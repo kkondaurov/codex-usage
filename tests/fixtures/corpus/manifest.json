@@ -1,0 +1,196 @@
+{
+  "version": 1,
+  "description": "Compact fixtures derived from real Codex JSONL histories on 2026-07-15.",
+  "pricingAssumption": {
+    "canonicalModel": "gpt-5.5",
+    "inputPerMillion": "5.00",
+    "cachedInputPerMillion": "0.50",
+    "outputPerMillion": "30.00",
+    "reasoningOutputIsIncludedInOutput": true
+  },
+  "cases": [
+    {
+      "id": "replay_spike",
+      "activeRoot": "replay_spike/active",
+      "archivedRoot": "replay_spike/archived",
+      "sourceFiles": 5,
+      "expected": {
+        "threads": 2,
+        "visibleSessionRows": 2,
+        "nativeRollouts": 3,
+        "replayOnlySources": 2,
+        "turns": 3,
+        "durableMessages": 6,
+        "toolCalls": 2,
+        "usageFacts": 3,
+        "allNativeUsage": {
+          "inputTokens": 303069,
+          "cachedInputTokens": 94336,
+          "outputTokens": 1991,
+          "reasoningOutputTokens": 1251,
+          "totalTokens": 305060
+        },
+        "july15NativeUsage": {
+          "inputTokens": 275900,
+          "cachedInputTokens": 90880,
+          "outputTokens": 1082,
+          "reasoningOutputTokens": 735,
+          "totalTokens": 276982,
+          "costUsd": 1.003
+        },
+        "may4NativeUsage": {
+          "inputTokens": 27169,
+          "cachedInputTokens": 3456,
+          "outputTokens": 909,
+          "reasoningOutputTokens": 516,
+          "totalTokens": 28078,
+          "costUsd": 0.147563
+        }
+      },
+      "ownership": [
+        {
+          "rolloutId": "019f64af-12fe-7170-8fcd-7d636000a8af",
+          "nativeStartLine": null,
+          "nativeUsageFacts": 0,
+          "visible": false
+        },
+        {
+          "rolloutId": "019f64af-6612-79d0-81d0-c53d7d6caef0",
+          "nativeStartLine": null,
+          "nativeUsageFacts": 0,
+          "visible": false
+        },
+        {
+          "rolloutId": "019f64aa-21e8-7a41-916f-0fe9b845eede",
+          "nativeStartLine": 8,
+          "nativeUsageFacts": 1,
+          "threadId": "019f64aa-21e8-7a41-916f-0fe9b845eede"
+        },
+        {
+          "rolloutId": "019f64be-5f19-7551-aefb-e40afd692da9",
+          "nativeStartLine": 8,
+          "nativeUsageFacts": 1,
+          "threadId": "019f64aa-21e8-7a41-916f-0fe9b845eede",
+          "parentThreadId": "019f64aa-21e8-7a41-916f-0fe9b845eede",
+          "agentPath": null,
+          "agentNickname": "Russell"
+        }
+      ]
+    },
+    {
+      "id": "rich_trace",
+      "activeRoot": "rich_trace/active",
+      "sourceFiles": 1,
+      "expected": {
+        "threads": 1,
+        "visibleSessionRows": 1,
+        "nativeRollouts": 1,
+        "turns": 1,
+        "durableMessages": 3,
+        "toolCalls": 8,
+        "subagentRuns": 1,
+        "usageFacts": 2,
+        "nativeUsage": {
+          "inputTokens": 84383,
+          "cachedInputTokens": 50688,
+          "outputTokens": 736,
+          "reasoningOutputTokens": 469,
+          "totalTokens": 85119,
+          "costUsd": 0.215899
+        },
+        "activityEvents": {
+          "userMessages": 1,
+          "assistantUpdates": 1,
+          "reasoningSummaries": 1,
+          "toolCalls": 8,
+          "subagentLifecycle": 2,
+          "subagentMessages": 1,
+          "goalUpdates": 1,
+          "compactions": 1,
+          "finalAnswers": 1,
+          "total": 17
+        },
+        "unknownRecordsPreserved": 1,
+        "unknownRecordsVisibleByDefault": 0
+      }
+    },
+    {
+      "id": "legacy_v0",
+      "activeRoot": "legacy_v0/active",
+      "sourceFiles": 1,
+      "expected": {
+        "threads": 1,
+        "visibleSessionRows": 1,
+        "nativeRollouts": 1,
+        "implicitTurns": 1,
+        "durableMessages": 3,
+        "reasoningSummaries": 1,
+        "toolCalls": 1,
+        "usageFacts": 0,
+        "totalTokens": 0,
+        "costUsd": 0.0
+      }
+    },
+    {
+      "id": "sparse_pricing",
+      "activeRoot": "sparse_pricing/active",
+      "archivedRoot": "sparse_pricing/archived",
+      "sourceFiles": 2,
+      "expected": {
+        "threads": 2,
+        "visibleSessionRows": 2,
+        "nativeRollouts": 2,
+        "turns": 2,
+        "durableMessages": 1,
+        "usageFacts": 1,
+        "messageOnlyAbortedSessions": 1,
+        "usageOnlySessions": 1,
+        "nativeUsage": {
+          "inputTokens": 25410,
+          "cachedInputTokens": 7552,
+          "outputTokens": 197,
+          "reasoningOutputTokens": 179,
+          "totalTokens": 25607
+        },
+        "beforeAlias": {
+          "observedModelId": "codex-auto-review",
+          "knownCostUsd": 0.0,
+          "unpricedTokens": 25607,
+          "pricingComplete": false
+        },
+        "afterAlias": {
+          "observedModelId": "codex-auto-review",
+          "canonicalModelId": "gpt-5.5",
+          "costUsd": 0.098976,
+          "unpricedTokens": 0,
+          "pricingComplete": true,
+          "reingestRequired": false
+        }
+      }
+    },
+    {
+      "id": "rate_limit_duplicates",
+      "activeRoot": "rate_limit_duplicates/active",
+      "sourceFiles": 1,
+      "derivedFrom": "archived rollout 019c9e08-eab1-7dc1-a90e-8201435a93ab lines 87-89 and adjacent repeated buckets",
+      "expected": {
+        "usageFacts": 3,
+        "recordsRead": 9,
+        "nativeUsage": {
+          "inputTokens": 1290,
+          "cachedInputTokens": 205,
+          "outputTokens": 78,
+          "reasoningOutputTokens": 46,
+          "totalTokens": 1368
+        }
+      }
+    }
+  ],
+  "liveEvidence": {
+    "capturedAt": "2026-07-15",
+    "replayTokenCountRecordsPerFile": 17121,
+    "replayNonNullTotalSequenceSha256": "b47844ad2edaf4fcaf3aa8fea9e37bd5feb458f65f137a1e6953cdf977a56a72",
+    "rootNativeStartLine": 101896,
+    "childNativeStartLine": 33984
+  }
+}

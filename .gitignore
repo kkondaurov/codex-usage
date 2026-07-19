@@ -1,0 +1,54 @@
+# Rust build output
+/target/
+
+# JavaScript dependencies, caches, and generated output
+node_modules/
+.npm-cache/
+dist/
+coverage/
+.vite/
+.eslintcache
+*.tsbuildinfo
+playwright-report/
+test-results/
+blob-report/
+
+# Local runtime databases and SQLite sidecars
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.wal
+*.shm
+*.journal
+*.ingest.lock
+*.pricing-refresh.lock
+
+# Local Codex session roots. Keep these root-anchored so test fixtures remain tracked.
+/sessions/
+/archived_sessions/
+
+# Local environment and machine-specific overrides
+.env
+.env.*
+!.env.example
+.envrc
+.direnv/
+/codex-usage.local.toml
+/codex-usage.pricing.json
+/codex-usage.pricing.json.lock
+/.codex-usage.pricing.json
+/.codex-usage.pricing.json.lock
+
+# Editor, log, and OS noise
+.idea/
+*.swp
+*.swo
+*~
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store

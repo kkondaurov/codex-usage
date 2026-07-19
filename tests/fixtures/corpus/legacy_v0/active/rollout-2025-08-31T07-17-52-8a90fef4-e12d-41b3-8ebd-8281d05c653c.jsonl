@@ -1,0 +1,10 @@
+{"id":"8a90fef4-e12d-41b3-8ebd-8281d05c653c","timestamp":"2025-08-31T07:17:52.824Z","instructions":null,"git":{"commit_hash":"fixture","branch":"main","repository_url":"https://example.invalid/legacy-repo.git"}}
+{"record_type":"state"}
+{"type":"message","id":null,"role":"user","content":[{"type":"input_text","text":"Explain this repository to me."}]}
+{"record_type":"state"}
+{"type":"reasoning","id":"rs_legacy_1","summary":[{"type":"summary_text","text":"Inspect the repository structure first."}],"content":null,"encrypted_content":"redacted"}
+{"type":"message","id":"msg_legacy_1","role":"assistant","content":[{"type":"output_text","text":"I will inspect the main modules and describe the data flow."}]}
+{"type":"function_call","id":"fc_legacy_1","call_id":"call_legacy_1","name":"shell","arguments":"{\"cmd\":\"rg --files\"}"}
+{"type":"function_call_output","call_id":"call_legacy_1","output":"Chunk ID: legacy\nProcess exited with code 0\nFinal output:\nsrc/main.rs\nsrc/lib.rs"}
+{"record_type":"state"}
+{"type":"message","id":"msg_legacy_2","role":"assistant","content":[{"type":"output_text","text":"The application has a small binary entry point and a reusable library core."}]}

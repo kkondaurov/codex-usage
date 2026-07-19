@@ -1,0 +1,50 @@
+[package]
+name = "codex-usage"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+publish = false
+include = [
+    "/.gitignore",
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/README.md",
+    "/rust-toolchain.toml",
+    "/migrations/**",
+    "/src/**",
+    "/tests/**",
+    "/frontend/AGENTS.md",
+    "/frontend/.node-version",
+    "/frontend/e2e/**",
+    "/frontend/public/**",
+    "/frontend/src/**/*.css",
+    "/frontend/src/**/*.ts",
+    "/frontend/src/**/*.tsx",
+    "/frontend/*.html",
+    "/frontend/*.js",
+    "/frontend/*.json",
+    "/frontend/*.ts",
+]
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
