@@ -4,7 +4,9 @@ import type { CSSProperties, FocusEvent, KeyboardEvent as ReactKeyboardEvent, Mo
 import { createPortal } from 'react-dom'
 import { Link } from 'react-router-dom'
 import { api } from '../api'
+import { MIN_PUBLIC_YEAR } from '../calendar'
 import { DegradedDataNotice } from '../components/Common'
+import { compareDecimal, decimalRatioGreaterThan, decimalSign } from '../decimal'
 import { estimatedMoney, money, tokens } from '../format'
 import { useCachedAsync } from '../hooks'
 import type { HeatmapDay, OverviewYearResponse, PeriodSummary } from '../types'
@@ -67,7 +69,7 @@ export function buildAnnualHeatmapLayout(year: number, days: HeatmapDay[], now =
       const source = byDate.get(iso)
       const entry = {
         date: iso,
-        costUsd: source ? source.costUsd : 0,
+        costUsd: source ? source.costUsd : '0',
         sessionCount: source?.sessionCount ?? 0,
         messageCount: source?.messageCount ?? 0,
         totalTokens: source?.totalTokens ?? 0,
@@ -109,11 +111,11 @@ function TodayPanel({ period }: { period: PeriodSummary }) {
   return (
     <section className="today-panel">
       <span className="eyebrow coral-text">TODAY</span>
-      <strong className="today-cost">{estimatedMoney(period.totals.costUsd ?? (hasActivity ? null : 0), period.totals.unpricedTokens)}</strong>
+      <strong className="today-cost">{estimatedMoney(period.totals.costUsd ?? (hasActivity ? null : '0'), period.totals.unpricedTokens)}</strong>
       <div className="today-rule" />
       <div className="today-stats">
         <div><strong>{period.sessionCount} sessions</strong><strong>{period.messageCount} messages</strong></div>
-        <div><strong>{tokens(period.totals.totalTokens)} API tokens</strong><span>{hasActivity && period.totals.unpricedTokens === 0 && period.deltaCostUsd != null ? `${period.deltaCostUsd >= 0 ? '+' : ''}${money(period.deltaCostUsd)}` : hasActivity ? 'Price pending' : 'No activity yet today'}</span></div>
+        <div><strong>{tokens(period.totals.totalTokens)} API tokens</strong><span>{hasActivity && period.totals.unpricedTokens === 0 && period.deltaCostUsd != null ? `${decimalSign(period.deltaCostUsd) >= 0 ? '+' : ''}${money(period.deltaCostUsd)}` : hasActivity ? 'Price pending' : 'No activity yet today'}</span></div>
       </div>
       {hasActivity
         ? <Link to={`/sessions?${new URLSearchParams({ date })}`} className="text-link">VIEW TODAY’S SESSIONS <ArrowRight weight="bold" /></Link>
@@ -193,7 +195,10 @@ function AnnualHeatmap({
   onNext: () => void
 }) {
   const layout = useMemo(() => buildAnnualHeatmapLayout(year, days ?? []), [days, year])
-  const maxCost = Math.max(1, ...(days ?? []).map(day => day.costUsd ?? 0))
+  const maxCost = (days ?? []).reduce(
+    (maximum, day) => day.costUsd != null && compareDecimal(day.costUsd, maximum) > 0 ? day.costUsd : maximum,
+    '1',
+  )
   const [card, setCard] = useState<HeatmapCardState | null>(null)
   const [cardPosition, setCardPosition] = useState<{ left: number; top: number } | null>(null)
   const [focusDate, setFocusDate] = useState<string | null>(null)
@@ -204,7 +209,7 @@ function AnnualHeatmap({
   const focusCardAction = useRef(false)
   const focusableCells = layout.cells.filter(cell => !cell.day.future)
   const todayDate = dateOnly(new Date())
-  const activeCells = focusableCells.filter(cell => cell.day.sessionCount > 0 || cell.day.totalTokens > 0 || (cell.day.costUsd ?? 0) > 0)
+  const activeCells = focusableCells.filter(cell => cell.day.sessionCount > 0 || cell.day.totalTokens > 0 || (cell.day.costUsd != null && decimalSign(cell.day.costUsd) > 0))
   const defaultFocusDate = year === new Date().getFullYear() && focusableCells.some(cell => cell.day.date === todayDate)
     ? todayDate
     : activeCells.at(-1)?.day.date ?? focusableCells.at(-1)?.day.date ?? null
@@ -241,9 +246,10 @@ function AnnualHeatmap({
     const next = layout.cells[currentIndex + offset]
     if (!next || next.day.future || loading || error) return
     setFocusDate(next.day.date)
-    gridRef.current
+    const nextTile = gridRef.current
       ?.querySelector<HTMLButtonElement>(`.heatmap-tile[data-date="${next.day.date}"]`)
-      ?.focus({ preventScroll: true })
+    nextTile?.focus({ preventScroll: true })
+    nextTile?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' })
   }
 
   const tileFromTarget = (target: EventTarget | null) => {
@@ -358,9 +364,9 @@ function AnnualHeatmap({
 
   const cardId = card ? `heatmap-card-${card.day.date}` : undefined
   return (
-    <section className="annual-section">
+    <section className="annual-section" role="region" aria-label={`${year} yearly usage ledger`} tabIndex={0}>
       <div className="heatmap-header" style={{ '--heatmap-weeks': layout.weekCount } as CSSProperties}>
-        <div className="year-control"><button type="button" aria-label="Previous year" onClick={() => { setCard(null); setCardPosition(null); onPrevious() }}><CaretLeft weight="bold" /></button><strong>{year}</strong><button type="button" aria-label="Next year" disabled={year >= new Date().getFullYear()} onClick={() => { setCard(null); setCardPosition(null); onNext() }}><CaretRight weight="bold" /></button></div>
+        <div className="year-control"><button type="button" aria-label="Previous year" disabled={year <= MIN_PUBLIC_YEAR} onClick={() => { setCard(null); setCardPosition(null); onPrevious() }}><CaretLeft weight="bold" /></button><strong>{year}</strong><button type="button" aria-label="Next year" disabled={year >= new Date().getFullYear()} onClick={() => { setCard(null); setCardPosition(null); onNext() }}><CaretRight weight="bold" /></button></div>
         {layout.months.map(month => <span key={month.name} style={{ gridColumn: month.week + 2 }}>{month.name}</span>)}
       </div>
       <div className="heatmap-layout">
@@ -380,7 +386,13 @@ function AnnualHeatmap({
           onClick={clickedTile}
         >
           {!loading && layout.cells.map(({ day, week, row }) => {
-            const intensity = day.costUsd === null ? 'unknown' : day.costUsd === 0 ? 'zero' : day.costUsd / maxCost > .55 ? 'high' : day.costUsd / maxCost > .2 ? 'medium' : 'low'
+            const intensity = day.costUsd === null
+              ? 'unknown'
+              : decimalSign(day.costUsd) === 0
+                ? 'zero'
+                : decimalRatioGreaterThan(day.costUsd, maxCost, 55n, 100n)
+                  ? 'high'
+                  : decimalRatioGreaterThan(day.costUsd, maxCost, 20n, 100n) ? 'medium' : 'low'
             const isToday = day.date === todayDate
             const expanded = card?.day.date === day.date
             const disabled = loading || Boolean(error) || Boolean(day.future)
@@ -528,7 +540,7 @@ export function OverviewPage() {
           ? <SummaryError error={summary.error} onRetry={() => void summary.refresh()} />
           : <SummarySkeleton />}
       {summarySettled
-        ? <YearOverviewSections year={year} onPrevious={() => setYear(value => value - 1)} onNext={() => setYear(value => value + 1)} />
+        ? <YearOverviewSections year={year} onPrevious={() => setYear(value => Math.max(MIN_PUBLIC_YEAR, value - 1))} onNext={() => setYear(value => value + 1)} />
         : (
           <>
             <AnnualHeatmap
@@ -537,7 +549,7 @@ export function OverviewPage() {
               loading
               error={null}
               onRetry={() => undefined}
-              onPrevious={() => setYear(value => value - 1)}
+              onPrevious={() => setYear(value => Math.max(MIN_PUBLIC_YEAR, value - 1))}
               onNext={() => setYear(value => value + 1)}
             />
             <BottomSkeleton year={year} />

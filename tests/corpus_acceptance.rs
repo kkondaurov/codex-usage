@@ -3,11 +3,13 @@ use codex_usage::{
     ingest::{IngestRoots, scan_once},
 };
 use rusqlite::Connection;
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde_json::Value;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 use tempfile::TempDir;
 
@@ -115,10 +117,20 @@ fn expected_u64(expected: &Value, key: &str) -> u64 {
         .unwrap_or_else(|| panic!("expected.{key} is a u64"))
 }
 
-fn expected_f64(expected: &Value, key: &str) -> f64 {
-    expected[key]
-        .as_f64()
-        .unwrap_or_else(|| panic!("expected.{key} is a number"))
+fn expected_cost_numerator(expected: &Value, key: &str) -> i128 {
+    let number = expected[key]
+        .as_number()
+        .unwrap_or_else(|| panic!("expected.{key} is a number"));
+    let decimal = Decimal::from_str(&number.to_string())
+        .unwrap_or_else(|_| panic!("expected.{key} is an exact decimal"));
+    let scaled = decimal * Decimal::from(1_000_000_000_000_i64);
+    assert!(
+        scaled.fract().is_zero(),
+        "expected.{key} exceeds price precision"
+    );
+    scaled
+        .to_i128()
+        .unwrap_or_else(|| panic!("expected.{key} fits the exact cost range"))
 }
 
 fn copy_tree(source: &Path, destination: &Path) {
@@ -239,13 +251,6 @@ fn assert_usage(actual: (i64, i64, i64, i64, i64), expected: &Value) {
         expected_u64(expected, "reasoningOutputTokens")
     );
     assert_eq!(actual.4 as u64, expected_u64(expected, "totalTokens"));
-}
-
-fn assert_close(actual: f64, expected: f64) {
-    assert!(
-        (actual - expected).abs() < 0.000_000_5,
-        "expected {expected:.9}, got {actual:.9}"
-    );
 }
 
 fn projection_snapshot(connection: &Connection) -> ProjectionSnapshot {
@@ -403,16 +408,16 @@ fn replay_corpus_counts_only_native_work_and_hides_pure_replays() {
         usage_totals(&connection, &format!("thread_id='{JULY_THREAD}'")),
         &expected["july15NativeUsage"],
     );
-    let july_cost: f64 = connection
+    let july_cost: i128 = connection
         .query_row(
-            "SELECT COALESCE(SUM(cost_usd),0.0) FROM priced_usage WHERE thread_id=?1",
+            "SELECT COALESCE(SUM(cost_numerator),0) FROM priced_usage WHERE thread_id=?1",
             [JULY_THREAD],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0).map(i128::from),
         )
         .unwrap();
-    assert_close(
+    assert_eq!(
         july_cost,
-        expected_f64(&expected["july15NativeUsage"], "costUsd"),
+        expected_cost_numerator(&expected["july15NativeUsage"], "costUsd"),
     );
 
     const MAY_THREAD: &str = "019df47e-62a3-7ba3-a57f-d7f8565ec08f";
@@ -420,16 +425,16 @@ fn replay_corpus_counts_only_native_work_and_hides_pure_replays() {
         usage_totals(&connection, &format!("thread_id='{MAY_THREAD}'")),
         &expected["may4NativeUsage"],
     );
-    let may_cost: f64 = connection
+    let may_cost: i128 = connection
         .query_row(
-            "SELECT COALESCE(SUM(cost_usd),0.0) FROM priced_usage WHERE thread_id=?1",
+            "SELECT COALESCE(SUM(cost_numerator),0) FROM priced_usage WHERE thread_id=?1",
             [MAY_THREAD],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0).map(i128::from),
         )
         .unwrap();
-    assert_close(
+    assert_eq!(
         may_cost,
-        expected_f64(&expected["may4NativeUsage"], "costUsd"),
+        expected_cost_numerator(&expected["may4NativeUsage"], "costUsd"),
     );
 
     for replay_only in [
@@ -584,14 +589,25 @@ fn rich_trace_preserves_activity_tools_subagents_compaction_and_unknowns() {
         1,
         "the child-agent message remains attached to the activity trace"
     );
+    let unknown_payloads = connection
+        .prepare(
+            "SELECT payload_json FROM events
+             WHERE kind='system' AND label='future_trace_marker'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(
-        scalar(
-            &connection,
-            r#"SELECT COUNT(*) FROM events
-               WHERE kind='system' AND label='future_trace_marker'
-                 AND payload_json LIKE '%schema_version%'"#
-        ) as u64,
+        unknown_payloads.len() as u64,
         expected_u64(expected, "unknownRecordsPreserved")
+    );
+    let unknown_payload: Value = serde_json::from_str(&unknown_payloads[0]).unwrap();
+    assert_eq!(
+        unknown_payload,
+        serde_json::json!({"type":"future_trace_marker","schema_version":99}),
+        "unknown records retain only bounded scalar identity metadata"
     );
 }
 
@@ -720,19 +736,19 @@ fn sparse_sessions_and_pricing_alias_reprice_without_reingestion() {
         1
     );
 
-    let before: (i64, f64, i64) = connection
+    let before: (i64, i128, i64) = connection
         .query_row(
-            r#"SELECT COUNT(*),COALESCE(SUM(cost_usd),0.0),
+            r#"SELECT COUNT(*),COALESCE(SUM(cost_numerator),0),
                       COALESCE(SUM(CASE WHEN price_known=0 THEN total_tokens ELSE 0 END),0)
                FROM priced_usage"#,
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, i128::from(row.get::<_, i64>(1)?), row.get(2)?)),
         )
         .unwrap();
     assert_eq!(before.0 as u64, expected_u64(expected, "usageFacts"));
-    assert_close(
+    assert_eq!(
         before.1,
-        expected_f64(&expected["beforeAlias"], "knownCostUsd"),
+        expected_cost_numerator(&expected["beforeAlias"], "knownCostUsd"),
     );
     assert_eq!(
         before.2 as u64,
@@ -753,17 +769,20 @@ fn sparse_sessions_and_pricing_alias_reprice_without_reingestion() {
             [],
         )
         .unwrap();
-    let after: (f64, i64, String) = connection
+    let after: (i128, i64, String) = connection
         .query_row(
-            r#"SELECT COALESCE(SUM(cost_usd),0.0),
+            r#"SELECT COALESCE(SUM(cost_numerator),0),
                       COALESCE(SUM(CASE WHEN price_known=0 THEN total_tokens ELSE 0 END),0),
                       MIN(model)
                FROM priced_usage"#,
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((i128::from(row.get::<_, i64>(0)?), row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_close(after.0, expected_f64(&expected["afterAlias"], "costUsd"));
+    assert_eq!(
+        after.0,
+        expected_cost_numerator(&expected["afterAlias"], "costUsd")
+    );
     assert_eq!(after.1, 0);
     assert_eq!(
         after.2, "codex-auto-review",

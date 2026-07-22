@@ -45,6 +45,68 @@ describe('CompactMarkdown', () => {
     expect(compactMarkdownText(value, 18)).toBe('diagram Alpha and…')
   })
 
+  it('removes internal memory-citation blocks before producing compact previews', () => {
+    const value = `Visible result.
+
+<oai-mem-citation>
+<citation_entries>
+rollout_summaries/private-session.md:10-12|note=[internal plumbing]
+</citation_entries>
+</oai-mem-citation>
+
+Visible ending.`
+
+    render(<CompactMarkdown maxLength={40}>{value}</CompactMarkdown>)
+
+    expect(document.body).toHaveTextContent('Visible result. Visible ending.')
+    expect(document.body).not.toHaveTextContent('private-session')
+    expect(document.body).not.toHaveTextContent('internal plumbing')
+    expect(compactMarkdownText(value)).toBe('Visible result. Visible ending.')
+  })
+
+  it('bounds adversarial unmatched inline markup while preserving the excerpt', () => {
+    const value = '['.repeat(50_000)
+    const startedAt = performance.now()
+
+    expect(compactMarkdownText(value, 190)).toBe(`${'['.repeat(189)}…`)
+    expect(performance.now() - startedAt).toBeLessThan(500)
+  })
+
+  it('keeps code, link destinations, and escaped pipes opaque during block flattening', () => {
+    render(<CompactMarkdown links="anchor">{'`a | <span>b</span>` [pipe link](https://example.com/a|b) \\| literal'}</CompactMarkdown>)
+
+    expect(screen.getByText('a | <span>b</span>').tagName).toBe('CODE')
+    expect(screen.getByRole('link', { name: 'pipe link' })).toHaveAttribute('href', 'https://example.com/a|b')
+    expect(document.body).toHaveTextContent('| literal')
+    expect(document.body).not.toHaveTextContent('·')
+  })
+
+  it('preserves fenced code as code without interpreting its HTML or pipes', () => {
+    render(<CompactMarkdown>{`Before
+
+\`\`\`html
+<span>a | b</span>
+\`\`\`
+
+After`}</CompactMarkdown>)
+
+    expect(screen.getByText('<span>a | b</span>').tagName).toBe('CODE')
+    expect(document.body).toHaveTextContent('Before <span>a | b</span> After')
+  })
+
+  it('flattens pathological whitespace and comments in linear time', () => {
+    const value = `${' '.repeat(100_000)}start<!--${'x'.repeat(100_000)}-->end${' '.repeat(100_000)}`
+    const startedAt = performance.now()
+
+    expect(compactMarkdownText(value)).toBe('start end')
+    expect(performance.now() - startedAt).toBeLessThan(500)
+
+    const unmatched = '<!--'.repeat(25_000)
+    const unmatchedStartedAt = performance.now()
+    expect(compactMarkdownText(unmatched, 190)).toBe(`${unmatched.slice(0, 189)}…`)
+    expect(performance.now() - unmatchedStartedAt).toBeLessThan(500)
+  })
+
   it('accepts local and web links but rejects executable or protocol-relative URLs', () => {
     expect(safeMarkdownHref('/sessions/one')).toBe('/sessions/one')
     expect(safeMarkdownHref('https://example.com')).toBe('https://example.com')

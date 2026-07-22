@@ -253,6 +253,54 @@ fn assert_number(value: &Value, key: &str) {
     assert!(value[key].is_number(), "{key} must be a number in {value}");
 }
 
+fn usd_units(value: &Value) -> i128 {
+    let text = value
+        .as_str()
+        .unwrap_or_else(|| panic!("USD amount must be a decimal string, got {value}"));
+    let (negative, unsigned) = text
+        .strip_prefix('-')
+        .map_or((false, text), |unsigned| (true, unsigned));
+    let (whole, fraction) = unsigned
+        .split_once('.')
+        .unwrap_or_else(|| panic!("USD amount must include a decimal point: {text}"));
+    assert!(!whole.is_empty(), "USD amount has no whole part: {text}");
+    assert!(
+        (2..=12).contains(&fraction.len()),
+        "USD amount must have 2 to 12 decimal places: {text}"
+    );
+    assert!(
+        fraction.len() == 2 || !fraction.ends_with('0'),
+        "USD amount is not canonical: {text}"
+    );
+    let whole = whole
+        .parse::<i128>()
+        .unwrap_or_else(|_| panic!("invalid USD whole part: {text}"));
+    let fraction_digits = fraction.len() as u32;
+    let fraction = fraction
+        .parse::<i128>()
+        .unwrap_or_else(|_| panic!("invalid USD fraction: {text}"));
+    let magnitude = whole
+        .checked_mul(1_000_000_000_000)
+        .and_then(|whole| whole.checked_add(fraction * 10_i128.pow(12 - fraction_digits)))
+        .unwrap_or_else(|| panic!("USD amount is out of range: {text}"));
+    if negative { -magnitude } else { magnitude }
+}
+
+fn assert_usd(value: &Value, expected: &str) {
+    assert_eq!(
+        value.as_str(),
+        Some(expected),
+        "expected exact USD decimal string {expected}, got {value}"
+    );
+    let _ = usd_units(value);
+}
+
+fn assert_nullable_usd(value: &Value, key: &str) {
+    if !value[key].is_null() {
+        let _ = usd_units(&value[key]);
+    }
+}
+
 fn assert_totals(value: &Value) {
     for key in [
         "inputTokens",
@@ -265,10 +313,7 @@ fn assert_totals(value: &Value) {
     ] {
         assert_number(value, key);
     }
-    assert!(
-        value["costUsd"].is_number() || value["costUsd"].is_null(),
-        "costUsd must be a number or null in {value}"
-    );
+    assert_nullable_usd(value, "costUsd");
     assert!(value["pricingComplete"].is_boolean());
 }
 
@@ -295,15 +340,8 @@ fn assert_session_row(value: &Value) {
     ] {
         assert_number(value, key);
     }
-    assert!(value["costUsd"].is_number() || value["costUsd"].is_null());
-    assert!(value["lifetimeCostUsd"].is_number() || value["lifetimeCostUsd"].is_null());
-}
-
-fn close(actual: f64, expected: f64) {
-    assert!(
-        (actual - expected).abs() < 0.000_000_5,
-        "expected {expected:.9}, got {actual:.9}"
-    );
+    assert_nullable_usd(value, "costUsd");
+    assert_nullable_usd(value, "lifetimeCostUsd");
 }
 
 fn test_local_midnight(date: NaiveDate) -> DateTime<Utc> {
@@ -352,6 +390,11 @@ async fn top_level_endpoints_match_the_frontend_contract_and_real_fixture_totals
         assert!(overview["periods"][period]["sessionCount"].is_number());
         assert!(overview["periods"][period]["messageCount"].is_number());
         assert_totals(&overview["periods"][period]["totals"]);
+        assert_nullable_usd(&overview["periods"][period], "deltaCostUsd");
+        assert!(
+            overview["periods"][period]["deltaPercent"].is_number()
+                || overview["periods"][period]["deltaPercent"].is_null()
+        );
         if overview["periods"][period]["totals"]["unpricedTokens"]
             .as_u64()
             .unwrap()
@@ -372,6 +415,9 @@ async fn top_level_endpoints_match_the_frontend_contract_and_real_fixture_totals
     }
     assert_eq!(overview_year["year"], 2026);
     assert_eq!(overview_year["heatmap"].as_array().unwrap().len(), 365);
+    for day in overview_year["heatmap"].as_array().unwrap() {
+        assert_nullable_usd(day, "costUsd");
+    }
     let july_15 = overview_year["heatmap"]
         .as_array()
         .unwrap()
@@ -388,9 +434,10 @@ async fn top_level_endpoints_match_the_frontend_contract_and_real_fixture_totals
     let top_projects = overview_year["topProjects"].as_array().unwrap();
     assert_eq!(top_projects.len(), 3);
     let mut saw_unpriced_project = false;
-    let mut previous_project_cost = f64::INFINITY;
+    let mut previous_project_cost = i128::MAX;
     for project in top_projects {
-        if let Some(cost) = project["costUsd"].as_f64() {
+        if !project["costUsd"].is_null() {
+            let cost = usd_units(&project["costUsd"]);
             assert!(!saw_unpriced_project);
             assert!(project["share"].is_number());
             assert!(cost <= previous_project_cost);
@@ -403,14 +450,14 @@ async fn top_level_endpoints_match_the_frontend_contract_and_real_fixture_totals
     let top_sessions = overview_year["topSessions"].as_array().unwrap();
     assert_eq!(top_sessions.len(), 3);
     let mut saw_unpriced_session = false;
-    let mut previous_session_cost = f64::INFINITY;
+    let mut previous_session_cost = i128::MAX;
     let mut previous_unpriced_tokens = u64::MAX;
     for row in top_sessions {
         assert_session_row(row);
         assert!(row["lastEventAt"].as_str().unwrap().starts_with("2026-"));
         if row["unpricedTokens"].as_u64().unwrap() == 0 {
             assert!(!saw_unpriced_session);
-            let cost = row["costUsd"].as_f64().unwrap();
+            let cost = usd_units(&row["costUsd"]);
             assert!(cost <= previous_session_cost);
             previous_session_cost = cost;
         } else {
@@ -478,7 +525,7 @@ async fn top_level_endpoints_match_the_frontend_contract_and_real_fixture_totals
     assert!(settings["databaseBytes"].as_u64().unwrap() > 0);
     assert!(settings["timezone"].is_string());
     assert!(settings["lastIngestAt"].is_string());
-    assert!(settings["pricing"]["knownCostUsd"].is_number());
+    let _ = usd_units(&settings["pricing"]["knownCostUsd"]);
     assert_eq!(settings["pricing"]["complete"], false);
     assert_eq!(settings["pricing"]["unpricedTokens"], 25_607);
 }
@@ -596,6 +643,21 @@ async fn overview_top_sessions_use_period_activity_for_cross_year_threads() {
             |row| row.get(0),
         )
         .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_runs SET started_at='2027-02-01T12:00:00Z'
+             WHERE thread_id=?1 AND id<>thread_id",
+            [RICH_SESSION],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_runs(id,thread_id,rollout_id,started_at,status)
+             VALUES('cross-year-agent-inside',?1,?2,'2026-06-01T12:00:00Z','completed'),
+                   ('cross-year-agent-outside',?1,?2,'2027-06-01T12:00:00Z','completed')",
+            rusqlite::params![RICH_SESSION, rollout_id],
+        )
+        .unwrap();
     for (id, timestamp, output_tokens) in [
         ("cross-year-inside", "2026-02-01T12:00:00Z", 10_000_000_i64),
         ("cross-year-outside", "2027-02-01T12:00:00Z", 20_000_000_i64),
@@ -632,9 +694,10 @@ async fn overview_top_sessions_use_period_activity_for_cross_year_threads() {
     assert_eq!(row["startedAt"], "2025-12-20T12:00:00Z");
     assert_eq!(row["lastEventAt"], "2026-11-01T12:00:00Z");
     assert_eq!(row["messageCount"], 1);
+    assert_eq!(row["agentCount"], 1);
     assert_eq!(row["totalTokens"], 10_000_000);
     assert!(
-        row["lifetimeCostUsd"].as_f64().unwrap() > row["costUsd"].as_f64().unwrap(),
+        usd_units(&row["lifetimeCostUsd"]) > usd_units(&row["costUsd"]),
         "usage outside the selected year belongs only to lifetime cost"
     );
 }
@@ -683,15 +746,83 @@ async fn sessions_support_search_project_sort_pagination_and_exact_date_drilldow
     assert_eq!(partial["unpricedTokens"], 0);
     assert_eq!(partial["lifetimeUnpricedTokens"], 0);
     assert!(
-        partial["lifetimeCostUsd"].as_f64().unwrap() > partial["costUsd"].as_f64().unwrap(),
+        usd_units(&partial["lifetimeCostUsd"]) > usd_units(&partial["costUsd"]),
         "the filtered cost must remain distinct from the session's lifetime cost"
     );
 
+    let connection = harness.db.connect().unwrap();
+    let rollout_id: String = connection
+        .query_row(
+            "SELECT id FROM rollouts WHERE thread_id=?1 ORDER BY started_at LIMIT 1",
+            [RICH_SESSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE agent_runs SET started_at='2025-01-01T00:00:00Z'
+             WHERE thread_id=?1 AND id<>thread_id",
+            [RICH_SESSION],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO agent_runs(id,thread_id,rollout_id,started_at,status)
+             VALUES('bounded-agent-inside',?1,?2,'2026-07-15T20:30:00Z','completed'),
+                   ('bounded-agent-outside',?1,?2,'2025-07-15T20:30:00Z','completed')",
+            rusqlite::params![RICH_SESSION, rollout_id],
+        )
+        .unwrap();
+    drop(connection);
+    let bounded_agents = get_json(
+        &harness.app,
+        &format!(
+            "/api/v1/sessions?q={RICH_SESSION}&start=2026-07-15T20%3A00%3A00Z&end=2026-07-15T21%3A00%3A00Z&pageSize=50"
+        ),
+    )
+    .await;
+    assert_eq!(bounded_agents["items"][0]["agentCount"], 1);
+    let lifetime_agents = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions?q={RICH_SESSION}&pageSize=50"),
+    )
+    .await;
+    assert!(lifetime_agents["items"][0]["agentCount"].as_u64().unwrap() > 1);
+
     let sorted = get_json(&harness.app, "/api/v1/sessions?sort=cost&page=1&pageSize=2").await;
     assert_eq!(sorted["items"][0]["id"], JULY_REPLAY_SESSION);
+    assert!(usd_units(&sorted["items"][0]["costUsd"]) >= usd_units(&sorted["items"][1]["costUsd"]));
+
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute(
+            "UPDATE threads SET project='all' WHERE id=?1",
+            [RICH_SESSION],
+        )
+        .unwrap();
+    let literal_all = get_json(&harness.app, "/api/v1/sessions?project=all&pageSize=50").await;
+    assert_eq!(literal_all["total"], 1);
+    assert_eq!(literal_all["items"][0]["id"], RICH_SESSION);
+
+    let (status, headers, body) = raw_request(
+        &harness.app,
+        Method::GET,
+        "/api/v1/sessions?sort=surprise",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        sorted["items"][0]["costUsd"].as_f64().unwrap()
-            >= sorted["items"][1]["costUsd"].as_f64().unwrap()
+        headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"],
+        "sort must be recent or cost"
     );
 
     let empty_page = get_json(&harness.app, "/api/v1/sessions?page=999&pageSize=2").await;
@@ -726,6 +857,142 @@ async fn sessions_support_search_project_sort_pagination_and_exact_date_drilldow
         .collect::<Vec<_>>();
     assert!(drilldown_ids.contains(&RICH_SESSION));
     assert!(drilldown_ids.contains(&ABORTED_SESSION));
+}
+
+#[tokio::test]
+async fn session_search_is_unicode_normalized_and_treats_like_metacharacters_literally() {
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO threads(id,title,project,branch,started_at,last_event_at) VALUES
+                ('search-percent-new','100% literal marker','search','main',
+                 '2026-08-01T12:00:00Z','2026-08-01T12:00:00Z'),
+                ('search-percent-old','50% literal marker','search','main',
+                 '2026-08-01T11:00:00Z','2026-08-01T11:00:00Z'),
+                ('search-percent-decoy','100x literal marker','search','main',
+                 '2026-08-01T10:00:00Z','2026-08-01T10:00:00Z'),
+                ('search-underscore','literal_under_score','search','main',
+                 '2026-08-01T09:00:00Z','2026-08-01T09:00:00Z'),
+                ('search-backslash','literal\\path','search','main',
+                 '2026-08-01T08:00:00Z','2026-08-01T08:00:00Z'),
+                ('search-unicode','Éclair report','search','main',
+                 '2026-08-01T07:00:00Z','2026-08-01T07:00:00Z');
+             INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived) VALUES
+                ('search-percent-new','search-percent-new','2026-08-01T12:00:00Z','2026-08-01T12:00:00Z',0),
+                ('search-percent-old','search-percent-old','2026-08-01T11:00:00Z','2026-08-01T11:00:00Z',0),
+                ('search-percent-decoy','search-percent-decoy','2026-08-01T10:00:00Z','2026-08-01T10:00:00Z',0),
+                ('search-underscore','search-underscore','2026-08-01T09:00:00Z','2026-08-01T09:00:00Z',0),
+                ('search-backslash','search-backslash','2026-08-01T08:00:00Z','2026-08-01T08:00:00Z',0),
+                ('search-unicode','search-unicode','2026-08-01T07:00:00Z','2026-08-01T07:00:00Z',0);
+             INSERT INTO messages(id,thread_id,rollout_id,timestamp,role,content,source_line) VALUES
+                ('search-percent-new-message','search-percent-new','search-percent-new','2026-08-01T12:00:00Z','user','visible',1),
+                ('search-percent-old-message','search-percent-old','search-percent-old','2026-08-01T11:00:00Z','user','visible',1),
+                ('search-percent-decoy-message','search-percent-decoy','search-percent-decoy','2026-08-01T10:00:00Z','user','visible',1),
+                ('search-underscore-message','search-underscore','search-underscore','2026-08-01T09:00:00Z','user','visible',1),
+                ('search-backslash-message','search-backslash','search-backslash','2026-08-01T08:00:00Z','user','visible',1),
+                ('search-unicode-message','search-unicode','search-unicode','2026-08-01T07:00:00Z','user','visible',1);",
+        )
+        .unwrap();
+    drop(connection);
+
+    let literal_percent =
+        get_json(&harness.app, "/api/v1/sessions?q=%25&sort=cost&pageSize=50").await;
+    assert_eq!(literal_percent["total"], 2);
+    assert_eq!(literal_percent["items"].as_array().unwrap().len(), 2);
+    assert!(
+        literal_percent["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["title"].as_str().unwrap().contains('%'))
+    );
+
+    for (query, expected_id) in [
+        ("%5F", "search-underscore"),
+        ("%5C", "search-backslash"),
+        // The query uses a decomposed accent; the stored title is precomposed.
+        ("e%CC%81clair", "search-unicode"),
+    ] {
+        let response = get_json(
+            &harness.app,
+            &format!("/api/v1/sessions?q={query}&pageSize=50"),
+        )
+        .await;
+        assert_eq!(response["total"], 1, "unexpected total for {query}");
+        assert_eq!(response["items"][0]["id"], expected_id);
+    }
+}
+
+#[tokio::test]
+async fn price_search_is_unicode_normalized_and_treats_like_metacharacters_literally() {
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO model_prices(
+                model_id,effective_from,input_microusd_per_million,
+                cached_input_microusd_per_million,output_microusd_per_million,
+                currency,source
+             ) VALUES
+                ('price%model','1970-01-01T00:00:00Z',1,1,1,'USD','manual'),
+                ('priceXmodel','1970-01-01T00:00:00Z',1,1,1,'USD','manual'),
+                ('price_model','1970-01-01T00:00:00Z',1,1,1,'USD','manual'),
+                ('price\\model','1970-01-01T00:00:00Z',1,1,1,'USD','manual'),
+                ('Éclair-price','1970-01-01T00:00:00Z',1,1,1,'USD','manual');",
+        )
+        .unwrap();
+    drop(connection);
+
+    for (query, expected_id) in [
+        ("%25", "price%model"),
+        ("%5F", "price_model"),
+        ("%5C", "price\\model"),
+        ("e%CC%81clair", "Éclair-price"),
+    ] {
+        let response = get_json(
+            &harness.app,
+            &format!("/api/v1/prices?q={query}&page=1&pageSize=25"),
+        )
+        .await;
+        assert_eq!(response["total"], 1, "unexpected total for {query}");
+        assert_eq!(response["items"][0]["modelId"], expected_id);
+    }
+}
+
+#[tokio::test]
+async fn pagination_never_echoes_an_integer_javascript_cannot_represent_exactly() {
+    let harness = harness();
+    let maximum_safe = 9_007_199_254_740_991_u64;
+
+    let safe = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions?page={maximum_safe}&pageSize=1"),
+    )
+    .await;
+    assert_eq!(safe["page"].as_u64(), Some(maximum_safe));
+
+    for uri in [
+        format!("/api/v1/sessions?page={}&pageSize=1", maximum_safe + 1),
+        format!("/api/v1/prices?page={}&pageSize=1", maximum_safe + 1),
+        format!(
+            "/api/v1/sessions/{RICH_SESSION}/activity?page={}&pageSize=1",
+            maximum_safe + 1
+        ),
+        format!(
+            "/api/v1/sessions/{RICH_SESSION}/activity/event-rich-tool?childPage={}&childPageSize=1",
+            maximum_safe + 1
+        ),
+    ] {
+        let (status, _, body) = raw_request(&harness.app, Method::GET, &uri, None).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{uri}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(String::from_utf8_lossy(&body).contains("page must not exceed"));
+    }
 }
 
 #[tokio::test]
@@ -775,13 +1042,10 @@ async fn bounded_cost_sort_uses_period_cost_instead_of_lifetime_cost() {
     assert_eq!(sorted["total"], 2);
     assert_eq!(sorted["items"][0]["id"], ABORTED_SESSION);
     assert_eq!(sorted["items"][1]["id"], RICH_SESSION);
+    assert!(usd_units(&sorted["items"][0]["costUsd"]) > usd_units(&sorted["items"][1]["costUsd"]));
     assert!(
-        sorted["items"][0]["costUsd"].as_f64().unwrap()
-            > sorted["items"][1]["costUsd"].as_f64().unwrap()
-    );
-    assert!(
-        sorted["items"][1]["lifetimeCostUsd"].as_f64().unwrap()
-            > sorted["items"][0]["lifetimeCostUsd"].as_f64().unwrap(),
+        usd_units(&sorted["items"][1]["lifetimeCostUsd"])
+            > usd_units(&sorted["items"][0]["lifetimeCostUsd"]),
         "lifetime order is deliberately inverted so it cannot drive bounded sorting"
     );
 }
@@ -855,9 +1119,15 @@ Revisit the usage application from ingestion through the browser UI."#],
     );
     assert_totals(&summary["totals"]);
     assert_eq!(summary["totals"]["totalTokens"], 85_119);
-    close(summary["totals"]["costUsd"].as_f64().unwrap(), 0.215899);
+    assert_usd(&summary["totals"]["costUsd"], "0.215899");
     assert_eq!(summary["models"][0]["model"], "gpt-5.6-sol");
     assert_eq!(summary["models"][0]["effort"], "ultra");
+    for model in summary["models"].as_array().unwrap() {
+        assert_nullable_usd(model, "costUsd");
+    }
+    for agent in summary["agents"].as_array().unwrap() {
+        assert_nullable_usd(agent, "costUsd");
+    }
     assert!(summary["agents"].as_array().unwrap().iter().any(|agent| {
         agent["label"] == "/root/storage_audit" || agent["path"] == "/root/storage_audit"
     }));
@@ -1012,12 +1282,13 @@ Revisit the usage application from ingestion through the browser UI."#],
         turn["usage"]["totalTokens"].as_u64().unwrap(),
         "every usage fact is attributed exactly once"
     );
-    close(
+    assert_eq!(
         attributed
             .iter()
-            .map(|item| item["usage"]["costUsd"].as_f64().unwrap())
-            .sum::<f64>(),
-        turn["usage"]["costUsd"].as_f64().unwrap(),
+            .map(|item| usd_units(&item["usage"]["costUsd"]))
+            .sum::<i128>(),
+        usd_units(&turn["usage"]["costUsd"]),
+        "attributed costs must reconcile exactly to turn cost",
     );
     assert!(
         children.iter().find(|item| item["kind"] == "user").unwrap()["usage"].is_null(),
@@ -1083,26 +1354,15 @@ Revisit the usage application from ingestion through the browser UI."#],
     assert!(image_tool_detail["body"].is_null());
     assert!(image_tool_detail.get("attachments").is_none());
 
-    let usage = get_json(
-        &harness.app,
-        &format!("/api/v1/sessions/{RICH_SESSION}/usage"),
-    )
-    .await;
-    assert_totals(&usage["totals"]);
-    assert_eq!(usage["totals"]["totalTokens"], 85_119);
-    assert_eq!(usage["pricing"]["complete"], true);
-    assert_eq!(usage["byModel"][0]["model"], "gpt-5.6-sol");
-    assert!(!usage["byAgent"].as_array().unwrap().is_empty());
-    assert_eq!(usage["byTurn"].as_array().unwrap().len(), 1);
-    for row in usage["byAgent"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .chain(usage["byTurn"].as_array().unwrap())
-    {
+    assert_eq!(summary["models"][0]["model"], "gpt-5.6-sol");
+    for model in summary["models"].as_array().unwrap() {
+        assert_nullable_usd(model, "costUsd");
+    }
+    assert!(!summary["agents"].as_array().unwrap().is_empty());
+    for row in summary["agents"].as_array().unwrap() {
         assert!(row["id"].is_string());
         assert!(row["label"].is_string());
-        assert_totals(&row["totals"]);
+        assert_nullable_usd(row, "costUsd");
     }
 
     let (status, _, aborted_body) = raw_request(
@@ -1289,7 +1549,7 @@ Revisit the usage application from ingestion through the browser UI."#],
     assert_eq!(review_group["children"][0]["kind"], "review");
     assert_eq!(review_group["children"][0]["id"], "fixture-review-turn");
     assert_eq!(review_group["usage"]["totalTokens"], 10_000);
-    assert_eq!(review_group["usage"]["costUsd"], 0.05);
+    assert_usd(&review_group["usage"]["costUsd"], "0.05");
     assert_eq!(
         review_group["usage"], review_group["children"][0]["usage"],
         "one-review group usage is the real contained turn usage"
@@ -1339,12 +1599,13 @@ Revisit the usage application from ingestion through the browser UI."#],
     }
     let visible_cost = replay_children
         .iter()
-        .filter_map(|item| item["usage"]["costUsd"].as_f64())
-        .sum::<f64>();
-    let exchange_cost = replay_exchange["usage"]["costUsd"].as_f64().unwrap();
-    assert!(
-        (visible_cost - exchange_cost).abs() < 1e-9,
-        "visible child cost {visible_cost} must reconcile to exchange cost {exchange_cost}"
+        .filter(|item| !item["usage"]["costUsd"].is_null())
+        .map(|item| usd_units(&item["usage"]["costUsd"]))
+        .sum::<i128>();
+    let exchange_cost = usd_units(&replay_exchange["usage"]["costUsd"]);
+    assert_eq!(
+        visible_cost, exchange_cost,
+        "visible child costs must reconcile exactly to exchange cost"
     );
 
     let legacy_summary = get_json(
@@ -1431,7 +1692,7 @@ Revisit the usage application from ingestion through the browser UI."#],
     assert_eq!(aborted_summary["session"]["messageCount"], 1);
     assert_eq!(aborted_summary["session"]["status"], "interrupted");
     assert_eq!(aborted_summary["totals"]["totalTokens"], 0);
-    assert_eq!(aborted_summary["totals"]["costUsd"], 0.0);
+    assert_usd(&aborted_summary["totals"]["costUsd"], "0.00");
     assert!(
         aborted_turn["children"]
             .as_array()
@@ -1493,10 +1754,8 @@ async fn session_summary_turn_fallback_stays_on_the_root_rollout() {
 async fn deep_session_breakdowns_never_follow_cross_thread_relation_ids() {
     let harness = harness();
     let summary_uri = format!("/api/v1/sessions/{RICH_SESSION}/summary");
-    let usage_uri = format!("/api/v1/sessions/{RICH_SESSION}/usage");
     let activity_uri = format!("/api/v1/sessions/{RICH_SESSION}/activity?page=1&pageSize=25");
     let summary_before = get_json(&harness.app, &summary_uri).await;
-    let usage_before = get_json(&harness.app, &usage_uri).await;
     let activity_before = get_json(&harness.app, &activity_uri).await;
 
     let connection = harness.db.connect().unwrap();
@@ -1531,7 +1790,7 @@ async fn deep_session_breakdowns_never_follow_cross_thread_relation_ids() {
              ) VALUES(
                 'cross-thread-relation-fixture',?1,?2,?3,?4,
                 '2026-07-15T20:59:00Z',9999,'gpt-5.6-sol','ultra',
-                900000,800000,90000,10000,1000000,1
+                900000,800000,90000,10000,990000,1
              )",
             rusqlite::params![ABORTED_SESSION, foreign_rollout_id, turn_id, agent_run_id],
         )
@@ -1539,12 +1798,10 @@ async fn deep_session_breakdowns_never_follow_cross_thread_relation_ids() {
     drop(connection);
 
     let summary_after = get_json(&harness.app, &summary_uri).await;
-    let usage_after = get_json(&harness.app, &usage_uri).await;
     let activity_after = get_json(&harness.app, &activity_uri).await;
     assert_eq!(summary_after["agents"], summary_before["agents"]);
-    assert_eq!(usage_after["totals"], usage_before["totals"]);
-    assert_eq!(usage_after["byAgent"], usage_before["byAgent"]);
-    assert_eq!(usage_after["byTurn"], usage_before["byTurn"]);
+    assert_eq!(summary_after["totals"], summary_before["totals"]);
+    assert_eq!(summary_after["models"], summary_before["models"]);
     assert_eq!(activity_after["items"], activity_before["items"]);
 }
 
@@ -1933,14 +2190,16 @@ async fn activity_reused_agent_identity_is_attributed_by_link_interval() {
                 "visible children for {root_id} must reconcile on {field}"
             );
         }
-        close(
+        assert_eq!(
             detail["children"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter_map(|item| item["usage"]["costUsd"].as_f64())
-                .sum::<f64>(),
-            detail["usage"]["costUsd"].as_f64().unwrap(),
+                .filter(|item| !item["usage"]["costUsd"].is_null())
+                .map(|item| usd_units(&item["usage"]["costUsd"]))
+                .sum::<i128>(),
+            usd_units(&detail["usage"]["costUsd"]),
+            "visible child costs must reconcile exactly for {root_id}",
         );
 
         let group = get_json(
@@ -2264,10 +2523,11 @@ async fn stats_cover_every_range_and_rows_drill_down_without_bucket_guessing() {
         )
         .await;
         assert_eq!(response["range"], range);
-        let expected_anchor = if range == "week" {
-            "2026-07-13"
-        } else {
-            anchor
+        let expected_anchor = match range {
+            "week" => "2026-07-13",
+            "month" => "2026-07-01",
+            "year" => "2026-01-01",
+            _ => anchor,
         };
         assert_eq!(response["anchor"], expected_anchor);
         assert!(response["label"].is_string());
@@ -2287,7 +2547,7 @@ async fn stats_cover_every_range_and_rows_drill_down_without_bucket_guessing() {
                 assert!(row["costUsd"].is_null());
                 assert!(response["trend"][index].is_null());
             } else {
-                assert!(response["trend"][index].is_number());
+                let _ = usd_units(&response["trend"][index]);
             }
         }
     }
@@ -2296,6 +2556,25 @@ async fn stats_cover_every_range_and_rows_drill_down_without_bucket_guessing() {
     assert_eq!(midweek["anchor"], "2026-07-13");
     assert_eq!(midweek["label"], "Week of Jul 13, 2026");
     assert_eq!(midweek["rows"][0]["label"], "Mon 13");
+
+    let first_public_week =
+        get_json(&harness.app, "/api/v1/stats?range=week&anchor=1970-01-05").await;
+    assert_eq!(first_public_week["anchor"], "1970-01-05");
+    assert_eq!(first_public_week["rows"].as_array().unwrap().len(), 7);
+
+    for (range, anchor, expected) in [
+        ("month", "2026-06-30", "2026-06-01"),
+        ("month", "2024-02-29", "2024-02-01"),
+        ("year", "2025-12-31", "2025-01-01"),
+        ("year", "2024-02-29", "2024-01-01"),
+    ] {
+        let response = get_json(
+            &harness.app,
+            &format!("/api/v1/stats?range={range}&anchor={anchor}"),
+        )
+        .await;
+        assert_eq!(response["anchor"], expected);
+    }
 
     let all = get_json(&harness.app, "/api/v1/stats?range=all").await;
     let today = Local::now().date_naive().to_string();
@@ -2315,6 +2594,9 @@ async fn stats_cover_every_range_and_rows_drill_down_without_bucket_guessing() {
         if row["unpricedTokens"].as_u64().unwrap() > 0 {
             assert!(row["costUsd"].is_null());
             assert!(all["trend"][index].is_null());
+        } else {
+            let _ = usd_units(&row["costUsd"]);
+            let _ = usd_units(&all["trend"][index]);
         }
     }
     for ignored_anchor in ["2020-01-01", "9999-01-01", "not-a-date"] {
@@ -2335,26 +2617,108 @@ async fn stats_cover_every_range_and_rows_drill_down_without_bucket_guessing() {
 }
 
 #[tokio::test]
+async fn stats_keep_public_year_bounds_and_fractional_dst_labels() {
+    const CHILD_MARKER: &str = "CODEX_USAGE_STATS_TIMEZONE_CHILD";
+    const TEST_NAME: &str = "stats_keep_public_year_bounds_and_fractional_dst_labels";
+
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD_MARKER, "1")
+            .env("TZ", "Australia/Lord_Howe")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "timezone-isolated regression failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let upper_timestamp = DateTime::parse_from_rfc3339("9998-12-31T23:30:00Z").unwrap();
+    assert_eq!(
+        upper_timestamp.with_timezone(&Local).year(),
+        9999,
+        "the isolated test process must use a positive-offset timezone"
+    );
+
+    let harness = harness();
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO threads(id,title,started_at,last_event_at) VALUES
+                ('upper-bound-thread','Upper bound','9998-12-31T23:30:00.000000000Z',
+                 '9998-12-31T23:30:00.000000000Z');
+             INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived) VALUES
+                ('upper-bound-rollout','upper-bound-thread',
+                 '9998-12-31T23:30:00.000000000Z',
+                 '9998-12-31T23:30:00.000000000Z',0);
+             INSERT INTO events(
+                id,thread_id,rollout_id,timestamp,source_line,kind,native
+             ) VALUES(
+                'upper-bound-event','upper-bound-thread','upper-bound-rollout',
+                '9998-12-31T23:30:00.000000000Z',1,'state',1
+             );",
+        )
+        .unwrap();
+
+    let all = get_json(&harness.app, "/api/v1/stats?range=all").await;
+    let rows = all["rows"].as_array().unwrap();
+    assert!(rows.iter().all(|row| {
+        row["label"]
+            .as_str()
+            .and_then(|label| label.parse::<i32>().ok())
+            .is_some_and(|year| (1970..=9998).contains(&year))
+    }));
+    let final_row = rows
+        .iter()
+        .find(|row| row["label"] == "9998")
+        .expect("the upper supported year must remain represented");
+    assert_eq!(final_row["periodEnd"], "9999-01-01T00:00:00+00:00");
+    assert_eq!(final_row["sessionCount"], 1);
+
+    let transition_day = get_json(&harness.app, "/api/v1/stats?range=day&anchor=2026-04-05").await;
+    let labels = transition_day["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["label"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        labels.iter().any(|label| label.ends_with(":30")),
+        "Lord Howe's half-hour DST transition must remain visible in labels: {labels:?}"
+    );
+}
+
+#[tokio::test]
 async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() {
     let (pricing_url, _pricing_server) = pricing_fixture_server().await;
     let harness = harness_with_pricing_url(pricing_url.clone());
 
     let before = get_json(
         &harness.app,
-        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/usage"),
+        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/summary"),
     )
     .await;
     assert!(before["totals"]["costUsd"].is_null());
     assert_eq!(before["totals"]["unpricedTokens"], 25_607);
-    assert_eq!(before["pricing"]["complete"], false);
+    assert_eq!(before["totals"]["pricingComplete"], false);
     let unknown = get_json(&harness.app, "/api/v1/prices?q=codex&page=1&pageSize=25").await;
     assert!(unknown["lastRefreshAt"].is_null());
     assert!(unknown["lastRefreshErrorAt"].is_null());
     assert!(unknown["refreshErrorKind"].is_null());
     assert!(unknown["refreshError"].is_null());
     assert!(unknown["source"].is_null());
+    assert!(unknown.get("observedUnknown").is_none());
+    let unknown_metadata = get_json(&harness.app, "/api/v1/prices/metadata").await;
+    assert!(unknown_metadata["aliasesTotal"].as_u64().is_some());
+    assert!(unknown_metadata["observedUnknownTotal"].as_u64().unwrap() >= 1);
     assert!(
-        unknown["observedUnknown"]
+        unknown_metadata["observedUnknown"]
             .as_array()
             .unwrap()
             .iter()
@@ -2370,9 +2734,9 @@ async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() 
         "/api/v1/prices/contract-test-model",
         Some(json!({
             "effectiveFrom": "2026-01-01",
-            "inputPerMillion": 2.0,
+            "inputPerMillion": "2.0",
             "cachedInputPerMillion": null,
-            "outputPerMillion": 3.0,
+            "outputPerMillion": "3.0",
             "currency": "USD"
         })),
     )
@@ -2384,6 +2748,9 @@ async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() 
         String::from_utf8_lossy(&body)
     );
     assert!(body.is_empty());
+
+    let model_ids = get_json(&harness.app, "/api/v1/prices/model-ids?q=CONTRACT&limit=1").await;
+    assert_eq!(model_ids["items"], json!(["contract-test-model"]));
 
     let (status, _, body) = raw_request(
         &harness.app,
@@ -2401,45 +2768,30 @@ async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() 
 
     let repriced = get_json(
         &harness.app,
-        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/usage"),
+        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/summary"),
     )
     .await;
-    close(repriced["totals"]["costUsd"].as_f64().unwrap(), 0.051411);
+    assert_usd(&repriced["totals"]["costUsd"], "0.051411");
     assert_eq!(repriced["totals"]["unpricedTokens"], 0);
-    assert_eq!(repriced["pricing"]["complete"], true);
+    assert_eq!(repriced["totals"]["pricingComplete"], true);
     let repriced_session_row = get_json(
         &harness.app,
         &format!("/api/v1/sessions?q={GUARDIAN_SESSION}&pageSize=50"),
     )
     .await;
-    close(
-        repriced_session_row["items"][0]["costUsd"]
-            .as_f64()
-            .unwrap(),
-        0.051411,
-    );
+    assert_usd(&repriced_session_row["items"][0]["costUsd"], "0.051411");
     assert_eq!(repriced_session_row["items"][0]["unpricedTokens"], 0);
     let repriced_stats = get_json(&harness.app, "/api/v1/stats?range=day&anchor=2026-07-15").await;
     assert_eq!(repriced_stats["totals"]["unpricedTokens"], 0);
-    close(
-        repriced_stats["totals"]["costUsd"].as_f64().unwrap(),
-        1.270310,
-    );
+    assert_usd(&repriced_stats["totals"]["costUsd"], "1.27031");
     let repriced_year = get_json(&harness.app, "/api/v1/overview/year?year=2026").await;
-    assert!(
-        repriced_year["topProjects"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["costUsd"].is_number() && row["share"].is_number())
-    );
-    assert!(
-        repriced_year["topSessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["costUsd"].is_number())
-    );
+    for row in repriced_year["topProjects"].as_array().unwrap() {
+        let _ = usd_units(&row["costUsd"]);
+        assert!(row["share"].is_number());
+    }
+    for row in repriced_year["topSessions"].as_array().unwrap() {
+        let _ = usd_units(&row["costUsd"]);
+    }
     let repriced_settings = get_json(&harness.app, "/api/v1/settings").await;
     assert_eq!(repriced_settings["pricing"]["unpricedTokens"], 0);
     assert_eq!(repriced_settings["pricing"]["complete"], true);
@@ -2456,11 +2808,16 @@ async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() 
     assert_eq!(listed["items"][0]["cachedInputPerMillion"], Value::Null);
     assert_eq!(listed["items"][0]["outputPerMillion"], "3.00");
     assert_eq!(listed["items"][0]["source"], "manual");
-    assert!(listed["aliases"].as_array().unwrap().iter().any(|row| {
+    assert!(listed.get("aliases").is_none());
+    assert!(listed.get("observedUnknown").is_none());
+    let metadata = get_json(&harness.app, "/api/v1/prices/metadata").await;
+    assert!(metadata["aliasesTotal"].as_u64().unwrap() >= 1);
+    assert_eq!(metadata["observedUnknownTotal"], 0);
+    assert!(metadata["aliases"].as_array().unwrap().iter().any(|row| {
         row["observedModelId"] == "codex-auto-review"
             && row["canonicalModelId"] == "contract-test-model"
     }));
-    assert!(listed["observedUnknown"].as_array().unwrap().is_empty());
+    assert!(metadata["observedUnknown"].as_array().unwrap().is_empty());
     let effective_from = listed["items"][0]["effectiveFrom"].as_str().unwrap();
 
     let (status, _, _) = raw_request(
@@ -2473,7 +2830,7 @@ async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() 
     assert_eq!(status, StatusCode::NO_CONTENT);
     let unpriced_again = get_json(
         &harness.app,
-        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/usage"),
+        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/summary"),
     )
     .await;
     assert_eq!(unpriced_again["totals"]["unpricedTokens"], 25_607);
@@ -2558,10 +2915,10 @@ async fn manual_price_canonicalizes_the_key_reprices_usage_and_survives_refresh(
 
     let before = get_json(
         &harness.app,
-        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/usage"),
+        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/summary"),
     )
     .await;
-    close(before["totals"]["costUsd"].as_f64().unwrap(), 0.098976);
+    assert_usd(&before["totals"]["costUsd"], "0.098976");
     let connection = harness.db.connect().unwrap();
     let usage_count_before: i64 = connection
         .query_row("SELECT COUNT(*) FROM usage_facts", [], |row| row.get(0))
@@ -2574,9 +2931,9 @@ async fn manual_price_canonicalizes_the_key_reprices_usage_and_survives_refresh(
         "/api/v1/prices/gpt-5.5",
         Some(json!({
             "effectiveFrom": "1970-01-01T00:00:00+00:00",
-            "inputPerMillion": 10.0,
-            "cachedInputPerMillion": 1.0,
-            "outputPerMillion": 60.0,
+            "inputPerMillion": "10.0",
+            "cachedInputPerMillion": "1.0",
+            "outputPerMillion": "60.0",
             "currency": "USD"
         })),
     )
@@ -2633,10 +2990,10 @@ async fn manual_price_canonicalizes_the_key_reprices_usage_and_survives_refresh(
 
     let after = get_json(
         &harness.app,
-        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/usage"),
+        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/summary"),
     )
     .await;
-    close(after["totals"]["costUsd"].as_f64().unwrap(), 0.197952);
+    assert_usd(&after["totals"]["costUsd"], "0.197952");
 
     let (status, _, _) = raw_request(
         &harness.app,
@@ -2769,19 +3126,6 @@ async fn unknown_only_usage_is_null_priced_but_still_present_on_every_product_su
     assert_eq!(activity["items"][0]["usage"]["totalTokens"], 25_607);
     assert!(activity["items"][0]["usage"]["costUsd"].is_null());
 
-    let usage = get_json(
-        &harness.app,
-        &format!("/api/v1/sessions/{GUARDIAN_SESSION}/usage"),
-    )
-    .await;
-    assert!(usage["totals"]["costUsd"].is_null());
-    assert!(usage["byModel"][0]["costUsd"].is_null());
-    assert!(usage["byAgent"][0]["totals"]["costUsd"].is_null());
-    assert!(usage["byTurn"][0]["totals"]["costUsd"].is_null());
-    assert_eq!(usage["pricing"]["knownCostUsd"], 0.0);
-    assert_eq!(usage["pricing"]["unpricedTokens"], 25_607);
-    assert_eq!(usage["pricing"]["complete"], false);
-
     let overview = get_json(&harness.app, "/api/v1/overview").await;
     assert_eq!(
         overview["periods"]["today"]["totals"]["totalTokens"],
@@ -2810,7 +3154,7 @@ async fn unknown_only_usage_is_null_priced_but_still_present_on_every_product_su
     assert_eq!(top_sessions.len(), 3);
     assert_eq!(top_sessions[0]["id"], MAY_SESSION);
     assert_eq!(top_sessions[0]["unpricedTokens"], 0);
-    assert!(top_sessions[0]["costUsd"].is_number());
+    let _ = usd_units(&top_sessions[0]["costUsd"]);
     assert_eq!(top_sessions[1]["id"], RICH_SESSION);
     assert_eq!(top_sessions[1]["totalTokens"], 85_119);
     assert!(top_sessions[1]["costUsd"].is_null());
@@ -2820,8 +3164,8 @@ async fn unknown_only_usage_is_null_priced_but_still_present_on_every_product_su
     let drivers = overview_year["topProjects"].as_array().unwrap();
     assert_eq!(drivers.len(), 3);
     assert_eq!(drivers[0]["project"], "peregrine");
-    assert!(drivers[0]["costUsd"].is_number());
-    close(drivers[0]["share"].as_f64().unwrap(), 1.0);
+    let _ = usd_units(&drivers[0]["costUsd"]);
+    assert_eq!(drivers[0]["share"].as_f64(), Some(1.0));
     assert_eq!(drivers[1]["project"], "codex-dashboard");
     assert!(drivers[1]["costUsd"].is_null());
     assert!(drivers[1]["share"].is_null());
@@ -2851,9 +3195,9 @@ async fn unknown_only_usage_is_null_priced_but_still_present_on_every_product_su
         .iter()
         .find(|row| row["totalTokens"] == 0)
         .unwrap();
-    assert_eq!(empty_row["costUsd"], 0.0);
+    assert_usd(&empty_row["costUsd"], "0.00");
 
-    let prices = get_json(&harness.app, "/api/v1/prices?page=1&pageSize=25").await;
+    let prices = get_json(&harness.app, "/api/v1/prices/metadata").await;
     assert!(
         prices["observedUnknown"]
             .as_array()
@@ -2894,7 +3238,6 @@ async fn errors_are_json_and_static_routes_use_spa_fallback_without_swallowing_a
         "/api/v1/sessions/missing/summary",
         "/api/v1/sessions/missing/activity?page=1&pageSize=25",
         "/api/v1/sessions/missing/activity/missing-event",
-        "/api/v1/sessions/missing/usage",
     ] {
         let (status, headers, body) = raw_request(&harness.app, Method::GET, uri, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2911,6 +3254,19 @@ async fn errors_are_json_and_static_routes_use_spa_fallback_without_swallowing_a
     let (status, _, body) = raw_request(
         &harness.app,
         Method::GET,
+        &format!("/api/v1/sessions/{RICH_SESSION}/usage"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"],
+        "API route not found"
+    );
+
+    let (status, _, body) = raw_request(
+        &harness.app,
+        Method::GET,
         "/api/v1/sessions/missing/activity/missing-event/attachments/0",
         None,
     )
@@ -2921,10 +3277,24 @@ async fn errors_are_json_and_static_routes_use_spa_fallback_without_swallowing_a
 
     for uri in [
         "/api/v1/sessions?date=not-a-date",
+        "/api/v1/sessions?date=1969-12-31",
+        "/api/v1/sessions?date=9999-12-31",
+        "/api/v1/sessions?date=%2B262142-12-31",
+        "/api/v1/sessions?start=9999-12-31T23%3A59%3A59Z",
         "/api/v1/sessions?start=2026-07-16&end=2026-07-15",
+        "/api/v1/sessions?page=not-a-number",
         "/api/v1/stats?range=quarter",
         "/api/v1/stats?range=day&anchor=not-a-date",
+        "/api/v1/stats?range=day&anchor=1969-12-31",
+        "/api/v1/stats?range=week&anchor=1970-01-01",
+        "/api/v1/stats?range=day&anchor=9999-12-31",
+        "/api/v1/stats?range=week&anchor=9999-12-31",
+        "/api/v1/stats?range=month&anchor=9999-12-31",
+        "/api/v1/stats?range=year&anchor=9999-12-31",
+        "/api/v1/stats?range=day&anchor=%2B262142-12-31",
         "/api/v1/overview/year?year=10000",
+        "/api/v1/prices/model-ids?limit=0",
+        "/api/v1/prices/metadata?unknownLimit=101",
     ] {
         let (status, headers, body) = raw_request(&harness.app, Method::GET, uri, None).await;
         assert_eq!(
@@ -2941,6 +3311,65 @@ async fn errors_are_json_and_static_routes_use_spa_fallback_without_swallowing_a
         );
         assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
     }
+
+    let compatibility_expanding_search = "%EF%AC%83".repeat(256);
+    let uri = format!("/api/v1/prices/model-ids?q={compatibility_expanding_search}");
+    let (status, headers, body) = raw_request(&harness.app, Method::GET, &uri, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"],
+        "model ID search must be at most 256 characters"
+    );
+
+    let malformed_json = Request::builder()
+        .method(Method::PUT)
+        .uri("/api/v1/prices/malformed-json")
+        .header("host", "127.0.0.1")
+        .header("accept", "application/json")
+        .header("content-type", "application/json")
+        .body(Body::from("{"))
+        .unwrap();
+    let response = harness.app.clone().oneshot(malformed_json).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert!(serde_json::from_slice::<Value>(&body).unwrap()["error"].is_string());
+
+    let (status, headers, body) =
+        raw_request(&harness.app, Method::POST, "/api/v1/status", None).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(
+        headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    assert!(headers["allow"].to_str().unwrap().contains("GET"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"],
+        "Method Not Allowed"
+    );
+
+    // Rejected boundary input must not unwind a request worker. A normal
+    // request immediately afterward proves the router remains usable.
+    let (status, _, body) = raw_request(&harness.app, Method::GET, "/api/v1/status", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "status after rejected date boundaries: {}",
+        String::from_utf8_lossy(&body)
+    );
 
     let (status, headers, body) = raw_request(
         &harness.app,
@@ -2964,9 +3393,9 @@ async fn errors_are_json_and_static_routes_use_spa_fallback_without_swallowing_a
         "/api/v1/prices/bad-price",
         Some(json!({
             "effectiveFrom": "2026-01-01",
-            "inputPerMillion": -1.0,
-            "cachedInputPerMillion": 0.1,
-            "outputPerMillion": 2.0
+            "inputPerMillion": "-1.0",
+            "cachedInputPerMillion": "0.1",
+            "outputPerMillion": "2.0"
         })),
     )
     .await;
@@ -2981,9 +3410,9 @@ async fn errors_are_json_and_static_routes_use_spa_fallback_without_swallowing_a
         "/api/v1/prices/bad-date",
         Some(json!({
             "effectiveFrom": "sometime-ish",
-            "inputPerMillion": 1.0,
+            "inputPerMillion": "1.0",
             "cachedInputPerMillion": null,
-            "outputPerMillion": 2.0
+            "outputPerMillion": "2.0"
         })),
     )
     .await;
@@ -2998,9 +3427,9 @@ async fn errors_are_json_and_static_routes_use_spa_fallback_without_swallowing_a
         "/api/v1/prices/euro-price",
         Some(json!({
             "effectiveFrom": "2026-01-01",
-            "inputPerMillion": 1.0,
+            "inputPerMillion": "1.0",
             "cachedInputPerMillion": null,
-            "outputPerMillion": 2.0,
+            "outputPerMillion": "2.0",
             "currency": "EUR"
         })),
     )
@@ -3082,6 +3511,17 @@ async fn browser_boundary_rejects_rebinding_and_cross_origin_mutations() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"],
+        "request host must be localhost or a loopback address"
+    );
 
     let response = harness
         .app
@@ -3102,9 +3542,17 @@ async fn browser_boundary_rejects_rebinding_and_cross_origin_mutations() {
     );
     assert_eq!(response.headers()["x-frame-options"], "DENY");
 
-    for (header, value) in [
-        ("origin", "https://attacker.example"),
-        ("sec-fetch-site", "cross-site"),
+    for (header, value, expected_error) in [
+        (
+            "origin",
+            "https://attacker.example",
+            "mutation origin does not match the local application",
+        ),
+        (
+            "sec-fetch-site",
+            "cross-site",
+            "cross-origin mutations are not allowed",
+        ),
     ] {
         let response = harness
             .app
@@ -3121,5 +3569,16 @@ async fn browser_boundary_rejects_rebinding_and_cross_origin_mutations() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"],
+            expected_error
+        );
     }
 }

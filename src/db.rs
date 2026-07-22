@@ -23,7 +23,7 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        let path = canonicalize_storage_path(path.as_ref())?;
         let pricing_config = path.with_extension("pricing.json");
         Self::open_with_pricing_config(path, pricing_config)
     }
@@ -32,11 +32,7 @@ impl Db {
         path: impl AsRef<Path>,
         pricing_config: impl AsRef<Path>,
     ) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+        let path = canonicalize_storage_path(path.as_ref())?;
         // Probe an existing database read-only before WAL setup, permission
         // repair, migrations, seeding, or pricing hydration can mutate it.
         // An older binary must never try to reinterpret a newer schema.
@@ -50,7 +46,7 @@ impl Db {
         }
         let db = Self {
             path,
-            manual_pricing: ManualPricingStore::new(pricing_config.as_ref().to_path_buf()),
+            manual_pricing: ManualPricingStore::new(pricing_config.as_ref().to_path_buf())?,
         };
         let connection = db.connect()?;
         restrict_private_file(&db.path)?;
@@ -94,6 +90,33 @@ impl Db {
         transaction.commit()?;
         Ok(value)
     }
+}
+
+/// Resolve a storage file to one stable absolute identity before locks,
+/// sidecars, or atomic replacement paths are derived from it.
+///
+/// Existing files (including symlinks) resolve to their real target. For a
+/// file that does not exist yet, canonicalize its created parent and append
+/// the original file name. This gives aliases of the same target one lock and
+/// prevents an atomic rename from replacing a symlink itself.
+pub(crate) fn canonicalize_storage_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() || std::fs::symlink_metadata(path).is_ok() {
+        return std::fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve {}", path.display()));
+    }
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("storage path has no file name: {}", path.display()))?;
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("failed to resolve {}", parent.display()))?;
+    Ok(parent.join(file_name))
 }
 
 fn enable_wal(connection: &Connection) -> Result<()> {
@@ -365,6 +388,249 @@ mod tests {
             );
             assert!(result.is_err(), "{id} must violate the final schema");
         }
+        for statement in [
+            "INSERT INTO usage_facts(
+                id,thread_id,rollout_id,timestamp,source_line,model,
+                input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens
+             ) VALUES(
+                'reasoning-over-output','thread','rollout','2026-01-01T00:00:00Z',1,'model',
+                10,0,5,6,15
+             )",
+            "INSERT INTO usage_facts(
+                id,thread_id,rollout_id,timestamp,source_line,model,
+                input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens
+             ) VALUES(
+                'contradictory-total','thread','rollout','2026-01-01T00:00:00Z',1,'model',
+                10,0,5,1,999
+             )",
+        ] {
+            assert!(
+                connection.execute_batch(statement).is_err(),
+                "contradictory token accounting must violate the baseline schema"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_point_domains_reject_real_or_overflowing_arithmetic() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,started_at,last_event_at)
+                    VALUES('thread','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at)
+                    VALUES('rollout','thread','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+                 INSERT INTO model_prices(
+                    model_id,effective_from,input_microusd_per_million,
+                    cached_input_microusd_per_million,output_microusd_per_million,
+                    currency,source
+                 ) VALUES(
+                    'boundary','1970-01-01T00:00:00.000000000Z',
+                    1000000000,1000000000,1000000000,'USD','manual'
+                 );
+                 INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,timestamp,source_line,model,
+                    input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens
+                 ) VALUES(
+                    'boundary','thread','rollout','2026-01-01T00:00:00Z',1,'boundary',
+                    2000000000,0,2000000000,0,4000000000
+                 );",
+            )
+            .unwrap();
+
+        let priced: (String, i64) = connection
+            .query_row(
+                "SELECT typeof(cost_microusd),cost_microusd
+                 FROM priced_usage WHERE id='boundary'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(priced, ("integer".into(), 4_000_000_000_000));
+
+        for statement in [
+            "INSERT INTO model_prices(
+                model_id,effective_from,input_microusd_per_million,
+                output_microusd_per_million,currency,source
+             ) VALUES('too-expensive','1970-01-01T00:00:00Z',1000000001,0,'USD','manual')",
+            "INSERT INTO usage_facts(
+                id,thread_id,rollout_id,timestamp,source_line,model,
+                input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens
+             ) VALUES(
+                'too-many','thread','rollout','2026-01-01T00:00:01Z',2,'boundary',
+                4000000001,0,0,0,0
+             )",
+            "INSERT INTO usage_facts(
+                id,thread_id,rollout_id,timestamp,source_line,model,
+                input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens
+             ) VALUES(
+                'real-token','thread','rollout','2026-01-01T00:00:02Z',3,'boundary',
+                1.5,0,0,0,0
+             )",
+        ] {
+            assert!(
+                connection.execute_batch(statement).is_err(),
+                "the fixed-point domain must reject: {statement}"
+            );
+        }
+
+        connection
+            .execute(
+                "UPDATE usage_global_totals
+                 SET input_tokens=9007197254740991,
+                     output_tokens=2000000000,
+                     total_tokens=9007199254740991
+                 WHERE id=1",
+                [],
+            )
+            .unwrap();
+        let overflow = connection.execute_batch(
+            "INSERT INTO usage_facts(
+                id,thread_id,rollout_id,timestamp,source_line,model,
+                input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens
+             ) VALUES(
+                'global-overflow','thread','rollout','2026-01-01T00:00:03Z',4,'boundary',
+                1,0,0,0,1
+             )",
+        );
+        assert!(overflow.is_err());
+        let unchanged: (i64, String, i64) = connection
+            .query_row(
+                "SELECT COUNT(*),typeof(input_tokens),input_tokens
+                 FROM usage_activity_rollups",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(unchanged, (1, "integer".into(), 2_000_000_000));
+        let fact_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM usage_facts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fact_count, 1);
+    }
+
+    #[test]
+    fn usage_rollups_follow_updates_foreign_key_nulling_and_deletes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,started_at,last_event_at)
+                    VALUES('thread','2026-01-01T00:00:00Z','2026-01-01T02:00:00Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at)
+                    VALUES('rollout','thread','2026-01-01T00:00:00Z','2026-01-01T02:00:00Z');
+                 INSERT INTO turns(id,thread_id,rollout_id,started_at)
+                    VALUES('turn','thread','rollout','2026-01-01T00:00:00Z');
+                 INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,model,
+                    input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens
+                 ) VALUES
+                    ('usage-a','thread','rollout','turn','2026-01-01T00:10:00Z',1,'model-a',
+                     10,2,3,1,13),
+                    ('usage-b','thread','rollout','turn','2026-01-01T00:20:00Z',2,'model-a',
+                     20,4,6,2,26);",
+            )
+            .unwrap();
+
+        let original: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT fact_count,input_tokens,total_tokens
+                 FROM usage_activity_rollups
+                 WHERE turn_key='turn' AND activity_hour='2026-01-01T00:00:00.000000000Z'
+                   AND model='model-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(original, (2, 30, 39));
+
+        connection
+            .execute(
+                "UPDATE usage_facts SET
+                    timestamp='2026-01-01T01:10:00Z',model='model-b',
+                    input_tokens=40,cached_input_tokens=8,output_tokens=12,
+                    reasoning_tokens=4,total_tokens=52
+                 WHERE id='usage-a'",
+                [],
+            )
+            .unwrap();
+        let old_bucket: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT fact_count,input_tokens,total_tokens
+                 FROM usage_activity_rollups
+                 WHERE turn_key='turn' AND activity_hour='2026-01-01T00:00:00.000000000Z'
+                   AND model='model-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(old_bucket, (1, 20, 26));
+        let moved_bucket: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT fact_count,input_tokens,total_tokens
+                 FROM usage_activity_rollups
+                 WHERE turn_key='turn' AND activity_hour='2026-01-01T01:00:00.000000000Z'
+                   AND model='model-b'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(moved_bucket, (1, 40, 52));
+
+        connection
+            .execute("DELETE FROM turns WHERE id='turn'", [])
+            .unwrap();
+        let detached: Vec<(String, String, i64, i64)> = connection
+            .prepare(
+                "SELECT activity_hour,model,fact_count,total_tokens
+                 FROM usage_activity_rollups WHERE turn_key=''
+                 ORDER BY activity_hour,model",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            detached,
+            [
+                (
+                    "2026-01-01T00:00:00.000000000Z".into(),
+                    "model-a".into(),
+                    1,
+                    26,
+                ),
+                (
+                    "2026-01-01T01:00:00.000000000Z".into(),
+                    "model-b".into(),
+                    1,
+                    52,
+                ),
+            ]
+        );
+        let stale_turn_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM usage_activity_rollups WHERE turn_key='turn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_turn_rows, 0);
+
+        connection
+            .execute("DELETE FROM usage_facts WHERE id='usage-a'", [])
+            .unwrap();
+        let remaining: i64 = connection
+            .query_row("SELECT COUNT(*) FROM usage_activity_rollups", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 1);
     }
 
     #[test]
@@ -447,6 +713,47 @@ mod tests {
         assert_eq!(
             sqlite_sidecar_path(path, "-shm"),
             PathBuf::from("data/private-ledger.sqlite3-shm")
+        );
+    }
+
+    #[test]
+    fn nonexistent_storage_path_uses_canonical_parent_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("new").join("projection.db");
+        let expected_parent = std::fs::canonicalize(temp.path()).unwrap().join("new");
+
+        let db = Db::open(&nested).unwrap();
+
+        assert_eq!(db.path(), expected_parent.join("projection.db"));
+        assert_eq!(
+            db.manual_pricing().path(),
+            expected_parent.join("projection.pricing.json")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_symlink_alias_resolves_to_the_target_identity() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("real.db");
+        let alias = temp.path().join("alias.db");
+        let direct = Db::open(&target).unwrap();
+        symlink(&target, &alias).unwrap();
+
+        let through_alias = Db::open(&alias).unwrap();
+
+        assert_eq!(through_alias.path(), direct.path());
+        assert_eq!(
+            through_alias.manual_pricing().path(),
+            direct.manual_pricing().path()
+        );
+        assert!(
+            std::fs::symlink_metadata(alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 

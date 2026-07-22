@@ -1,12 +1,23 @@
 import { describe, expect, it } from 'vitest'
-import { bytes, duration, ellipsis, estimatedMoney, money, tokens } from './format'
+import {
+  bytes,
+  duration,
+  ellipsis,
+  estimatedMoney,
+  money,
+  relativeTime,
+  shortDate,
+  shortDateTime,
+  time,
+  tokens,
+} from './format'
 
 describe('display formatting', () => {
   it('keeps unknown prices distinct from zero', () => {
     expect(money(null)).toBe('—')
-    expect(money(0)).toBe('$0.00')
-    expect(estimatedMoney(0, 25_607)).toBe('—')
-    expect(estimatedMoney(0, 0)).toBe('$0.00')
+    expect(money('0')).toBe('$0.00')
+    expect(estimatedMoney('0', 25_607)).toBe('—')
+    expect(estimatedMoney('0', 0)).toBe('$0.00')
   })
 
   it('formats token and byte magnitudes for the ledgers', () => {
@@ -28,5 +39,12 @@ describe('display formatting', () => {
     expect(duration(3_599_500)).toBe('1h 0m')
     expect(duration(4_425_000)).toBe('1h 14m')
     expect(duration(16_107_000)).toBe('4h 28m')
+  })
+
+  it('renders invalid dates as unknown instead of throwing', () => {
+    expect(shortDate('not-a-date')).toBe('—')
+    expect(shortDateTime('not-a-date')).toBe('—')
+    expect(time('not-a-date')).toBe('—')
+    expect(relativeTime('not-a-date')).toBe('at an unknown time')
   })
 })

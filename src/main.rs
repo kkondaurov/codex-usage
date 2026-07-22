@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use codex_usage::{
     api::{self, ApiState},
     config::{Command, parse_cli, require_repository_root},
@@ -23,7 +23,8 @@ async fn main() -> Result<()> {
     match cli.command.expect("the parser always supplies a command") {
         Command::Ingest(args) => {
             let common = args.common.resolved();
-            let db = Db::open_with_pricing_config(&common.db, common.pricing_config_path())?;
+            let db = open_configured_db(&common)?;
+            ingest::recover_interrupted_scan(&db)?;
             PricingSync::new(DbExecutor::default())
                 .sync_if_needed(&db, &common.pricing())
                 .await?;
@@ -39,8 +40,16 @@ async fn main() -> Result<()> {
         Command::Serve(args) => {
             let address = args.bind_address()?;
             args.require_frontend_build()?;
+            // Reserve the public process boundary before opening SQLite or
+            // starting background work. If another server already owns this
+            // address, startup must fail without migrating, seeding, scanning,
+            // or refreshing any local state.
+            let listener = tokio::net::TcpListener::bind(address)
+                .await
+                .with_context(|| format!("failed to bind {address}"))?;
             let common = args.common.resolved();
-            let db = Db::open_with_pricing_config(&common.db, common.pricing_config_path())?;
+            let db = open_configured_db(&common)?;
+            ingest::recover_interrupted_scan(&db)?;
             let pricing_config = common.pricing();
             let roots = IngestRoots {
                 active: common.sessions,
@@ -55,10 +64,17 @@ async fn main() -> Result<()> {
             });
             let state = ApiState::new(db.clone(), roots, args.frontend, pricing_config.clone());
             let _pricing_refresher = state.pricing_sync.spawn_refresher(db, pricing_config);
-            api::serve(state, address).await?;
+            api::serve(state, listener).await?;
         }
     }
     Ok(())
+}
+
+fn open_configured_db(common: &codex_usage::config::CommonArgs) -> Result<Db> {
+    match common.pricing_config.as_ref() {
+        Some(path) => Db::open_with_pricing_config(&common.db, path),
+        None => Db::open(&common.db),
+    }
 }
 
 #[cfg(unix)]

@@ -1,3 +1,4 @@
+use crate::money::UsdAmount;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -9,9 +10,9 @@ pub struct Totals {
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
     pub blended_tokens: u64,
-    pub cost_usd: Option<f64>,
+    pub cost_usd: Option<UsdAmount>,
     #[serde(skip)]
-    pub known_cost_usd: f64,
+    pub known_cost_numerator: i128,
     pub unpriced_tokens: u64,
     pub pricing_complete: bool,
 }
@@ -24,7 +25,9 @@ impl Totals {
             .saturating_add(self.cached_input_tokens / 10)
             .saturating_add(self.output_tokens);
         self.pricing_complete = self.unpriced_tokens == 0;
-        self.cost_usd = self.pricing_complete.then_some(self.known_cost_usd);
+        self.cost_usd = self
+            .pricing_complete
+            .then_some(UsdAmount::from_cost_numerator(self.known_cost_numerator));
         self
     }
 }

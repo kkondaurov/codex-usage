@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 interface AsyncCacheEntry {
   data?: unknown
   fetchedAt: number
+  lastAccessedAt: number
   hasData: boolean
   inFlight?: Promise<unknown>
   controller?: AbortController
@@ -17,6 +18,8 @@ interface AsyncCacheSnapshot<T> {
 
 const asyncCache = new Map<string, AsyncCacheEntry>()
 const ORPHANED_REQUEST_GRACE_MS = 100
+const MAX_ASYNC_CACHE_ENTRIES = 64
+const MAX_ASYNC_CACHE_AGE_MS = 30 * 60 * 1000
 
 interface AsyncState<T> {
   identity: object
@@ -33,6 +36,7 @@ function dependenciesMatch(left: unknown[], right: unknown[]) {
 function cachedSnapshot<T>(key: string): AsyncCacheSnapshot<T> | null {
   const entry = asyncCache.get(key)
   if (!entry?.hasData) return null
+  entry.lastAccessedAt = Date.now()
   return { data: entry.data as T, fetchedAt: entry.fetchedAt }
 }
 
@@ -45,10 +49,28 @@ function isAbortError(error: unknown) {
 function ensureAsyncCacheEntry(key: string) {
   let entry = asyncCache.get(key)
   if (!entry) {
-    entry = { fetchedAt: 0, hasData: false, subscribers: 0 }
+    entry = { fetchedAt: 0, lastAccessedAt: Date.now(), hasData: false, subscribers: 0 }
     asyncCache.set(key, entry)
   }
+  entry.lastAccessedAt = Date.now()
   return entry
+}
+
+function pruneAsyncCache(protectedKey?: string) {
+  const now = Date.now()
+  const removable = [...asyncCache.entries()]
+    .filter(([key, entry]) => key !== protectedKey && entry.subscribers === 0 && !entry.inFlight)
+    .sort((left, right) => left[1].lastAccessedAt - right[1].lastAccessedAt)
+
+  for (const [key, entry] of removable) {
+    if (
+      now - entry.lastAccessedAt >= MAX_ASYNC_CACHE_AGE_MS
+      || asyncCache.size > MAX_ASYNC_CACHE_ENTRIES
+    ) {
+      if (entry.orphanTimer !== undefined) window.clearTimeout(entry.orphanTimer)
+      asyncCache.delete(key)
+    }
+  }
 }
 
 function retainCached(key: string) {
@@ -65,7 +87,12 @@ function releaseCached(key: string) {
   if (!entry) return
 
   entry.subscribers = Math.max(0, entry.subscribers - 1)
-  if (entry.subscribers > 0 || !entry.inFlight || entry.orphanTimer !== undefined) return
+  if (entry.subscribers > 0) return
+  if (!entry.inFlight) {
+    pruneAsyncCache()
+    return
+  }
+  if (entry.orphanTimer !== undefined) return
 
   entry.orphanTimer = window.setTimeout(() => {
     const current = asyncCache.get(key)
@@ -99,7 +126,9 @@ function loadCached<T>(key: string, loader: AsyncLoader<T>): Promise<T> {
       if (current?.inFlight === promise) {
         current.data = next
         current.fetchedAt = Date.now()
+        current.lastAccessedAt = current.fetchedAt
         current.hasData = true
+        pruneAsyncCache(key)
       }
       return next
     })
@@ -162,7 +191,7 @@ export function useAsync<T>(loader: AsyncLoader<T>, dependencies: unknown[], ref
     inFlight.current = true
     if (!quiet) {
       setState(current => current.identity === identity
-        ? { ...current, loading: true }
+        ? { ...current, error: null, loading: true }
         : { identity, data: null, error: null, loading: true, lastSuccessfulAt: null })
     }
     try {
@@ -240,7 +269,10 @@ export function useCachedAsync<T>(
 
   const refresh = useCallback(async (quiet = false) => {
     const sequence = ++requestSequence.current
-    if (!quiet) setLoading(true)
+    if (!quiet) {
+      setError(null)
+      setLoading(true)
+    }
     try {
       const next = await loadCached(cacheKey, signal => loaderRef.current(signal))
       if (mounted.current && sequence === requestSequence.current) {

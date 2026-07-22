@@ -98,6 +98,7 @@ fn authoritative_root_meta(timestamp: &str) -> Value {
             "id": ROOT,
             "session_id": ROOT,
             "cwd": "/tmp/root-authoritative",
+            "thread_name": "Stale root title",
             "source": "vscode",
             "thread_source": "user",
             "git": {
@@ -116,6 +117,7 @@ fn conflicting_child_meta(timestamp: &str) -> Value {
             "id": CHILD,
             "session_id": ROOT,
             "cwd": "/tmp/child-metadata",
+            "thread_name": "Child rollout is not a root title authority",
             "thread_source": "subagent",
             "git": {
                 "repository_url": "https://example.test/child.git",
@@ -217,6 +219,24 @@ fn tool_output(timestamp: &str, call_id: &str, output: &str) -> Value {
             "type": "function_call_output",
             "call_id": call_id,
             "output": output
+        }
+    })
+}
+
+fn subagent_activity(
+    timestamp: &str,
+    agent_thread_id: &str,
+    agent_path: &str,
+    kind: &str,
+) -> Value {
+    json!({
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "sub_agent_activity",
+            "agent_thread_id": agent_thread_id,
+            "agent_path": agent_path,
+            "kind": kind
         }
     })
 }
@@ -424,7 +444,7 @@ fn projection_is_deterministic_when_source_names_reverse_discovery_order() {
 fn ingest_owner_metadata(
     root_name: &str,
     child_name: &str,
-) -> (String, String, String, String, String, String, i64) {
+) -> (String, String, String, String, String, Option<String>, i64) {
     let harness = Harness::new();
     write_jsonl(
         &harness.active.join(root_name),
@@ -468,7 +488,7 @@ fn native_root_metadata_is_authoritative_in_both_discovery_orders() {
         "https://example.test/root.git".into(),
         "root-main".into(),
         "vscode".into(),
-        "\"vscode\"".into(),
+        None,
         1,
     );
     assert_eq!(
@@ -478,6 +498,170 @@ fn native_root_metadata_is_authoritative_in_both_discovery_orders() {
     assert_eq!(
         ingest_owner_metadata("z-root.jsonl", "a-child.jsonl"),
         expected
+    );
+}
+
+#[derive(Debug, PartialEq)]
+struct ProjectedThreadMetadata {
+    id: String,
+    title: Option<String>,
+    cwd: Option<String>,
+    project: Option<String>,
+    repository_url: Option<String>,
+    branch: Option<String>,
+    source: Option<String>,
+    thread_source: Option<String>,
+    source_json: Option<String>,
+    started_at: String,
+    last_event_at: String,
+    title_updated_at: Option<String>,
+    root_metadata_seen: i64,
+}
+
+fn projected_thread_metadata(connection: &Connection) -> ProjectedThreadMetadata {
+    connection
+        .query_row(
+            "SELECT id,title,cwd,project,repository_url,branch,source,thread_source,source_json,
+                    started_at,last_event_at,title_updated_at,root_metadata_seen
+             FROM threads WHERE id=?1",
+            [ROOT],
+            |row| {
+                Ok(ProjectedThreadMetadata {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    cwd: row.get(2)?,
+                    project: row.get(3)?,
+                    repository_url: row.get(4)?,
+                    branch: row.get(5)?,
+                    source: row.get(6)?,
+                    thread_source: row.get(7)?,
+                    source_json: row.get(8)?,
+                    started_at: row.get(9)?,
+                    last_event_at: row.get(10)?,
+                    title_updated_at: row.get(11)?,
+                    root_metadata_seen: row.get(12)?,
+                })
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn removing_root_rollout_recomputes_thread_metadata_from_surviving_child() {
+    let incremental = Harness::new();
+    let root_path = incremental.active.join("a-root.jsonl");
+    write_jsonl(
+        &root_path,
+        &[authoritative_root_meta("2026-07-15T09:00:00Z")],
+    );
+    write_jsonl(
+        &incremental.active.join("z-child.jsonl"),
+        &[conflicting_child_meta("2026-07-15T09:01:00Z")],
+    );
+    assert_eq!(
+        scan_once(&incremental.db, &incremental.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+    fs::remove_file(root_path).unwrap();
+    assert_eq!(
+        scan_once(&incremental.db, &incremental.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+
+    let fresh = Harness::new();
+    write_jsonl(
+        &fresh.active.join("z-child.jsonl"),
+        &[conflicting_child_meta("2026-07-15T09:01:00Z")],
+    );
+    assert_eq!(
+        scan_once(&fresh.db, &fresh.roots()).unwrap().files_failed,
+        0
+    );
+
+    assert_eq!(
+        projected_thread_metadata(&incremental.db.connect().unwrap()),
+        projected_thread_metadata(&fresh.db.connect().unwrap())
+    );
+    assert_eq!(
+        canonical_projection(&incremental.db.connect().unwrap()),
+        canonical_projection(&fresh.db.connect().unwrap())
+    );
+}
+
+#[test]
+fn removing_promoted_child_restores_surviving_parent_agent_observation() {
+    let root_records = [
+        root_meta("2026-07-15T09:00:00Z", ROOT),
+        subagent_activity(
+            "2026-07-15T09:00:01Z",
+            CHILD,
+            "/root/contract-child",
+            "completed",
+        ),
+    ];
+    let child_records = [child_meta("2026-07-15T09:01:00Z", CHILD, ROOT)];
+
+    let incremental = Harness::new();
+    write_jsonl(&incremental.active.join("a-root.jsonl"), &root_records);
+    let child_path = incremental.active.join("z-child.jsonl");
+    write_jsonl(&child_path, &child_records);
+    assert_eq!(
+        scan_once(&incremental.db, &incremental.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+    fs::remove_file(child_path).unwrap();
+    assert_eq!(
+        scan_once(&incremental.db, &incremental.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+
+    let fresh = Harness::new();
+    write_jsonl(&fresh.active.join("a-root.jsonl"), &root_records);
+    assert_eq!(
+        scan_once(&fresh.db, &fresh.roots()).unwrap().files_failed,
+        0
+    );
+
+    assert_eq!(
+        canonical_projection(&incremental.db.connect().unwrap()),
+        canonical_projection(&fresh.db.connect().unwrap())
+    );
+    let restored: (Option<String>, String, String, Option<String>, String) = incremental
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT rollout_id,parent_rollout_id,status,completed_at,agent_path
+             FROM agent_runs WHERE id=?1",
+            [CHILD],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        restored,
+        (
+            None,
+            ROOT.into(),
+            "completed".into(),
+            Some("2026-07-15T09:00:01.000000000Z".into()),
+            "/root/contract-child".into(),
+        )
     );
 }
 

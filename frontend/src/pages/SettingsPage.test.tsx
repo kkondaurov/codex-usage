@@ -3,13 +3,11 @@ import { MemoryRouter, useNavigate } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../api'
 import { useCachedAsync } from '../hooks'
-import type { PricesResponse, SettingsResponse } from '../types'
+import type { PriceMetadataResponse, PricesResponse, SettingsResponse } from '../types'
 import { SettingsPage } from './SettingsPage'
 
 const prices: PricesResponse = {
   items: [],
-  aliases: [],
-  observedUnknown: [],
   page: 1,
   pageSize: 25,
   total: 0,
@@ -20,6 +18,7 @@ const prices: PricesResponse = {
   refreshErrorKind: null,
   source: null,
 }
+const priceMetadata: PriceMetadataResponse = { aliases: [], aliasesTotal: 0, observedUnknown: [], observedUnknownTotal: 0 }
 
 const settings: SettingsResponse = {
   databasePath: '/tmp/codex-usage.db',
@@ -29,7 +28,17 @@ const settings: SettingsResponse = {
   lastIngestAt: '2026-07-19T12:00:00Z',
   sessionCount: 2270,
   databaseBytes: 3_435_973_837,
-  pricing: { knownCostUsd: 1, unpricedTokens: 0, complete: true },
+  pricing: { knownCostUsd: '1', unpricedTokens: 0, complete: true },
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: Error) => void
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve
+    reject = nextReject
+  })
+  return { promise, resolve, reject }
 }
 
 function CachedSurface({ cacheKey, loader }: { cacheKey: string; loader: () => Promise<string> }) {
@@ -48,10 +57,25 @@ afterEach(() => {
 })
 beforeEach(() => {
   vi.spyOn(api, 'pricedModelIds').mockResolvedValue([])
+  vi.spyOn(api, 'priceMetadata').mockResolvedValue(priceMetadata)
   vi.spyOn(api, 'settings').mockResolvedValue(settings)
 })
 
 describe('SettingsPage price editor', () => {
+  it('states when the bounded alias ledger omits additional mappings', async () => {
+    vi.spyOn(api, 'prices').mockResolvedValue(prices)
+    vi.mocked(api.priceMetadata).mockResolvedValue({
+      aliases: [{ observedModelId: 'legacy-model', canonicalModelId: 'gpt-5.5' }],
+      aliasesTotal: 120,
+      observedUnknown: [],
+      observedUnknownTotal: 0,
+    })
+    render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
+
+    expect(await screen.findByText('Showing the first 1 of 120 model aliases.')).toBeVisible()
+    expect(screen.getByText('legacy-model')).toBeVisible()
+  })
+
   it('surfaces the local database footprint and explains that retained history can grow', async () => {
     vi.spyOn(api, 'prices').mockResolvedValue(prices)
     render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
@@ -193,6 +217,101 @@ describe('SettingsPage price editor', () => {
     await waitFor(() => expect(loadPrices).toHaveBeenLastCalledWith({ q: 'gpt-5.6-sol', page: 1 }, expect.any(AbortSignal)))
   })
 
+  it('keeps the search and table shell mounted and focused while filtered prices load', async () => {
+    let resolveFiltered!: (value: PricesResponse) => void
+    const filtered = new Promise<PricesResponse>(resolve => { resolveFiltered = resolve })
+    const loadPrices = vi.spyOn(api, 'prices')
+      .mockResolvedValueOnce(prices)
+      .mockReturnValueOnce(filtered)
+
+    render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
+
+    const search = await screen.findByRole('textbox', { name: 'Search model prices' })
+    search.focus()
+    fireEvent.change(search, { target: { value: 'sol' } })
+    await waitFor(() => expect(loadPrices).toHaveBeenCalledTimes(2))
+
+    expect(search).toHaveFocus()
+    expect(screen.getByRole('table', { name: 'Model prices' })).toBeVisible()
+    expect(screen.getByRole('region', { name: 'Scrollable model price ledger' })).toHaveAttribute('aria-busy', 'true')
+
+    resolveFiltered(prices)
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Scrollable model price ledger' })).not.toHaveAttribute('aria-busy'))
+    expect(search).toHaveFocus()
+  })
+
+  it('keeps the focused price paginator mounted without retaining prior-page rows', async () => {
+    const row = {
+      modelId: 'gpt-page-one',
+      effectiveFrom: '1970-01-01T00:00:00Z',
+      effectiveTo: null,
+      inputPerMillion: '1.00',
+      cachedInputPerMillion: null,
+      outputPerMillion: '2.00',
+      currency: 'USD',
+      source: 'remote:test',
+    }
+    let resolveSecond!: (value: PricesResponse) => void
+    const second = new Promise<PricesResponse>(resolve => { resolveSecond = resolve })
+    vi.spyOn(api, 'prices')
+      .mockResolvedValueOnce({ ...prices, items: [row], page: 1, total: 50, totalPages: 2 })
+      .mockReturnValueOnce(second)
+
+    render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
+
+    const nextPage = await screen.findByRole('button', { name: '02' })
+    nextPage.focus()
+    fireEvent.click(nextPage)
+    await waitFor(() => expect(api.prices).toHaveBeenCalledTimes(2))
+
+    expect(nextPage).toHaveFocus()
+    expect(nextPage).not.toBeDisabled()
+    expect(nextPage).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByRole('navigation', { name: 'Pagination' })).toHaveAttribute('aria-busy', 'true')
+    expect(screen.queryByText('gpt-page-one')).not.toBeInTheDocument()
+    expect(screen.getByRole('table', { name: 'Model prices' })).toBeVisible()
+
+    resolveSecond({ ...prices, items: [{ ...row, modelId: 'gpt-page-two' }], page: 2, total: 50, totalPages: 2 })
+    expect(await screen.findByText('gpt-page-two')).toBeVisible()
+    expect(nextPage).toHaveFocus()
+    expect(nextPage).not.toHaveAttribute('aria-disabled')
+  })
+
+  it('keeps retained price pagination inert after a replacement page fails', async () => {
+    const row = {
+      modelId: 'gpt-page-one',
+      effectiveFrom: '1970-01-01T00:00:00Z',
+      effectiveTo: null,
+      inputPerMillion: '1.00',
+      cachedInputPerMillion: null,
+      outputPerMillion: '2.00',
+      currency: 'USD',
+      source: 'remote:test',
+    }
+    const second = deferred<PricesResponse>()
+    vi.spyOn(api, 'prices')
+      .mockResolvedValueOnce({ ...prices, items: [row], page: 1, total: 50, totalPages: 2 })
+      .mockReturnValueOnce(second.promise)
+
+    render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
+
+    const nextPage = await screen.findByRole('button', { name: '02' })
+    nextPage.focus()
+    fireEvent.click(nextPage)
+    await waitFor(() => expect(api.prices).toHaveBeenCalledTimes(2))
+    second.reject(new Error('price page failed'))
+
+    expect(await screen.findByText('price page failed')).toBeVisible()
+    expect(nextPage).toHaveFocus()
+    expect(nextPage).not.toBeDisabled()
+    expect(nextPage).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByRole('navigation', { name: 'Pagination' })).toHaveAttribute('aria-busy', 'true')
+    expect(screen.queryByText('gpt-page-one')).not.toBeInTheDocument()
+
+    fireEvent.click(nextPage)
+    expect(api.prices).toHaveBeenCalledTimes(2)
+  })
+
   it('resynchronizes the search field when browser history changes the query', async () => {
     const loadPrices = vi.spyOn(api, 'prices').mockResolvedValue(prices)
     render(
@@ -242,7 +361,7 @@ describe('SettingsPage price editor', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /ADD ALIAS/ }))
 
-    await waitFor(() => expect(api.pricedModelIds).toHaveBeenCalledOnce())
+    await waitFor(() => expect(api.pricedModelIds).toHaveBeenCalledWith({ q: undefined, limit: 100 }, expect.any(AbortSignal)))
     expect(document.querySelector('option[value="gpt-first-page"]')).toBeInTheDocument()
     expect(document.querySelector('option[value="gpt-last-page"]')).toBeInTheDocument()
   })
@@ -343,6 +462,62 @@ describe('SettingsPage price editor', () => {
     expect(savePrice).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps a pending price save modal and does not let its late completion close a newer editor', async () => {
+    const save = deferred<void>()
+    const loadPrices = vi.spyOn(api, 'prices').mockResolvedValue(prices)
+    vi.spyOn(api, 'savePrice').mockReturnValue(save.promise)
+
+    render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
+    fireEvent.click(await screen.findByRole('button', { name: /ADD PRICE/ }))
+    fireEvent.change(screen.getByLabelText('MODEL ID'), { target: { value: 'gpt-pending' } })
+    fireEvent.change(screen.getByLabelText('INPUT / 1M'), { target: { value: '1' } })
+    fireEvent.change(screen.getByLabelText('OUTPUT / 1M'), { target: { value: '2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'SAVE PRICE' }))
+
+    await waitFor(() => expect(api.savePrice).toHaveBeenCalledOnce())
+    const dialog = screen.getByRole('dialog', { name: 'Add model price' })
+    const close = screen.getByRole('button', { name: 'Close' })
+    const cancel = screen.getByRole('button', { name: 'CANCEL' })
+    expect(close).toBeDisabled()
+    expect(cancel).toBeDisabled()
+    fireEvent.click(close)
+    fireEvent.click(cancel)
+    fireEvent.keyDown(document, { key: 'Escape' })
+    fireEvent.mouseDown(dialog.parentElement!)
+    expect(screen.getByRole('dialog', { name: 'Add model price' })).toBeInTheDocument()
+
+    // Defensive identity check: even a programmatic replacement is not owned by the old save.
+    fireEvent.click(screen.getByRole('button', { name: /ADD ALIAS/ }))
+    expect(screen.getByRole('dialog', { name: 'Map observed model ID' })).toBeInTheDocument()
+    save.resolve()
+
+    await waitFor(() => expect(loadPrices).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('dialog', { name: 'Map observed model ID' })).toBeInTheDocument()
+  })
+
+  it('keeps a pending alias save modal until the mutation completes', async () => {
+    const save = deferred<void>()
+    vi.spyOn(api, 'prices').mockResolvedValue(prices)
+    vi.spyOn(api, 'saveAlias').mockReturnValue(save.promise)
+
+    render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
+    fireEvent.click(await screen.findByRole('button', { name: /ADD ALIAS/ }))
+    fireEvent.change(screen.getByLabelText('OBSERVED MODEL ID'), { target: { value: 'gpt-observed' } })
+    fireEvent.change(screen.getByLabelText('CANONICAL MODEL ID'), { target: { value: 'gpt-canonical' } })
+    fireEvent.click(screen.getByRole('button', { name: 'SAVE MAPPING' }))
+
+    await waitFor(() => expect(api.saveAlias).toHaveBeenCalledOnce())
+    const dialog = screen.getByRole('dialog', { name: 'Map observed model ID' })
+    expect(screen.getByRole('button', { name: 'Close' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'CANCEL' })).toBeDisabled()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    fireEvent.mouseDown(dialog.parentElement!)
+    expect(screen.getByRole('dialog', { name: 'Map observed model ID' })).toBeInTheDocument()
+
+    save.resolve()
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Map observed model ID' })).not.toBeInTheDocument())
+  })
+
   it('contains price-editor focus and restores it to the opening control', async () => {
     vi.spyOn(api, 'prices').mockResolvedValue(prices)
     render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
@@ -394,9 +569,12 @@ describe('SettingsPage price editor', () => {
   })
 
   it('starts a locked unknown-model mapping at the canonical model field', async () => {
-    vi.spyOn(api, 'prices').mockResolvedValue({
-      ...prices,
+    vi.spyOn(api, 'prices').mockResolvedValue(prices)
+    vi.mocked(api.priceMetadata).mockResolvedValue({
+      aliases: [],
+      aliasesTotal: 0,
       observedUnknown: [{ modelId: 'unpriced-model', usageCount: 1, totalTokens: 42, lastSeenAt: '2026-07-18T12:00:00Z' }],
+      observedUnknownTotal: 1,
     })
     render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
 

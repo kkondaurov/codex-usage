@@ -109,11 +109,9 @@ pub struct CommonArgs {
 
 impl CommonArgs {
     pub fn resolved(mut self) -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        if self.sessions.is_none() {
+        if self.sessions.is_none() && self.archive.is_none() {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
             self.sessions = home.as_ref().map(|path| path.join(".codex/sessions"));
-        }
-        if self.archive.is_none() {
             self.archive = home
                 .as_ref()
                 .map(|path| path.join(".codex/archived_sessions"));
@@ -235,6 +233,27 @@ mod tests {
             );
             assert!(error.contains("localhost-only"), "{error}");
         }
+    }
+
+    #[test]
+    fn one_explicit_ingest_root_does_not_enable_the_other_default_root() {
+        let sessions = PathBuf::from("/explicit/sessions");
+        let sessions_only = CommonArgs {
+            sessions: Some(sessions.clone()),
+            ..ServeArgs::default().common
+        }
+        .resolved();
+        assert_eq!(sessions_only.sessions, Some(sessions));
+        assert_eq!(sessions_only.archive, None);
+
+        let archive = PathBuf::from("/explicit/archive");
+        let archive_only = CommonArgs {
+            archive: Some(archive.clone()),
+            ..ServeArgs::default().common
+        }
+        .resolved();
+        assert_eq!(archive_only.sessions, None);
+        assert_eq!(archive_only.archive, Some(archive));
     }
 
     #[test]

@@ -12,7 +12,7 @@ const totals: Totals = {
   reasoningTokens: 0,
   blendedTokens: 12,
   totalTokens: 12,
-  costUsd: 0.01,
+  costUsd: '0.01',
   unpricedTokens: 0,
   pricingComplete: true,
 }
@@ -20,9 +20,9 @@ const totals: Totals = {
 const summaryResponse: OverviewResponse = {
   updatedAt: '2026-07-16T10:00:00Z',
   periods: {
-    today: { start: '2026-07-15T22:00:00Z', end: '2026-07-16T22:00:00Z', sessionCount: 1, messageCount: 2, totals: { ...totals, costUsd: 12.34, totalTokens: 1_234 } },
-    week: { sessionCount: 3, messageCount: 4, totals: { ...totals, costUsd: 23.45 } },
-    month: { sessionCount: 5, messageCount: 6, totals: { ...totals, costUsd: 34.56 } },
+    today: { start: '2026-07-15T22:00:00Z', end: '2026-07-16T22:00:00Z', sessionCount: 1, messageCount: 2, totals: { ...totals, costUsd: '12.34', totalTokens: 1_234 } },
+    week: { sessionCount: 3, messageCount: 4, totals: { ...totals, costUsd: '23.45' } },
+    month: { sessionCount: 5, messageCount: 6, totals: { ...totals, costUsd: '34.56' } },
   },
 }
 
@@ -40,9 +40,9 @@ function session(id: string, title: string, overrides: Partial<SessionRow> = {})
     agentCount: 1,
     toolCount: 3,
     totalTokens: 2_500,
-    costUsd: 9.87,
+    costUsd: '9.87',
     unpricedTokens: 0,
-    lifetimeCostUsd: 9.87,
+    lifetimeCostUsd: '9.87',
     lifetimeUnpricedTokens: 0,
     ...overrides,
   }
@@ -51,11 +51,11 @@ function session(id: string, title: string, overrides: Partial<SessionRow> = {})
 function yearResponse(year = 2026): OverviewYearResponse {
   return {
     year,
-    heatmap: [{ date: `${year}-07-16`, costUsd: 12.34, sessionCount: 2, messageCount: 7, totalTokens: 98_765 }],
+    heatmap: [{ date: `${year}-07-16`, costUsd: '12.34', sessionCount: 2, messageCount: 7, totalTokens: 98_765 }],
     topProjects: [
-      { project: '/Users/example/src/codex-usage', costUsd: 90, share: .9 },
-      { project: 'personal-hq', costUsd: 8, share: .08 },
-      { project: 'peregrine', costUsd: 2, share: .02 },
+      { project: '/Users/example/src/codex-usage', costUsd: '90', share: .9 },
+      { project: 'personal-hq', costUsd: '8', share: .08 },
+      { project: 'peregrine', costUsd: '2', share: .02 },
     ],
     topSessions: [
       session(`${year}-one`, `${year} winner`, { startedAt: `${year - 1}-12-31T23:00:00Z` }),
@@ -201,6 +201,22 @@ describe('OverviewPage staged loading', () => {
     expect(screen.getByText('2025 winner')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /2025-07-16:/ })).toHaveAttribute('tabindex', '0')
   })
+
+  it('does not navigate before the public 1970 boundary', async () => {
+    vi.setSystemTime(new Date('1970-07-16T12:00:00+02:00'))
+    vi.spyOn(api, 'overview').mockResolvedValue(summaryResponse)
+    const yearSpy = vi.spyOn(api, 'overviewYear').mockResolvedValue(yearResponse(1970))
+    renderOverview()
+    await flush()
+
+    const previous = screen.getByRole('button', { name: 'Previous year' })
+    expect(previous).toBeDisabled()
+    fireEvent.click(previous)
+    await flush()
+    expect(yearSpy).toHaveBeenCalledTimes(1)
+    expect(yearSpy).toHaveBeenCalledWith(1970, expect.any(AbortSignal))
+    expect(screen.getByRole('region', { name: '1970 yearly usage ledger' })).toBeVisible()
+  })
 })
 
 describe('OverviewPage heatmap hover card', () => {
@@ -262,6 +278,23 @@ describe('OverviewPage heatmap hover card', () => {
     expect(screen.getByRole('button', { name: /2026-07-15:/ })).toHaveFocus()
   })
 
+  it('scrolls the arrow-focused tile into the visible heatmap viewport', async () => {
+    const original = HTMLElement.prototype.scrollIntoView
+    const scrollIntoView = vi.fn()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+    try {
+      const tile = await loadedTile()
+      act(() => tile.focus())
+      fireEvent.keyDown(tile, { key: 'ArrowLeft' })
+
+      expect(screen.getByRole('button', { name: /2026-07-09:/ })).toHaveFocus()
+      expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest', inline: 'nearest' })
+    } finally {
+      if (original) Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: original })
+      else delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView
+    }
+  })
+
   it('moves keyboard activation into the portaled action and Escape returns to the tile', async () => {
     const tile = await loadedTile()
     act(() => tile.focus())
@@ -311,7 +344,7 @@ describe('OverviewPage yearly leaders', () => {
   it('shows only three rows, absolute dates, and bounded cost-sorted links', async () => {
     const data = yearResponse()
     data.topProjects[0].share = null
-    data.topProjects.push({ project: 'fourth-project', costUsd: 1, share: .01 })
+    data.topProjects.push({ project: 'fourth-project', costUsd: '1', share: .01 })
     data.topSessions.push(session('fourth', 'fourth session'))
     vi.spyOn(api, 'overview').mockResolvedValue(summaryResponse)
     vi.spyOn(api, 'overviewYear').mockResolvedValue(data)

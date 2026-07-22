@@ -99,6 +99,21 @@ describe('RangeCalendar', () => {
     expect(today).toHaveAttribute('tabindex', '-1')
   })
 
+  it('keeps outside-month spillovers as inert geometry', () => {
+    render(<RangeCalendar initialStart={null} initialEnd={null} onApply={vi.fn()} onCancel={vi.fn()} />)
+
+    const outsideDays = [...document.querySelectorAll<HTMLButtonElement>('.calendar-days button.outside')]
+    expect(outsideDays.length).toBeGreaterThan(0)
+    for (const day of outsideDays) {
+      expect(day).toBeDisabled()
+      expect(day).toHaveAttribute('aria-hidden', 'true')
+      expect(day).toHaveAttribute('tabindex', '-1')
+    }
+    fireEvent.click(outsideDays[0])
+    expect(document.querySelector('.calendar-days button.range-start')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'APPLY RANGE' })).toBeDisabled()
+  })
+
   it('clamps PageUp and PageDown to the last valid day of the destination month', async () => {
     const first = render(<RangeCalendar initialStart="2025-01-31" initialEnd={null} onApply={vi.fn()} onCancel={vi.fn()} />)
     const january31 = document.querySelector<HTMLButtonElement>('[data-calendar-date="2025-01-31"]:not(.outside)')!

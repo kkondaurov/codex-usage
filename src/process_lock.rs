@@ -107,13 +107,32 @@ mod tests {
     fn lock_path_is_derived_from_the_database_path_and_operation() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let canonical_parent = fs::canonicalize(temp.path()).unwrap();
         assert_eq!(
             lock_path(&db, "ingest"),
-            temp.path().join("usage.db.ingest.lock")
+            canonical_parent.join("usage.db.ingest.lock")
         );
         assert_eq!(
             lock_path(&db, "pricing-refresh"),
-            temp.path().join("usage.db.pricing-refresh.lock")
+            canonical_parent.join("usage.db.pricing-refresh.lock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_symlink_aliases_derive_the_same_process_lock() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("usage.db");
+        let alias = temp.path().join("usage-alias.db");
+        let direct = Db::open(&target).unwrap();
+        symlink(&target, &alias).unwrap();
+        let through_alias = Db::open(&alias).unwrap();
+
+        assert_eq!(
+            lock_path(&direct, "ingest"),
+            lock_path(&through_alias, "ingest")
         );
     }
 }

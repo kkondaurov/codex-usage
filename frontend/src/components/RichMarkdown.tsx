@@ -1,4 +1,5 @@
 import { CompactMarkdown } from './CompactMarkdown'
+import { stripInternalMarkdownMetadata } from './markdownExcerpt'
 
 type RichMarkdownBlock =
   | { type: 'paragraph'; text: string }
@@ -8,7 +9,6 @@ type RichMarkdownBlock =
   | { type: 'code'; language?: string; text: string }
   | { type: 'rule' }
 
-const INTERNAL_MEMORY = /<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>/gi
 const FENCE = /^\s{0,3}(```+|~~~+)\s*([A-Za-z0-9_+-]+)?\s*$/
 const HEADING = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/
 const LIST_ITEM = /^\s{0,3}([-+*]|\d+[.)])\s+(?:\[[ xX]\]\s+)?(.+)$/
@@ -20,7 +20,7 @@ function startsBlock(line: string) {
 }
 
 function richMarkdownBlocks(value: string): RichMarkdownBlock[] {
-  const lines = value.replace(/\r\n?/g, '\n').replace(INTERNAL_MEMORY, '').trim().split('\n')
+  const lines = stripInternalMarkdownMetadata(value).replace(/\r\n?/g, '\n').trim().split('\n')
   const blocks: RichMarkdownBlock[] = []
 
   for (let index = 0; index < lines.length;) {
@@ -104,12 +104,20 @@ function Inline({ children }: { children: string }) {
   return <CompactMarkdown links="anchor">{children}</CompactMarkdown>
 }
 
+function MarkdownHeading({ level, children }: { level: number; children: string }) {
+  const content = <Inline>{children}</Inline>
+  if (level <= 1) return <h3 className="level-1">{content}</h3>
+  if (level === 2) return <h4 className="level-2">{content}</h4>
+  if (level === 3) return <h5 className="level-3">{content}</h5>
+  return <h6 className={`level-${level}`}>{content}</h6>
+}
+
 export function RichMarkdown({ children }: { children: string }) {
   return (
     <div className="activity-rich-markdown">
       {richMarkdownBlocks(children).map((block, index) => {
         const key = `${block.type}-${index}`
-        if (block.type === 'heading') return <h3 className={`level-${block.level}`} key={key}><Inline>{block.text}</Inline></h3>
+        if (block.type === 'heading') return <MarkdownHeading level={block.level} key={key}>{block.text}</MarkdownHeading>
         if (block.type === 'list') {
           const items = block.items.map((item, itemIndex) => <li key={`${key}-${itemIndex}`}><Inline>{item}</Inline></li>)
           return block.ordered ? <ol key={key} start={block.start}>{items}</ol> : <ul key={key}>{items}</ul>

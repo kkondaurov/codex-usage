@@ -1,4 +1,4 @@
-use crate::db::Db;
+use crate::db::{Db, canonicalize_storage_path};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -18,6 +18,7 @@ use std::{
 use thiserror::Error;
 
 const CONFIG_VERSION: u32 = 1;
+pub const MAX_MODEL_ID_CHARS: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -72,11 +73,11 @@ pub struct ManualPricingStore {
 }
 
 impl ManualPricingStore {
-    pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
+    pub fn new(path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            path: canonicalize_storage_path(&path)?,
             lock: Arc::new(Mutex::new(())),
-        }
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -213,9 +214,10 @@ impl ManualPricingStore {
     pub fn save_alias(&self, db: &Db, alias: ManualAlias) -> Result<(), MutationError> {
         let observed = alias.observed_model_id.trim();
         let canonical = alias.canonical_model_id.trim();
-        if observed.is_empty() || canonical.is_empty() {
-            return Err(validation("both model IDs are required"));
-        }
+        validate_model_id(observed, "observed model ID")
+            .map_err(|error| validation(error.to_string()))?;
+        validate_model_id(canonical, "canonical model ID")
+            .map_err(|error| validation(error.to_string()))?;
         if observed == canonical {
             return Err(validation("an alias cannot map a model ID to itself"));
         }
@@ -477,9 +479,8 @@ fn validate_config(config: &ManualPricingConfig) -> Result<()> {
     }
     let mut observed = HashSet::new();
     for alias in &config.aliases {
-        if alias.observed_model_id.trim().is_empty() || alias.canonical_model_id.trim().is_empty() {
-            return Err(anyhow!("manual aliases require both model IDs"));
-        }
+        validate_model_id(&alias.observed_model_id, "observed model ID")?;
+        validate_model_id(&alias.canonical_model_id, "canonical model ID")?;
         if alias.observed_model_id == alias.canonical_model_id {
             return Err(anyhow!("an alias cannot map a model ID to itself"));
         }
@@ -556,9 +557,7 @@ fn alias_validation_message(
 }
 
 fn validate_price(price: &ManualPrice) -> Result<()> {
-    if price.model_id.trim().is_empty() {
-        return Err(anyhow!("model ID is required"));
-    }
+    validate_model_id(&price.model_id, "model ID")?;
     if price.input_microusd_per_million < 0
         || price
             .cached_input_microusd_per_million
@@ -573,6 +572,19 @@ fn validate_price(price: &ManualPrice) -> Result<()> {
         if value <= &price.effective_from {
             return Err(anyhow!("effective-to must be after effective-from"));
         }
+    }
+    Ok(())
+}
+
+fn validate_model_id(value: &str, label: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("{label} is required"));
+    }
+    if value.chars().count() > MAX_MODEL_ID_CHARS {
+        return Err(anyhow!(
+            "{label} must be at most {MAX_MODEL_ID_CHARS} characters"
+        ));
     }
     Ok(())
 }
@@ -721,6 +733,33 @@ mod tests {
         assert_eq!(alias, "manual-model");
     }
 
+    #[test]
+    fn manual_pricing_rejects_unbounded_model_identifiers() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let oversized = "x".repeat(MAX_MODEL_ID_CHARS + 1);
+
+        let price_error = db
+            .manual_pricing()
+            .save_price(&db, price(&oversized))
+            .unwrap_err()
+            .to_string();
+        assert!(price_error.contains("at most 256 characters"));
+
+        let alias_error = db
+            .manual_pricing()
+            .save_alias(
+                &db,
+                ManualAlias {
+                    observed_model_id: oversized,
+                    canonical_model_id: "gpt-5.5".into(),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(alias_error.contains("at most 256 characters"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn manual_pricing_config_is_owner_only() {
@@ -746,7 +785,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("usage.db");
         let config_path = temp.path().join("pricing.json");
-        let store = ManualPricingStore::new(config_path.clone());
+        let store = ManualPricingStore::new(config_path.clone()).unwrap();
         let mut config = ManualPricingConfig::default();
         config.prices.push(price("existing-price"));
         store.write_unlocked(&config).unwrap();
@@ -762,12 +801,53 @@ mod tests {
     fn hidden_pricing_config_uses_a_single_dot_lock_name() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join(".codex-usage.pricing.json");
-        let store = ManualPricingStore::new(config_path);
+        let store = ManualPricingStore::new(config_path).unwrap();
 
         drop(store.acquire_file_lock().unwrap());
 
         assert!(temp.path().join(".codex-usage.pricing.json.lock").exists());
         assert!(!temp.path().join("..codex-usage.pricing.json.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_pricing_write_updates_symlink_target_without_replacing_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("usage.db");
+        let target = temp.path().join("pricing-target.json");
+        let alias = temp.path().join("pricing-alias.json");
+        fs::write(
+            &target,
+            serde_json::to_vec_pretty(&ManualPricingConfig::default()).unwrap(),
+        )
+        .unwrap();
+        symlink(&target, &alias).unwrap();
+
+        let db = Db::open_with_pricing_config(&db_path, &alias).unwrap();
+        db.manual_pricing()
+            .save_price(&db, price("symlink-safe-price"))
+            .unwrap();
+
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let stored: ManualPricingConfig =
+            serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+        assert!(
+            stored
+                .prices
+                .iter()
+                .any(|row| row.model_id == "symlink-safe-price")
+        );
+        assert_eq!(
+            db.manual_pricing().path(),
+            std::fs::canonicalize(&target).unwrap()
+        );
     }
 
     #[cfg(unix)]
@@ -781,7 +861,7 @@ mod tests {
         let ready_path = temp.path().join("child-ready");
         let acquired_path = temp.path().join("child-acquired");
         let db = Db::open_with_pricing_config(&db_path, &config_path).unwrap();
-        let store = ManualPricingStore::new(config_path.clone());
+        let store = ManualPricingStore::new(config_path.clone()).unwrap();
         let guard = store.acquire_file_lock().unwrap();
 
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -837,7 +917,7 @@ mod tests {
         let ready_path = PathBuf::from(std::env::var("CODEX_USAGE_LOCK_CHILD_READY").unwrap());
         let acquired_path =
             PathBuf::from(std::env::var("CODEX_USAGE_LOCK_CHILD_ACQUIRED").unwrap());
-        let store = ManualPricingStore::new(config_path.clone());
+        let store = ManualPricingStore::new(config_path.clone()).unwrap();
         fs::write(&ready_path, b"ready").unwrap();
         let guard = store.acquire_file_lock().unwrap();
         fs::write(&acquired_path, b"acquired").unwrap();
@@ -852,7 +932,7 @@ mod tests {
     #[test]
     fn failed_database_commit_restores_previous_manual_config() {
         let temp = tempfile::tempdir().unwrap();
-        let store = ManualPricingStore::new(temp.path().join("pricing.json"));
+        let store = ManualPricingStore::new(temp.path().join("pricing.json")).unwrap();
         let mut previous = ManualPricingConfig::default();
         previous.prices.push(price("previous"));
         store.write_unlocked(&previous).unwrap();
@@ -963,7 +1043,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open(temp.path().join("usage.db")).unwrap();
         let config_path = temp.path().join("manual-pricing.json");
-        let store = ManualPricingStore::new(config_path);
+        let store = ManualPricingStore::new(config_path).unwrap();
 
         db.connect()
             .unwrap()
@@ -1026,7 +1106,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        let store = ManualPricingStore::new(temp.path().join("manual-pricing.json"));
+        let store = ManualPricingStore::new(temp.path().join("manual-pricing.json")).unwrap();
         let mut config = ManualPricingConfig::default();
         config.aliases.extend([
             ManualAlias {

@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 const MICROS_PER_USD: i64 = 1_000_000;
 const PER_TOKEN_TO_MICROUSD_PER_MILLION: i64 = 1_000_000_000_000;
+pub(crate) const MAX_PRICE_MICROUSD_PER_MILLION: i64 = 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PriceMicros(i64);
@@ -13,6 +14,9 @@ impl PriceMicros {
     pub fn from_raw(value: i64) -> Result<Self> {
         if value < 0 {
             bail!("price cannot be negative");
+        }
+        if value > MAX_PRICE_MICROUSD_PER_MILLION {
+            bail!("price exceeds the supported $1,000 per million tokens");
         }
         Ok(Self(value))
     }
@@ -72,7 +76,6 @@ fn parse_decimal(value: &str) -> Result<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn per_million_prices_round_trip_as_canonical_decimal_strings() {
@@ -94,13 +97,20 @@ mod tests {
     fn manual_prices_reject_negative_or_overprecise_values() {
         assert!(PriceMicros::from_per_million_text("-0.1").is_err());
         assert!(PriceMicros::from_per_million_text("0.0000001").is_err());
+        assert!(PriceMicros::from_per_million_text("1000.000001").is_err());
+        assert!(PriceMicros::from_raw(MAX_PRICE_MICROUSD_PER_MILLION + 1).is_err());
     }
 
     #[test]
     fn per_token_json_numbers_convert_without_binary_floating_point() {
-        let number = json!(0.0000004).as_number().unwrap().clone();
+        let number = serde_json::from_str::<Number>("0.0000004").unwrap();
         let price = PriceMicros::from_per_token_number(&number).unwrap();
         assert_eq!(price.raw(), 400_000);
         assert_eq!(price.decimal_string(), "0.40");
+
+        let rounding_boundary = serde_json::from_str::<Number>("0.0000004000005").unwrap();
+        let rounded = PriceMicros::from_per_token_number(&rounding_boundary).unwrap();
+        assert_eq!(rounded.raw(), 400_001);
+        assert_eq!(rounded.decimal_string(), "0.400001");
     }
 }

@@ -76,13 +76,14 @@ npm --prefix frontend run lint
 npm --prefix frontend run build
 ```
 
-The ordinary suite skips the large-session Activity benchmark. Run it explicitly when
-changing Activity queries, attribution, or indexes; it seeds one metadata-only session with
-500,000 tool calls, measures query/assembly plus JSON serialization across three fresh
-connections, and enforces the documented regression budget:
+The ordinary debug suite skips the large-session Activity performance gates. Run
+both explicitly when changing Activity queries, attribution, rollups, or indexes.
+They cover a 500,000-event/tool session, deep numeric and cursor pages, and a
+separate 500,000-fact usage-heavy turn:
 
 ```sh
-cargo test --lib activity_large_session_query_and_assembly_stays_within_regression_budget -- --ignored --nocapture
+cargo test --release --lib activity_large_session_query_and_assembly_stays_within_regression_budget -- --ignored --nocapture
+cargo test --release --lib activity_usage_heavy_queries_stay_under_one_second -- --nocapture
 ```
 
 The browser suite builds and launches the real application against a temporary

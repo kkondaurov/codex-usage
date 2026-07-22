@@ -91,8 +91,34 @@ function useModalFocus(onClose: () => void) {
   return modalRef
 }
 
+function usePendingModal(onClose: () => void) {
+  const pendingRef = useRef(false)
+  const [pending, setPending] = useState(false)
+  const requestClose = useCallback(() => {
+    if (!pendingRef.current) onClose()
+  }, [onClose])
+  const modalRef = useModalFocus(requestClose)
+
+  const beginPending = useCallback(() => {
+    if (pendingRef.current) return false
+    pendingRef.current = true
+    setPending(true)
+    return true
+  }, [])
+  const failPending = useCallback(() => {
+    pendingRef.current = false
+    setPending(false)
+  }, [])
+  const completePending = useCallback(() => {
+    pendingRef.current = false
+    onClose()
+  }, [onClose])
+
+  return { modalRef, pending, requestClose, beginPending, failPending, completePending }
+}
+
 function PriceEditor({ initial, onClose, onSaved }: { initial?: PriceRow; onClose: () => void; onSaved: (message: string) => Promise<void> }) {
-  const modalRef = useModalFocus(onClose)
+  const { modalRef, pending: saving, requestClose, beginPending, failPending, completePending } = usePendingModal(onClose)
   const [form, setForm] = useState<PriceForm>({
     modelId: initial?.modelId ?? '',
     effectiveFrom: initial?.effectiveFrom?.slice(0, 10) ?? dateOnly(new Date()),
@@ -100,7 +126,6 @@ function PriceEditor({ initial, onClose, onSaved }: { initial?: PriceRow; onClos
     cached: initial?.cachedInputPerMillion ?? '',
     output: initial?.outputPerMillion ?? '',
   })
-  const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   async function save(event: React.FormEvent) {
@@ -120,22 +145,23 @@ function PriceEditor({ initial, onClose, onSaved }: { initial?: PriceRow; onClos
       setError('Cached price must be a non-negative decimal with up to 6 places, or left blank.')
       return
     }
-    setSaving(true); setError(null)
+    if (!beginPending()) return
+    setError(null)
     try {
       await api.savePrice(form.modelId.trim(), { effectiveFrom: `${form.effectiveFrom}T00:00:00Z`, inputPerMillion: inputText, cachedInputPerMillion: cachedText || null, outputPerMillion: outputText, currency: 'USD' })
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : 'Could not save price')
-      setSaving(false)
+      failPending()
       return
     }
-    onClose()
+    completePending()
     await onSaved('Price saved')
   }
 
   return (
-    <div className="editor-scrim" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
+    <div className="editor-scrim" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) requestClose() }}>
       <form ref={modalRef} className="data-editor" role="dialog" aria-modal="true" aria-label={initial ? 'Edit model price' : 'Add model price'} tabIndex={-1} onSubmit={save}>
-        <header><div><span className="eyebrow coral-text">PRICE DATA</span><h2>{initial ? 'Edit model price' : 'Add model price'}</h2></div><button type="button" aria-label="Close" onClick={onClose}><X weight="bold" /></button></header>
+        <header><div><span className="eyebrow coral-text">PRICE DATA</span><h2>{initial ? 'Edit model price' : 'Add model price'}</h2></div><button type="button" aria-label="Close" disabled={saving} onClick={requestClose}><X weight="bold" /></button></header>
         <label>MODEL ID<input data-modal-initial-focus={!initial ? 'true' : undefined} value={form.modelId} readOnly={Boolean(initial)} onChange={event => setForm(value => ({ ...value, modelId: event.target.value }))} /></label>
         <label>EFFECTIVE FROM<input type="date" value={form.effectiveFrom} readOnly={Boolean(initial)} onChange={event => setForm(value => ({ ...value, effectiveFrom: event.target.value }))} /></label>
         <div className="editor-price-grid">
@@ -144,60 +170,68 @@ function PriceEditor({ initial, onClose, onSaved }: { initial?: PriceRow; onClos
           <label>OUTPUT / 1M<input inputMode="decimal" value={form.output} onChange={event => setForm(value => ({ ...value, output: event.target.value }))} /></label>
         </div>
         {error && <div className="inline-error" role="alert">{error}</div>}
-        <footer><button type="button" className="button" onClick={onClose}>CANCEL</button><button type="submit" className="button button-coral" disabled={saving}>{saving ? 'SAVING' : 'SAVE PRICE'}</button></footer>
+        <footer><button type="button" className="button" disabled={saving} onClick={requestClose}>CANCEL</button><button type="submit" className="button button-coral" disabled={saving}>{saving ? 'SAVING' : 'SAVE PRICE'}</button></footer>
       </form>
     </div>
   )
 }
 
 function AliasEditor({ initial, observedModelId, models, onClose, onSaved }: { initial?: PriceAlias; observedModelId?: string; models: string[]; onClose: () => void; onSaved: (message: string) => Promise<void> }) {
-  const modalRef = useModalFocus(onClose)
+  const { modalRef, pending: saving, requestClose, beginPending, failPending, completePending } = usePendingModal(onClose)
   const observedReadOnly = Boolean(observedModelId || initial)
   const [observed, setObserved] = useState(initial?.observedModelId ?? observedModelId ?? '')
   const [canonical, setCanonical] = useState(initial?.canonicalModelId ?? '')
   const [availableModels, setAvailableModels] = useState(models)
   const [suggestionError, setSuggestionError] = useState<string | null>(null)
-  const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     const controller = new AbortController()
-    void api.pricedModelIds(controller.signal)
-      .then(next => {
-        if (!controller.signal.aborted) setAvailableModels([...new Set([...models, ...next])].sort())
-      })
-      .catch(error => {
-        if (!controller.signal.aborted && !(error instanceof Error && error.name === 'AbortError')) {
-          setSuggestionError('Could not load every priced model suggestion. You can still type a model ID.')
-        }
-      })
-    return () => controller.abort()
-  }, [models])
+    const timer = window.setTimeout(() => {
+      void api.pricedModelIds({ q: canonical.trim() || undefined, limit: 100 }, controller.signal)
+        .then(next => {
+          if (!controller.signal.aborted) {
+            setAvailableModels([...new Set([...models, ...next])].sort())
+            setSuggestionError(null)
+          }
+        })
+        .catch(error => {
+          if (!controller.signal.aborted && !(error instanceof Error && error.name === 'AbortError')) {
+            setSuggestionError('Could not load priced model suggestions. You can still type a model ID.')
+          }
+        })
+    }, 180)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [canonical, models])
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
     if (!observed.trim() || !canonical.trim()) { setError('Enter both model IDs.'); return }
-    setSaving(true); setError(null)
+    if (!beginPending()) return
+    setError(null)
     try { await api.saveAlias(observed.trim(), canonical.trim()) }
     catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : 'Could not save alias')
-      setSaving(false)
+      failPending()
       return
     }
-    onClose()
+    completePending()
     await onSaved('Mapping saved')
   }
 
   return (
-    <div className="editor-scrim" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
+    <div className="editor-scrim" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) requestClose() }}>
       <form ref={modalRef} className="data-editor alias-editor" role="dialog" aria-modal="true" aria-label="Map observed model ID" tabIndex={-1} onSubmit={save}>
-        <header><div><span className="eyebrow coral-text">MODEL ALIAS</span><h2>Map observed model</h2></div><button type="button" aria-label="Close" onClick={onClose}><X weight="bold" /></button></header>
+        <header><div><span className="eyebrow coral-text">MODEL ALIAS</span><h2>Map observed model</h2></div><button type="button" aria-label="Close" disabled={saving} onClick={requestClose}><X weight="bold" /></button></header>
         <p>This model ID will use the selected canonical model’s price for past and future usage.</p>
         <label>OBSERVED MODEL ID<input data-modal-initial-focus={!observedReadOnly ? 'true' : undefined} value={observed} readOnly={observedReadOnly} onChange={event => setObserved(event.target.value)} /></label>
         <label>CANONICAL MODEL ID<input data-modal-initial-focus={observedReadOnly ? 'true' : undefined} list="priced-models" value={canonical} onChange={event => setCanonical(event.target.value)} placeholder="Choose or type a priced model" /><datalist id="priced-models">{availableModels.map(model => <option value={model} key={model} />)}</datalist></label>
         {suggestionError && <p className="editor-note">{suggestionError}</p>}
         {error && <div className="inline-error" role="alert">{error}</div>}
-        <footer><button type="button" className="button" onClick={onClose}>CANCEL</button><button type="submit" className="button button-coral" disabled={saving}>{saving ? 'SAVING' : 'SAVE MAPPING'}</button></footer>
+        <footer><button type="button" className="button" disabled={saving} onClick={requestClose}>CANCEL</button><button type="submit" className="button button-coral" disabled={saving}>{saving ? 'SAVING' : 'SAVE MAPPING'}</button></footer>
       </form>
     </div>
   )
@@ -224,6 +258,7 @@ function PriceData() {
   const [mutationError, setMutationError] = useState<string | null>(null)
   const [editor, setEditor] = useState<Editor | null>(null)
   const settings = useAsync(signal => api.settings(signal), [])
+  const metadata = useAsync(signal => api.priceMetadata(signal), [])
   const { data, error, loading, lastSuccessfulAt, refresh, refreshOrThrow } = useAsync(signal => api.prices({ q: query || undefined, page }, signal), [query, page])
   const models = useMemo(() => [...new Set(data?.items.map(item => item.modelId) ?? [])].sort(), [data?.items])
   const commitSearch = useCallback((value: string) => {
@@ -259,7 +294,7 @@ function PriceData() {
     setMutationError(null)
     invalidateAsyncCache('overview', 'stats:')
     try {
-      await refreshOrThrow()
+      await Promise.all([refreshOrThrow(), metadata.refreshOrThrow()])
     } catch (nextError) {
       const detail = nextError instanceof Error ? nextError.message : 'Reload failed'
       setMutationError(`${successMessage}, but the price list could not be reloaded: ${detail}`)
@@ -305,41 +340,62 @@ function PriceData() {
     commitSearch(search)
   }
 
-  if (loading && !data) return <LoadingLedger rows={16} />
-  if (error && !data) return <ErrorState error={error} onRetry={() => void refresh()} />
-  if (!data) return null
-  if (page > Math.max(1, data.totalPages)) return <LoadingLedger rows={16} />
+  const pageOutOfRange = Boolean(data && page > Math.max(1, data.totalPages))
+  const visibleData = pageOutOfRange ? null : data
+  const resultsLoading = loading || pageOutOfRange
+  const paginationRef = useRef<{ page: number; totalPages: number; total: number; pageSize: number } | null>(null)
+  if (visibleData) {
+    paginationRef.current = visibleData.total > 0
+      ? { page: visibleData.page, totalPages: Math.max(1, visibleData.totalPages), total: visibleData.total, pageSize: visibleData.pageSize }
+      : null
+  }
+  const pagination = visibleData?.total ? {
+    page: visibleData.page,
+    totalPages: Math.max(1, visibleData.totalPages),
+    total: visibleData.total,
+    pageSize: visibleData.pageSize,
+  } : paginationRef.current
+  const paginationUnavailable = resultsLoading || (!visibleData && Boolean(error))
   return (
     <div className="price-settings">
-      {error && <DegradedDataNotice error={error} lastSuccessfulAt={lastSuccessfulAt} onRetry={() => void refresh()} />}
+      <span className="sr-only" aria-live="polite">{resultsLoading ? 'Loading model prices' : visibleData ? `${visibleData.total} model prices loaded` : ''}</span>
+      {error && visibleData && <DegradedDataNotice error={error} lastSuccessfulAt={lastSuccessfulAt} onRetry={() => void refresh()} />}
       <div className="price-toolbar">
-        <span>LAST SYNC {data.lastRefreshAt ? shortDateTime(data.lastRefreshAt).toUpperCase() : 'PENDING'}{data.source ? <> · SOURCE <span title={data.source}>{priceSourceLabel(data.source)}</span></> : ''}</span>
+        <span>LAST SYNC {visibleData?.lastRefreshAt ? shortDateTime(visibleData.lastRefreshAt).toUpperCase() : 'PENDING'}{visibleData?.source ? <> · SOURCE <span title={visibleData.source}>{priceSourceLabel(visibleData.source)}</span></> : ''}</span>
         <div><button type="button" className="button" onClick={() => setEditor({ kind: 'alias' })}><Plus weight="bold" /> ADD ALIAS</button><button type="button" className="button" onClick={() => setEditor({ kind: 'price' })}><Plus weight="bold" /> ADD PRICE</button><button type="button" className="button button-coral" disabled={refreshing} onClick={() => void refreshPrices()}>{refreshing ? 'REFRESHING' : 'REFRESH PRICES'}</button></div>
       </div>
       {settings.data && <div className="storage-notice" role="status"><span><strong>LOCAL DATABASE · {storageSize(settings.data.databaseBytes)}</strong><small>Usage history is retained locally and the database can continue growing as sessions are ingested.</small></span><code title={settings.data.databasePath}>{settings.data.databasePath}</code></div>}
       {settings.error && <div className="settings-metadata-warning pricing-refresh-warning" role="alert"><span><strong>LOCAL DATABASE DETAILS UNAVAILABLE</strong><small>{settings.error.message}</small></span><button type="button" onClick={() => void settings.refresh()}>TRY AGAIN</button></div>}
-      {data.refreshError && <div className="pricing-refresh-warning" role="alert"><span><strong>PRICE REFRESH FAILED{data.refreshErrorKind ? ` · ${data.refreshErrorKind.toUpperCase()}` : ''}</strong>{data.lastRefreshErrorAt ? <> · {shortDateTime(data.lastRefreshErrorAt).toUpperCase()}</> : null}<small>{data.refreshError}</small></span><button type="button" disabled={refreshing} onClick={() => void refreshPrices()}>TRY AGAIN</button></div>}
+      {visibleData?.refreshError && <div className="pricing-refresh-warning" role="alert"><span><strong>PRICE REFRESH FAILED{visibleData.refreshErrorKind ? ` · ${visibleData.refreshErrorKind.toUpperCase()}` : ''}</strong>{visibleData.lastRefreshErrorAt ? <> · {shortDateTime(visibleData.lastRefreshErrorAt).toUpperCase()}</> : null}<small>{visibleData.refreshError}</small></span><button type="button" disabled={refreshing} onClick={() => void refreshPrices()}>TRY AGAIN</button></div>}
       {mutationError && <div className="inline-error" role="alert">{mutationError}</div>}
-      {data.observedUnknown.length > 0 && (
-        <div className="missing-price-banner expanded-warning"><span><strong>MISSING PRICE DATA</strong><small>{data.observedUnknown.map(item => unknownId(item)).join(', ')}</small></span><div>{data.observedUnknown.slice(0, 3).map(item => <button key={unknownId(item)} type="button" onClick={() => setEditor({ kind: 'alias', observed: unknownId(item) })}>MAP {unknownId(item)}</button>)}</div><b>{data.observedUnknown.length} MODEL {data.observedUnknown.length === 1 ? 'ID' : 'IDS'}</b></div>
+      {metadata.error && <div className="settings-metadata-warning pricing-refresh-warning" role="alert"><span><strong>MODEL MAPPINGS UNAVAILABLE</strong><small>{metadata.error.message}</small></span><button type="button" onClick={() => void metadata.refresh()}>TRY AGAIN</button></div>}
+      {metadata.data && metadata.data.observedUnknown.length > 0 && (
+        <div className="missing-price-banner expanded-warning"><span><strong>MISSING PRICE DATA</strong><small>{metadata.data.observedUnknown.map(item => unknownId(item)).join(', ')}</small></span><div>{metadata.data.observedUnknown.slice(0, 3).map(item => <button key={unknownId(item)} type="button" onClick={() => setEditor({ kind: 'alias', observed: unknownId(item) })}>MAP {unknownId(item)}</button>)}</div><b>{metadata.data.observedUnknownTotal} MODEL {metadata.data.observedUnknownTotal === 1 ? 'ID' : 'IDS'}</b></div>
       )}
       <form className="price-search" onSubmit={submitSearch}><label className="search-field"><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search model IDs" aria-label="Search model prices" /></label></form>
-      <section className="price-ledger" role="table" aria-label="Model prices">
-        <div className="price-head" role="row"><span role="columnheader">MODEL</span><span role="columnheader">SOURCE</span><span role="columnheader">INPUT / 1M</span><span role="columnheader">CACHED / 1M</span><span role="columnheader">OUTPUT / 1M</span><span role="columnheader" aria-label="Actions" /></div>
-        {data.items.map(price => {
-          const manual = price.source === 'manual'
-          const editLabel = manual ? `Edit ${price.modelId}` : `Override ${price.modelId} price`
-          return <div className="price-row" role="row" key={`${price.modelId}-${price.effectiveFrom}-${price.source}`}><span role="cell">{price.modelId}</span><span role="cell" className="price-source" title={price.source}>{priceSourceLabel(price.source)}</span><b role="cell">{priceMoney(price.inputPerMillion)}</b><b role="cell">{price.cachedInputPerMillion === null ? '—' : priceMoney(price.cachedInputPerMillion)}</b><b role="cell">{priceMoney(price.outputPerMillion)}</b><span role="cell" className="row-actions"><button type="button" aria-label={editLabel} title={manual ? 'Edit manual price' : 'Create a manual override'} onClick={() => setEditor({ kind: 'price', initial: price })}><PencilSimple /></button>{manual && <button type="button" aria-label={`Delete ${price.modelId}`} title="Delete manual price" onClick={() => void removePrice(price)}><Trash /></button>}</span></div>
-        })}
-        {data.items.length === 0 && <div className="usage-empty">No prices match this search.</div>}
-        {data.total > 0 && <Pagination page={data.page} totalPages={Math.max(1, data.totalPages)} total={data.total} pageSize={data.pageSize} onPage={value => { const next = new URLSearchParams(params); next.set('tab', 'price-data'); next.set('page', String(value)); setParams(next) }} />}
-      </section>
-      <section className="alias-ledger">
-        <h2>MODEL ALIASES</h2>
-        {data.aliases.length === 0 ? <div className="usage-empty">No model aliases configured.</div> : data.aliases.map(alias => <div className="alias-row" key={alias.observedModelId}><span>{alias.observedModelId}</span><b>USES</b><strong>{alias.canonicalModelId}</strong><span className="row-actions"><button type="button" aria-label={`Edit alias ${alias.observedModelId}`} onClick={() => setEditor({ kind: 'alias', initial: alias })}><PencilSimple /></button><button type="button" aria-label={`Delete alias ${alias.observedModelId}`} onClick={() => void removeAlias(alias)}><Trash /></button></span></div>)}
-      </section>
-      {editor?.kind === 'price' && <PriceEditor initial={editor.initial} onClose={() => setEditor(null)} onSaved={refreshAfterMutation} />}
-      {editor?.kind === 'alias' && <AliasEditor initial={editor.initial} observedModelId={editor.observed} models={models} onClose={() => setEditor(null)} onSaved={refreshAfterMutation} />}
+      <div className="ledger-scroll price-scroll" role="region" aria-label="Scrollable model price ledger" aria-busy={resultsLoading || undefined} tabIndex={0}>
+        <section className="price-ledger" role="table" aria-label="Model prices" aria-rowcount={visibleData ? visibleData.total + 1 : undefined}>
+          <div className="price-head" role="row"><span role="columnheader">MODEL</span><span role="columnheader">SOURCE</span><span role="columnheader">INPUT / 1M</span><span role="columnheader">CACHED / 1M</span><span role="columnheader">OUTPUT / 1M</span><span role="columnheader" aria-label="Actions" /></div>
+          {visibleData?.items.map(price => {
+            const manual = price.source === 'manual'
+            const editLabel = manual ? `Edit ${price.modelId}` : `Override ${price.modelId} price`
+            return <div className="price-row" role="row" key={`${price.modelId}-${price.effectiveFrom}-${price.source}`}><span role="cell">{price.modelId}</span><span role="cell" className="price-source" title={price.source}>{priceSourceLabel(price.source)}</span><b role="cell">{priceMoney(price.inputPerMillion)}</b><b role="cell">{price.cachedInputPerMillion === null ? '—' : priceMoney(price.cachedInputPerMillion)}</b><b role="cell">{priceMoney(price.outputPerMillion)}</b><span role="cell" className="row-actions"><button type="button" aria-label={editLabel} title={manual ? 'Edit manual price' : 'Create a manual override'} onClick={() => setEditor({ kind: 'price', initial: price })}><PencilSimple /></button>{manual && <button type="button" aria-label={`Delete ${price.modelId}`} title="Delete manual price" onClick={() => void removePrice(price)}><Trash /></button>}</span></div>
+          })}
+          {!visibleData && resultsLoading ? <div className="table-state-row" role="row"><div role="cell" aria-colspan={6}><LoadingLedger rows={8} /></div></div> : null}
+          {error && !visibleData && !resultsLoading ? <div className="table-state-row" role="row"><div role="cell" aria-colspan={6}><ErrorState error={error} onRetry={() => void refresh()} /></div></div> : null}
+          {visibleData?.items.length === 0 && <div className="table-state-row" role="row"><div className="usage-empty" role="cell" aria-colspan={6}>No prices match this search.</div></div>}
+        </section>
+        {pagination && <Pagination {...pagination} busy={paginationUnavailable} onPage={value => { const next = new URLSearchParams(params); next.set('tab', 'price-data'); next.set('page', String(value)); setParams(next) }} />}
+      </div>
+      <div className="ledger-scroll alias-scroll" role="region" aria-label="Scrollable model alias ledger" tabIndex={0}>
+        <section className="alias-ledger">
+          <h2>MODEL ALIASES</h2>
+          {metadata.data && metadata.data.aliasesTotal > metadata.data.aliases.length && <div className="usage-empty">Showing the first {metadata.data.aliases.length.toLocaleString()} of {metadata.data.aliasesTotal.toLocaleString()} model aliases.</div>}
+          {metadata.data ? metadata.data.aliases.length === 0 ? <div className="usage-empty">No model aliases configured.</div> : metadata.data.aliases.map(alias => <div className="alias-row" key={alias.observedModelId}><span>{alias.observedModelId}</span><b>USES</b><strong>{alias.canonicalModelId}</strong><span className="row-actions"><button type="button" aria-label={`Edit alias ${alias.observedModelId}`} onClick={() => setEditor({ kind: 'alias', initial: alias })}><PencilSimple /></button><button type="button" aria-label={`Delete alias ${alias.observedModelId}`} onClick={() => void removeAlias(alias)}><Trash /></button></span></div>) : <div className="usage-empty">Model aliases are loading.</div>}
+        </section>
+      </div>
+      {editor?.kind === 'price' && <PriceEditor initial={editor.initial} onClose={() => setEditor(current => current === editor ? null : current)} onSaved={refreshAfterMutation} />}
+      {editor?.kind === 'alias' && <AliasEditor initial={editor.initial} observedModelId={editor.observed} models={models} onClose={() => setEditor(current => current === editor ? null : current)} onSaved={refreshAfterMutation} />}
     </div>
   )
 }

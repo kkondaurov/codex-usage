@@ -1,3 +1,5 @@
+import type { DecimalString } from './decimal'
+
 export interface Totals {
   inputTokens: number
   cachedInputTokens: number
@@ -5,7 +7,7 @@ export interface Totals {
   reasoningTokens: number
   blendedTokens: number
   totalTokens: number
-  costUsd: number | null
+  costUsd: DecimalString | null
   unpricedTokens: number
   pricingComplete: boolean
 }
@@ -37,7 +39,7 @@ export interface PeriodSummary {
   sessionCount: number
   messageCount: number
   deltaPercent?: number | null
-  deltaCostUsd?: number | null
+  deltaCostUsd?: DecimalString | null
   totals: Totals
 }
 
@@ -54,23 +56,23 @@ export interface SessionRow {
   agentCount: number
   toolCount: number
   totalTokens: number
-  costUsd: number | null
+  costUsd: DecimalString | null
   unpricedTokens: number
-  lifetimeCostUsd: number | null
+  lifetimeCostUsd: DecimalString | null
   lifetimeUnpricedTokens: number
 }
 
 export interface HeatmapDay {
   date: string
-  costUsd: number | null
+  costUsd: DecimalString | null
   sessionCount: number
   messageCount?: number
   totalTokens: number
   future?: boolean
 }
 
-export interface ProjectDriver { project: string; costUsd: number | null; share: number | null }
-export interface PricingSummary { knownCostUsd: number; unpricedTokens: number; complete: boolean }
+export interface ProjectDriver { project: string; costUsd: DecimalString | null; share: number | null }
+export interface PricingSummary { knownCostUsd: DecimalString; unpricedTokens: number; complete: boolean }
 
 export interface OverviewResponse {
   updatedAt: string | null
@@ -102,7 +104,7 @@ export interface ModelUsage {
   outputTokens: number
   reasoningTokens: number
   totalTokens: number
-  costUsd: number | null
+  costUsd: DecimalString | null
   unpricedTokens: number
 }
 
@@ -115,7 +117,7 @@ export interface AgentSummary {
   turnCount: number
   toolCount: number
   totalTokens: number
-  costUsd: number | null
+  costUsd: DecimalString | null
   unpricedTokens: number
 }
 
@@ -164,6 +166,7 @@ export interface ActivityItem {
   childPageSize?: number
   childTotal?: number
   childHasMore?: boolean
+  childNextCursor?: string
   usage: Totals | null
   counts: {
     modelCalls: number
@@ -193,14 +196,6 @@ export interface UsageBreakdown {
   totals: Totals
 }
 
-export interface SessionUsageResponse {
-  totals: Totals
-  byModel: ModelUsage[]
-  byAgent: UsageBreakdown[]
-  byTurn: UsageBreakdown[]
-  pricing: PricingSummary
-}
-
 export type StatsRange = 'day' | 'week' | 'month' | 'year' | 'all'
 export interface StatsRow extends Totals { periodStart: string; periodEnd: string; label: string; sessionCount: number }
 export interface StatsResponse {
@@ -209,7 +204,7 @@ export interface StatsResponse {
   label: string
   totals: Totals
   rows: StatsRow[]
-  trend: Array<number | null>
+  trend: Array<DecimalString | null>
 }
 
 export interface PriceRow {
@@ -232,8 +227,6 @@ export interface UnknownModel {
 }
 export interface PricesResponse {
   items: PriceRow[]
-  aliases: PriceAlias[]
-  observedUnknown: UnknownModel[]
   page: number
   pageSize: number
   total: number
@@ -244,3 +237,10 @@ export interface PricesResponse {
   refreshErrorKind?: string | null
   source: string | null
 }
+export interface PriceMetadataResponse {
+  aliases: PriceAlias[]
+  aliasesTotal: number
+  observedUnknown: UnknownModel[]
+  observedUnknownTotal: number
+}
+export interface PriceModelIdsResponse { items: string[] }

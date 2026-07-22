@@ -3,10 +3,11 @@ import type {
   OverviewResponse,
   OverviewYearResponse,
   PricesResponse,
+  PriceMetadataResponse,
+  PriceModelIdsResponse,
   SettingsResponse,
   SessionSort,
   SessionSummary,
-  SessionUsageResponse,
   SessionsResponse,
   StatsRange,
   StatsResponse,
@@ -18,8 +19,9 @@ import {
   overviewResponse,
   overviewYearResponse,
   pricesResponse,
+  priceMetadataResponse,
+  priceModelIdsResponse,
   sessionSummaryResponse,
-  sessionUsageResponse,
   sessionsResponse,
   settingsResponse,
   statsResponse,
@@ -36,7 +38,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit, validate?: (value: unknown) => T): Promise<T> {
+async function checkedResponse(path: string, init?: RequestInit) {
   const response = await fetch(path, {
     headers: { Accept: 'application/json', 'Content-Type': 'application/json', ...init?.headers },
     ...init,
@@ -45,10 +47,22 @@ async function request<T>(path: string, init?: RequestInit, validate?: (value: u
     const body = await response.json().catch(() => null) as { error?: string; message?: string } | null
     throw new ApiError(response.status, body?.error ?? body?.message ?? `Request failed (${response.status})`)
   }
-  if (response.status === 204) return undefined as T
+  return response
+}
+
+async function requestJson<T>(path: string, init?: RequestInit, validate?: (value: unknown) => T): Promise<T> {
+  const response = await checkedResponse(path, init)
+  if (response.status === 204) {
+    throw new Error(`Invalid API response from ${path}: expected JSON, received 204 No Content`)
+  }
   const text = await response.text()
-  const value: unknown = text ? JSON.parse(text) : undefined
+  if (!text) throw new Error(`Invalid API response from ${path}: expected a JSON body`)
+  const value: unknown = JSON.parse(text)
   return validate ? validate(value) : value as T
+}
+
+async function requestNoContent(path: string, init?: RequestInit): Promise<void> {
+  await checkedResponse(path, init)
 }
 
 function params(values: Record<string, string | number | null | undefined>) {
@@ -59,36 +73,35 @@ function params(values: Record<string, string | number | null | undefined>) {
   return search.toString()
 }
 
+function queryPath(path: string, values: Record<string, string | number | null | undefined>) {
+  const query = params(values)
+  return query ? `${path}?${query}` : path
+}
+
 const base = '/api/v1'
 
 export const api = {
-  status: (signal?: AbortSignal) => request<StatusResponse>(`${base}/status`, { signal }, statusResponse),
-  settings: (signal?: AbortSignal) => request<SettingsResponse>(`${base}/settings`, { signal }, settingsResponse),
-  overview: (signal?: AbortSignal) => request<OverviewResponse>(`${base}/overview`, { signal }, overviewResponse),
-  overviewYear: (year: number, signal?: AbortSignal) => request<OverviewYearResponse>(`${base}/overview/year?${params({ year })}`, { signal }, overviewYearResponse),
+  status: (signal?: AbortSignal) => requestJson<StatusResponse>(`${base}/status`, { signal }, statusResponse),
+  settings: (signal?: AbortSignal) => requestJson<SettingsResponse>(`${base}/settings`, { signal }, settingsResponse),
+  overview: (signal?: AbortSignal) => requestJson<OverviewResponse>(`${base}/overview`, { signal }, overviewResponse),
+  overviewYear: (year: number, signal?: AbortSignal) => requestJson<OverviewYearResponse>(`${base}/overview/year?${params({ year })}`, { signal }, overviewYearResponse),
   sessions: (options: { q?: string; date?: string; start?: string; end?: string; project?: string; sort?: SessionSort; page?: number; pageSize?: number }, signal?: AbortSignal) =>
-    request<SessionsResponse>(`${base}/sessions?${params({ ...options, pageSize: options.pageSize ?? 50 })}`, { signal }, sessionsResponse),
-  sessionSummary: (id: string, signal?: AbortSignal) => request<SessionSummary>(`${base}/sessions/${encodeURIComponent(id)}/summary`, { signal }, sessionSummaryResponse),
+    requestJson<SessionsResponse>(`${base}/sessions?${params({ ...options, pageSize: options.pageSize ?? 50 })}`, { signal }, sessionsResponse),
+  sessionSummary: (id: string, signal?: AbortSignal) => requestJson<SessionSummary>(`${base}/sessions/${encodeURIComponent(id)}/summary`, { signal }, sessionSummaryResponse),
   sessionActivity: (id: string, page: number, signal?: AbortSignal) =>
-    request<ActivityResponse>(`${base}/sessions/${encodeURIComponent(id)}/activity?${params({ page, pageSize: 25 })}`, { signal }, activityResponse),
-  sessionActivityDetail: (id: string, eventId: string, signal?: AbortSignal, childPage = 1, childPageSize = 250) =>
-    request<ActivityResponse['items'][number]>(`${base}/sessions/${encodeURIComponent(id)}/activity/${encodeURIComponent(eventId)}?${params({ childPage, childPageSize })}`, { signal }, activityItemResponse),
-  sessionUsage: (id: string, signal?: AbortSignal) => request<SessionUsageResponse>(`${base}/sessions/${encodeURIComponent(id)}/usage`, { signal }, sessionUsageResponse),
-  stats: (range: StatsRange, anchor?: string, signal?: AbortSignal) => request<StatsResponse>(`${base}/stats?${params({ range, anchor })}`, { signal }, statsResponse),
-  prices: (options: { q?: string; page?: number; pageSize?: number }, signal?: AbortSignal) => request<PricesResponse>(`${base}/prices?${params({ ...options, pageSize: options.pageSize ?? 25 })}`, { signal }, pricesResponse),
-  pricedModelIds: async (signal?: AbortSignal) => {
-    const first = await request<PricesResponse>(`${base}/prices?${params({ page: 1, pageSize: 100 })}`, { signal }, pricesResponse)
-    const remaining = await Promise.all(
-      Array.from({ length: Math.max(0, first.totalPages - 1) }, (_, index) =>
-        request<PricesResponse>(`${base}/prices?${params({ page: index + 2, pageSize: 100 })}`, { signal }, pricesResponse),
-      ),
-    )
-    return [...new Set([first, ...remaining].flatMap(response => response.items.map(item => item.modelId)))].sort()
-  },
+    requestJson<ActivityResponse>(`${base}/sessions/${encodeURIComponent(id)}/activity?${params({ page, pageSize: 25 })}`, { signal }, activityResponse),
+  sessionActivityDetail: (id: string, eventId: string, signal?: AbortSignal, childPage = 1, childPageSize = 250, childCursor?: string) =>
+    requestJson<ActivityResponse['items'][number]>(`${base}/sessions/${encodeURIComponent(id)}/activity/${encodeURIComponent(eventId)}?${params({ childPage, childPageSize, childCursor })}`, { signal }, activityItemResponse),
+  stats: (range: StatsRange, anchor?: string, signal?: AbortSignal) => requestJson<StatsResponse>(`${base}/stats?${params({ range, anchor })}`, { signal }, statsResponse),
+  prices: (options: { q?: string; page?: number; pageSize?: number }, signal?: AbortSignal) => requestJson<PricesResponse>(`${base}/prices?${params({ ...options, pageSize: options.pageSize ?? 25 })}`, { signal }, pricesResponse),
+  priceMetadata: (signal?: AbortSignal, unknownLimit?: number) => requestJson<PriceMetadataResponse>(queryPath(`${base}/prices/metadata`, { unknownLimit }), { signal }, priceMetadataResponse),
+  pricedModelIds: async (options: { q?: string; limit?: number } = {}, signal?: AbortSignal) => (
+    await requestJson<PriceModelIdsResponse>(queryPath(`${base}/prices/model-ids`, options), { signal }, priceModelIdsResponse)
+  ).items,
   savePrice: (modelId: string, value: { effectiveFrom: string; inputPerMillion: string; cachedInputPerMillion: string | null; outputPerMillion: string; currency?: string }) =>
-    request<void>(`${base}/prices/${encodeURIComponent(modelId)}`, { method: 'PUT', body: JSON.stringify(value) }),
-  deletePrice: (modelId: string, effectiveFrom: string) => request<void>(`${base}/prices/${encodeURIComponent(modelId)}?${params({ effectiveFrom })}`, { method: 'DELETE' }),
-  saveAlias: (observedModelId: string, canonicalModelId: string) => request<void>(`${base}/aliases/${encodeURIComponent(observedModelId)}`, { method: 'PUT', body: JSON.stringify({ canonicalModelId }) }),
-  deleteAlias: (observedModelId: string) => request<void>(`${base}/aliases/${encodeURIComponent(observedModelId)}`, { method: 'DELETE' }),
-  refreshPrices: () => request<{ updated?: number }>(`${base}/prices/refresh`, { method: 'POST' }),
+    requestNoContent(`${base}/prices/${encodeURIComponent(modelId)}`, { method: 'PUT', body: JSON.stringify(value) }),
+  deletePrice: (modelId: string, effectiveFrom: string) => requestNoContent(`${base}/prices/${encodeURIComponent(modelId)}?${params({ effectiveFrom })}`, { method: 'DELETE' }),
+  saveAlias: (observedModelId: string, canonicalModelId: string) => requestNoContent(`${base}/aliases/${encodeURIComponent(observedModelId)}`, { method: 'PUT', body: JSON.stringify({ canonicalModelId }) }),
+  deleteAlias: (observedModelId: string) => requestNoContent(`${base}/aliases/${encodeURIComponent(observedModelId)}`, { method: 'DELETE' }),
+  refreshPrices: () => requestJson<{ updated?: number }>(`${base}/prices/refresh`, { method: 'POST' }),
 }

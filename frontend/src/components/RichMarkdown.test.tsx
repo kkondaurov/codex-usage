@@ -38,4 +38,24 @@ describe('RichMarkdown', () => {
     expect(screen.getByText('const answer = 42').closest('pre')).toBeInTheDocument()
     expect(screen.queryByText('private citation plumbing')).not.toBeInTheDocument()
   })
+
+  it('bounds adversarial unmatched inline markup', () => {
+    const value = '['.repeat(32_000)
+    const startedAt = performance.now()
+
+    const { container } = render(<RichMarkdown>{value}</RichMarkdown>)
+
+    expect(container).toHaveTextContent(value)
+    expect(performance.now() - startedAt).toBeLessThan(500)
+  })
+
+  it('preserves source heading depth while capping it below the page hierarchy', () => {
+    render(<RichMarkdown>{'# One\n## Two\n### Three\n#### Four\n###### Six'}</RichMarkdown>)
+
+    expect(screen.getByRole('heading', { name: 'One', level: 3 })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Two', level: 4 })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Three', level: 5 })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Four', level: 6 })).toBeVisible()
+    expect(screen.getByRole('heading', { name: 'Six', level: 6 })).toBeVisible()
+  })
 })

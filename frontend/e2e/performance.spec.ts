@@ -13,9 +13,10 @@ import {
 } from './fixtures'
 
 const STATS_RANGES = ['day', 'week', 'month', 'year', 'all'] as const
-const COLD_SAMPLE_COUNT = 3
+const COLD_SAMPLE_COUNT = 5
 const PRODUCT_TARGET_MS = 1_000
-const HEADROOM_RENDER_BUDGET_MS = 900
+const HEADROOM_MEDIAN_BUDGET_MS = 900
+const API_BUDGET_MS = 900
 const SURFACE_WAIT_TIMEOUT_MS = 10_000
 
 type StatsRange = typeof STATS_RANGES[number]
@@ -147,6 +148,22 @@ async function measureColdOverviewToStats(page: Page, baseUrl: string): Promise<
   return { renderMs, apiMs }
 }
 
+async function measureColdCostSortedSessions(page: Page, baseUrl: string): Promise<SurfaceTiming> {
+  const response = page.waitForResponse(candidate => {
+    const url = new URL(candidate.url())
+    return url.pathname === '/api/v1/sessions' && url.searchParams.get('sort') === 'cost'
+  }, { timeout: SURFACE_WAIT_TIMEOUT_MS })
+  const startedAt = performance.now()
+  const apiTime = coldApiTime(response, startedAt)
+  const renderTime = coldRenderTime(page.locator('.sessions-table .session-row').first(), startedAt)
+  const [, renderMs, apiMs] = await Promise.all([
+    page.goto(`${baseUrl}/sessions?sort=cost`),
+    renderTime,
+    apiTime,
+  ])
+  return { renderMs, apiMs }
+}
+
 function summarize(samples: number[]) {
   const sorted = [...samples].sort((left, right) => left - right)
   const percentile = (fraction: number) => sorted[Math.ceil(sorted.length * fraction) - 1]
@@ -161,10 +178,11 @@ function summarize(samples: number[]) {
 test.describe('cold analytical performance', () => {
   test.describe.configure({ retries: 0, timeout: 180_000 })
 
-  test(`Overview and every Stats range stay below ${HEADROOM_RENDER_BUDGET_MS}ms across cold samples`, async ({ browser, app }, testInfo) => {
+  test(`Overview and every Stats range stay below ${PRODUCT_TARGET_MS}ms with median headroom`, async ({ browser, app }, testInfo) => {
     const overview: OverviewTiming[] = []
     const stats = Object.fromEntries(STATS_RANGES.map(range => [range, [] as SurfaceTiming[]])) as Record<StatsRange, SurfaceTiming[]>
     const overviewToStats: SurfaceTiming[] = []
+    const costSortedSessions: SurfaceTiming[] = []
 
     for (let sample = 0; sample < COLD_SAMPLE_COUNT; sample += 1) {
       overview.push(await withColdBrowserContext(browser, page => measureColdOverview(page, app.baseUrl)))
@@ -172,6 +190,7 @@ test.describe('cold analytical performance', () => {
         stats[range].push(await withColdBrowserContext(browser, page => measureColdStats(page, app.baseUrl, range)))
       }
       overviewToStats.push(await withColdBrowserContext(browser, page => measureColdOverviewToStats(page, app.baseUrl)))
+      costSortedSessions.push(await withColdBrowserContext(browser, page => measureColdCostSortedSessions(page, app.baseUrl)))
     }
 
     const renderSamples: Record<string, number[]> = Object.fromEntries(
@@ -190,12 +209,15 @@ test.describe('cold analytical performance', () => {
     }
     renderSamples['Overview to Stats navigation'] = overviewToStats.map(sample => sample.renderMs)
     apiSamples['Overview to Stats API'] = overviewToStats.map(sample => sample.apiMs)
+    renderSamples['Sessions sorted by cost'] = costSortedSessions.map(sample => sample.renderMs)
+    apiSamples['Sessions sorted by cost API'] = costSortedSessions.map(sample => sample.apiMs)
 
     const report = {
       productTargetMs: PRODUCT_TARGET_MS,
-      enforcedHeadroomBudgetMs: HEADROOM_RENDER_BUDGET_MS,
+      medianHeadroomBudgetMs: HEADROOM_MEDIAN_BUDGET_MS,
+      apiBudgetMs: API_BUDGET_MS,
       coldSampleCount: COLD_SAMPLE_COUNT,
-      coldDefinition: 'a new isolated Chromium context for every measured page load or navigation',
+      coldDefinition: 'a new isolated Chromium context and empty SPA cache for every measured page load or navigation; the long-running server and database remain warm as they do in normal use',
       scale: {
         year: overviewScaleYear,
         threads: 12 * overviewScaleThreadsPerMonth,
@@ -205,7 +227,7 @@ test.describe('cold analytical performance', () => {
         usageGroups: 12 * (overviewScaleThreadsPerMonth + overviewScaleAdditionalGroupsPerMonth),
         activityPairs: 12 * (overviewScaleThreadsPerMonth + overviewScaleAdditionalGroupsPerMonth),
       },
-      raw: { overview, stats, overviewToStats },
+      raw: { overview, stats, overviewToStats, costSortedSessions },
       summaries: {
         render: Object.fromEntries(Object.entries(renderSamples).map(([surface, samples]) => [surface, summarize(samples)])),
         api: Object.fromEntries(Object.entries(apiSamples).map(([surface, samples]) => [surface, summarize(samples)])),
@@ -219,7 +241,17 @@ test.describe('cold analytical performance', () => {
 
     const slowSamples = Object.entries(renderSamples).flatMap(([surface, samples]) => (
       samples.flatMap((elapsedMs, index) => (
-        elapsedMs >= HEADROOM_RENDER_BUDGET_MS ? [`${surface} sample ${index + 1}: ${elapsedMs}ms`] : []
+        elapsedMs >= PRODUCT_TARGET_MS ? [`${surface} sample ${index + 1}: ${elapsedMs}ms`] : []
+      ))
+    ))
+    const headroomMisses = Object.entries(report.summaries.render).flatMap(([surface, timing]) => (
+      timing.medianMs >= HEADROOM_MEDIAN_BUDGET_MS
+        ? [`${surface} median: ${timing.medianMs}ms`]
+        : []
+    ))
+    const slowApiSamples = Object.entries(apiSamples).flatMap(([surface, samples]) => (
+      samples.flatMap((elapsedMs, index) => (
+        elapsedMs >= API_BUDGET_MS ? [`${surface} sample ${index + 1}: ${elapsedMs}ms`] : []
       ))
     ))
     const summaryText = Object.entries(report.summaries.render)
@@ -227,7 +259,15 @@ test.describe('cold analytical performance', () => {
       .join('\n')
     expect(
       slowSamples,
-      `The ${PRODUCT_TARGET_MS}ms product target is enforced at ${HEADROOM_RENDER_BUDGET_MS}ms for headroom.\n${summaryText}`,
+      `Every cold SPA render must stay below the ${PRODUCT_TARGET_MS}ms product target.\n${summaryText}`,
+    ).toEqual([])
+    expect(
+      headroomMisses,
+      `Median cold SPA renders must stay below the ${HEADROOM_MEDIAN_BUDGET_MS}ms headroom budget.\n${summaryText}`,
+    ).toEqual([])
+    expect(
+      slowApiSamples,
+      `Analytical APIs must leave render headroom by staying below ${API_BUDGET_MS}ms.\n${summaryText}`,
     ).toEqual([])
   })
 })

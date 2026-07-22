@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest'
 import {
   activityItemResponse,
+  activityResponse,
   overviewResponse,
+  overviewYearResponse,
+  priceMetadataResponse,
+  priceModelIdsResponse,
   pricesResponse,
+  settingsResponse,
   sessionSummaryResponse,
   sessionsResponse,
+  statsResponse,
+  statusResponse,
 } from './apiValidation'
 
 const totals = {
@@ -62,8 +69,6 @@ const activityItem = {
 
 const prices = {
   items: [],
-  aliases: [],
-  observedUnknown: [],
   page: 1,
   pageSize: 25,
   total: 0,
@@ -72,6 +77,18 @@ const prices = {
   lastRefreshErrorAt: null,
   refreshError: null,
   source: null,
+}
+const priceMetadata = { aliases: [], aliasesTotal: 0, observedUnknown: [], observedUnknownTotal: 0 }
+
+const price = {
+  modelId: 'gpt-test',
+  effectiveFrom: '2026-07-19T00:00:00Z',
+  effectiveTo: null,
+  inputPerMillion: '1.000000',
+  cachedInputPerMillion: null,
+  outputPerMillion: '2.000000',
+  currency: 'USD',
+  source: 'manual',
 }
 
 function without(value: Record<string, unknown>, key: string) {
@@ -97,6 +114,95 @@ describe('runtime API contracts', () => {
       updatedAt: null,
       periods: { today: invalidPeriod, week: invalidPeriod, month: invalidPeriod },
     })).toThrow('Invalid API response at overview.periods.today.label')
+  })
+
+  it('accepts canonical decimal strings without coercing dollar values to numbers', () => {
+    const exactTotals = { ...totals, costUsd: '9007199254740993.000000000001' }
+    const exactPeriod = { sessionCount: 1, messageCount: 1, totals: exactTotals }
+
+    expect(overviewResponse({
+      updatedAt: null,
+      periods: { today: exactPeriod, week: exactPeriod, month: exactPeriod },
+    }).periods.today.totals.costUsd).toBe('9007199254740993.000000000001')
+  })
+
+  it.each([
+    ['overview.periods.today.totals.totalTokens', () => overviewResponse({
+      updatedAt: null,
+      periods: {
+        today: { sessionCount: 0, messageCount: 0, totals: { ...totals, totalTokens: Number.MAX_SAFE_INTEGER + 1 } },
+        week: { sessionCount: 0, messageCount: 0, totals },
+        month: { sessionCount: 0, messageCount: 0, totals },
+      },
+    })],
+    ['sessions.items[0].messageCount', () => sessionsResponse({
+      items: [{ ...session, messageCount: -1 }],
+      page: 1,
+      pageSize: 50,
+      total: 1,
+      totalPages: 1,
+      projects: [],
+    })],
+    ['sessions.page', () => sessionsResponse({
+      items: [],
+      page: 1.5,
+      pageSize: 50,
+      total: 0,
+      totalPages: 1,
+      projects: [],
+    })],
+    ['activityItem.durationMs', () => activityItemResponse({ ...activityItem, durationMs: 1.5 })],
+    ['settings.databaseBytes', () => settingsResponse({
+      databasePath: '/tmp/codex-usage.db',
+      activeRoot: null,
+      archiveRoot: null,
+      timezone: 'UTC',
+      lastIngestAt: null,
+      sessionCount: 0,
+      databaseBytes: -1,
+      pricing: { knownCostUsd: '0', unpricedTokens: 0, complete: true },
+    })],
+  ])('rejects unsafe, fractional, or negative integer fields at %s', (path, validate) => {
+    expect(validate).toThrow(`Invalid API response at ${path}: expected a non-negative safe integer`)
+  })
+
+  it.each([
+    ['overview.periods.today.totals.costUsd', () => overviewResponse({
+      updatedAt: null,
+      periods: {
+        today: { sessionCount: 0, messageCount: 0, totals: { ...totals, costUsd: 0 } },
+        week: { sessionCount: 0, messageCount: 0, totals },
+        month: { sessionCount: 0, messageCount: 0, totals },
+      },
+    })],
+    ['sessions.items[0].costUsd', () => sessionsResponse({
+      items: [{ ...session, costUsd: 0 }],
+      page: 1,
+      pageSize: 50,
+      total: 1,
+      totalPages: 1,
+      projects: [],
+    })],
+    ['settings.pricing.knownCostUsd', () => settingsResponse({
+      databasePath: '/tmp/codex-usage.db',
+      activeRoot: null,
+      archiveRoot: null,
+      timezone: 'UTC',
+      lastIngestAt: null,
+      sessionCount: 0,
+      databaseBytes: 0,
+      pricing: { knownCostUsd: 0, unpricedTokens: 0, complete: true },
+    })],
+    ['stats.trend[0]', () => statsResponse({
+      range: 'day',
+      anchor: '2026-07-19',
+      label: 'July 19',
+      totals,
+      rows: [],
+      trend: [0],
+    })],
+  ])('rejects binary numbers at %s', (path, validate) => {
+    expect(validate).toThrow(`Invalid API response at ${path}`)
   })
 
   it.each([
@@ -161,5 +267,141 @@ describe('runtime API contracts', () => {
     expect(() => pricesResponse(prices)).not.toThrow()
     expect(() => pricesResponse({ ...prices, refreshErrorKind: 503 }))
       .toThrow('Invalid API response at prices.refreshErrorKind')
+  })
+
+  it.each([
+    ['not-a-date', 'status.lastIngestAt'],
+    ['2026-02-30T00:00:00Z', 'status.lastIngestAt'],
+  ])('rejects invalid status timestamp %s', (value, path) => {
+    expect(() => statusResponse({
+      state: 'idle',
+      lastIngestAt: value,
+      lastIngestAttemptAt: null,
+      lastEventAt: null,
+      filesScanned: 0,
+      filesFailed: 0,
+    })).toThrow(`Invalid API response at ${path}`)
+  })
+
+  it('rejects invalid settings timestamps', () => {
+    expect(() => settingsResponse({
+      databasePath: '/tmp/codex-usage.db',
+      activeRoot: '/tmp/sessions',
+      archiveRoot: null,
+      timezone: 'UTC',
+      lastIngestAt: '2026-07-19T24:00:00Z',
+      sessionCount: 0,
+      databaseBytes: 0,
+      pricing: { knownCostUsd: '0', unpricedTokens: 0, complete: true },
+    })).toThrow('Invalid API response at settings.lastIngestAt')
+  })
+
+  it.each(['startedAt', 'lastEventAt'])('semantically validates SessionRow.%s', field => {
+    expect(() => sessionsResponse({
+      items: [{ ...session, [field]: '2026-02-30T00:00:00Z' }],
+      page: 1,
+      pageSize: 50,
+      total: 1,
+      totalPages: 1,
+      projects: [],
+    })).toThrow(`Invalid API response at sessions.items[0].${field}`)
+  })
+
+  it('semantically validates overview update and period timestamps', () => {
+    const validPeriod = {
+      label: 'Today',
+      start: '2026-07-19T00:00:00Z',
+      end: '2026-07-20T00:00:00Z',
+      sessionCount: 0,
+      messageCount: 0,
+      totals,
+    }
+    expect(() => overviewResponse({
+      updatedAt: '2026-02-30T00:00:00Z',
+      periods: { today: validPeriod, week: validPeriod, month: validPeriod },
+    })).toThrow('Invalid API response at overview.updatedAt')
+    expect(() => overviewResponse({
+      updatedAt: null,
+      periods: {
+        today: { ...validPeriod, end: '2026-07-20T24:00:00Z' },
+        week: validPeriod,
+        month: validPeriod,
+      },
+    })).toThrow('Invalid API response at overview.periods.today.end')
+  })
+
+  it('semantically validates the optional session completion timestamp', () => {
+    expect(() => sessionSummaryResponse({
+      session: { ...session, status: 'completed', completedAt: 'not-a-timestamp' },
+      totals,
+      models: [],
+      agents: [],
+      toolSummary: [],
+    })).toThrow('Invalid API response at sessionSummary.session.completedAt')
+  })
+
+  it('semantically validates renderable date-only fields', () => {
+    expect(() => overviewYearResponse({
+      year: 2026,
+      heatmap: [{ date: '2026-02-30', costUsd: '0', sessionCount: 0, totalTokens: 0 }],
+      topProjects: [],
+      topSessions: [],
+    })).toThrow('Invalid API response at overviewYear.heatmap[0].date')
+    expect(() => activityResponse({
+      items: [],
+      days: [{ date: '1969-12-31', durationMs: 0, totals }],
+      page: 1,
+      pageSize: 25,
+      total: 0,
+      totalPages: 1,
+    })).toThrow('Invalid API response at activity.days[0].date')
+    expect(() => statsResponse({
+      range: 'month',
+      anchor: '9999-01-01',
+      label: 'January 9999',
+      totals,
+      rows: [],
+      trend: [],
+    })).toThrow('Invalid API response at stats.anchor')
+  })
+
+  it.each(['periodStart', 'periodEnd'])('semantically validates StatsRow.%s', field => {
+    expect(() => statsResponse({
+      range: 'day',
+      anchor: '2026-07-19',
+      label: 'July 19',
+      totals,
+      rows: [{
+        ...totals,
+        periodStart: '2026-07-19T00:00:00Z',
+        periodEnd: '2026-07-20T00:00:00Z',
+        [field]: '2026-07-19T24:00:00Z',
+        label: 'MIDNIGHT',
+        sessionCount: 0,
+      }],
+      trend: [],
+    })).toThrow(`Invalid API response at stats.rows[0].${field}`)
+  })
+
+  it.each([
+    ['prices.items[0].effectiveFrom', { ...prices, items: [{ ...price, effectiveFrom: '2026-02-30T00:00:00Z' }] }],
+    ['prices.items[0].effectiveTo', { ...prices, items: [{ ...price, effectiveTo: 'not-a-timestamp' }] }],
+    ['prices.lastRefreshAt', { ...prices, lastRefreshAt: '2026-02-30T00:00:00Z' }],
+    ['prices.lastRefreshErrorAt', { ...prices, lastRefreshErrorAt: 'not-a-timestamp' }],
+  ])('semantically validates %s', (path, candidate) => {
+    expect(() => pricesResponse(candidate)).toThrow(`Invalid API response at ${path}`)
+  })
+
+  it('validates dedicated price metadata and model ID responses', () => {
+    expect(() => priceMetadataResponse({
+      ...priceMetadata,
+      observedUnknown: [{ modelId: 'unknown', usageCount: 1, totalTokens: 1, lastSeenAt: '2026-07-19T24:00:00Z' }],
+    })).toThrow('Invalid API response at priceMetadata.observedUnknown[0].lastSeenAt')
+    expect(() => priceMetadataResponse({ ...priceMetadata, observedUnknownTotal: -1 }))
+      .toThrow('Invalid API response at priceMetadata.observedUnknownTotal')
+    expect(() => priceMetadataResponse({ ...priceMetadata, aliasesTotal: -1 }))
+      .toThrow('Invalid API response at priceMetadata.aliasesTotal')
+    expect(() => priceModelIdsResponse({ items: ['gpt-5', 7] }))
+      .toThrow('Invalid API response at priceModelIds.items[1]')
   })
 })

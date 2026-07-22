@@ -9,21 +9,25 @@ import { StatsPage } from './pages/StatsPage'
 
 export default function App() {
   const location = useLocation()
+  const resetKey = `${location.pathname}${location.search}`
   return (
-    <div className="app-shell">
-      <AppHeader />
-      <main>
-        <AppErrorBoundary resetKey={`${location.pathname}${location.search}`}>
-          <Routes>
-            <Route path="/" element={<OverviewPage />} />
-            <Route path="/sessions" element={<SessionsPage />} />
-            <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
-            <Route path="/stats" element={<StatsPage />} />
-            <Route path="/settings" element={<SettingsPage />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
-        </AppErrorBoundary>
-      </main>
-    </div>
+    <AppErrorBoundary resetKey={`shell:${resetKey}`}>
+      <div className="app-shell">
+        <a className="skip-link" href="#main-content">Skip to main content</a>
+        <AppHeader />
+        <main id="main-content" tabIndex={-1}>
+          <AppErrorBoundary resetKey={resetKey}>
+            <Routes>
+              <Route path="/" element={<OverviewPage />} />
+              <Route path="/sessions" element={<SessionsPage />} />
+              <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
+              <Route path="/stats" element={<StatsPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </AppErrorBoundary>
+        </main>
+      </div>
+    </AppErrorBoundary>
   )
 }

@@ -8,12 +8,15 @@ import { DegradedDataNotice, ErrorState, LoadingLedger, Pagination } from '../co
 import { handleTabKeyDown } from '../components/tabKeyboard'
 import { RichMarkdown } from '../components/RichMarkdown'
 import { UserMessageContent } from '../components/UserMessageContent'
+import { addDecimal } from '../decimal'
 import { duration, ellipsis, estimatedMoney, shortDate, time, tokens } from '../format'
 import { useAsync } from '../hooks'
 import type { ActivityItem, SessionSummary, Totals } from '../types'
 
-const ZERO_TOTALS: Totals = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, blendedTokens: 0, totalTokens: 0, costUsd: 0, unpricedTokens: 0, pricingComplete: true }
+const ZERO_TOTALS: Totals = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningTokens: 0, blendedTokens: 0, totalTokens: 0, costUsd: '0', unpricedTokens: 0, pricingComplete: true }
 const SESSION_TABS = ['summary', 'activity'] as const
+const COMPACT_MODEL_LIMIT = 6
+const COMPACT_TOOL_LIMIT = 18
 
 function Metric({ label, children, accent = false }: { label: string; children: ReactNode; accent?: boolean }) {
   return <div className={`detail-metric ${accent ? 'accent' : ''}`}><span>{label}</span><strong>{children}</strong></div>
@@ -31,8 +34,14 @@ function LongTextCard({ label, text, date, tone }: { label: string; text: string
 }
 
 function SummaryTab({ detail }: { detail: SessionSummary }) {
+  const [allModelsVisible, setAllModelsVisible] = useState(false)
+  const [allToolsVisible, setAllToolsVisible] = useState(false)
+  const modelListId = useId()
+  const toolListId = useId()
   const maxToolCount = Math.max(1, ...detail.toolSummary.map(item => item.count))
   const totalModelTokens = Math.max(1, detail.models.reduce((sum, item) => sum + item.totalTokens, 0))
+  const visibleModels = allModelsVisible ? detail.models : detail.models.slice(0, COMPACT_MODEL_LIMIT)
+  const visibleTools = allToolsVisible ? detail.toolSummary : detail.toolSummary.slice(0, COMPACT_TOOL_LIMIT)
   const firstPrompt = detail.session.firstPrompt
   const latestResult = detail.session.latestResult
   return (
@@ -44,9 +53,9 @@ function SummaryTab({ detail }: { detail: SessionSummary }) {
       <aside className="session-insights">
         <section className="insight-card model-card">
           <h2>MODELS &amp; REASONING</h2>
-          <div className="model-list">
+          <div className="model-list" id={modelListId}>
             <div className="model-list-head"><span>MODEL</span><span>EFFORT</span><span>COST</span><span>API TOKENS</span><span>SHARE</span></div>
-            {detail.models.slice(0, 6).map((model, index) => {
+            {visibleModels.map((model, index) => {
               const share = model.totalTokens / totalModelTokens
               return <div className="model-row" key={`${model.model}-${model.effort}`}>
                 <span className="model-name"><i className={`model-key model-${index % 3}`} /><strong>{model.model}</strong></span>
@@ -57,11 +66,13 @@ function SummaryTab({ detail }: { detail: SessionSummary }) {
               </div>
             })}
           </div>
-          <div className="model-bar">{detail.models.slice(0, 6).map((model, index) => <i key={`${model.model}-${index}`} className={`model-${index % 3}`} style={{ width: `${model.totalTokens / totalModelTokens * 100}%` }} />)}</div>
+          <div className="model-bar">{visibleModels.map((model, index) => <i key={`${model.model}-${index}`} className={`model-${index % 3}`} style={{ width: `${model.totalTokens / totalModelTokens * 100}%` }} />)}</div>
+          {detail.models.length > COMPACT_MODEL_LIMIT && <button type="button" className="insight-disclosure" aria-expanded={allModelsVisible} aria-controls={modelListId} onClick={() => setAllModelsVisible(value => !value)}>{allModelsVisible ? `SHOWING ALL ${detail.models.length} · SHOW TOP ${COMPACT_MODEL_LIMIT}` : `SHOWING ${COMPACT_MODEL_LIMIT} OF ${detail.models.length} · SHOW ALL`}</button>}
         </section>
         <section className="insight-card tools-card">
           <h2>TOOLS USED · {detail.toolSummary.reduce((sum, tool) => sum + tool.count, 0)}</h2>
-          <div className="tool-list">{detail.toolSummary.slice(0, 18).map(tool => <div key={tool.tool}><span><strong>{tool.tool}</strong><i style={{ width: `${Math.max(4, tool.count / maxToolCount * 100)}%` }} /></span><b>{tool.count}</b></div>)}</div>
+          <div className="tool-list" id={toolListId}>{visibleTools.map(tool => <div key={tool.tool}><span><strong>{tool.tool}</strong><i style={{ width: `${Math.max(4, tool.count / maxToolCount * 100)}%` }} /></span><b>{tool.count}</b></div>)}</div>
+          {detail.toolSummary.length > COMPACT_TOOL_LIMIT && <button type="button" className="insight-disclosure" aria-expanded={allToolsVisible} aria-controls={toolListId} onClick={() => setAllToolsVisible(value => !value)}>{allToolsVisible ? `SHOWING ALL ${detail.toolSummary.length} · SHOW TOP ${COMPACT_TOOL_LIMIT}` : `SHOWING ${COMPACT_TOOL_LIMIT} OF ${detail.toolSummary.length} · SHOW ALL`}</button>}
         </section>
       </aside>
     </div>
@@ -218,7 +229,7 @@ function workUsage(items: ActivityItem[]) {
     reasoningTokens: sum.reasoningTokens + usage.reasoningTokens,
     blendedTokens: sum.blendedTokens + usage.blendedTokens,
     totalTokens: sum.totalTokens + usage.totalTokens,
-    costUsd: sum.costUsd == null || usage.costUsd == null ? null : sum.costUsd + usage.costUsd,
+    costUsd: sum.costUsd == null || usage.costUsd == null ? null : addDecimal(sum.costUsd, usage.costUsd),
     unpricedTokens: sum.unpricedTokens + usage.unpricedTokens,
     pricingComplete: sum.pricingComplete && usage.pricingComplete,
   }), { ...ZERO_TOTALS })
@@ -235,6 +246,25 @@ function mergeActivityDetail(current: ActivityItem, next: ActivityItem) {
   const children = new Map(current.children.map(child => [child.id, child]))
   for (const child of next.children) children.set(child.id, child)
   return { ...current, ...next, children: newestFirst([...children.values()]) }
+}
+
+function mergeActivityDetailPages(pages: Map<number, ActivityItem>) {
+  const ordered = [...pages.entries()].sort(([left], [right]) => left - right)
+  if (ordered.length === 0) return null
+  const [, firstPage] = ordered[0]
+  const [lastPageNumber, lastPage] = ordered[ordered.length - 1]
+  const merged = ordered.slice(1).reduce(
+    (current, [, page]) => mergeActivityDetail(current, page),
+    firstPage,
+  )
+  return {
+    ...merged,
+    childPage: lastPage.childPage ?? lastPageNumber,
+    childPageSize: firstPage.childPageSize ?? lastPage.childPageSize,
+    childTotal: firstPage.childTotal ?? lastPage.childTotal,
+    childHasMore: lastPage.childHasMore,
+    childNextCursor: lastPage.childNextCursor,
+  }
 }
 
 function loadedPagedChildren(item: ActivityItem) {
@@ -264,14 +294,32 @@ function SenderIcon({ sender }: { sender: 'user' | 'assistant' }) {
     : <ChatCircleText className="event-sender-icon" weight="bold" aria-hidden="true" />
 }
 
-function EventRow({ sessionId, item, depth = 0, exchange = false }: { sessionId: string; item: ActivityItem; depth?: number; exchange?: boolean }) {
+function EventRow({
+  sessionId,
+  item,
+  depth = 0,
+  exchange = false,
+  refreshRevision = null,
+}: {
+  sessionId: string
+  item: ActivityItem
+  depth?: number
+  exchange?: boolean
+  refreshRevision?: number | null
+}) {
   const detailId = useId()
   const [open, setOpen] = useState(false)
-  const [detail, setDetail] = useState<ActivityItem | null>(item.children.length > 0 ? item : null)
+  const [detailPages, setDetailPages] = useState<Map<number, ActivityItem>>(() => (
+    item.children.length > 0 ? new Map([[item.childPage ?? 1, item]]) : new Map()
+  ))
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState<string | null>(null)
+  const [failedDetailPages, setFailedDetailPages] = useState<number[]>([])
   const detailRequestSequence = useRef(0)
   const detailRequestController = useRef<AbortController | null>(null)
+  const detailPagesRef = useRef(detailPages)
+  detailPagesRef.current = detailPages
+  const detail = mergeActivityDetailPages(detailPages)
 
   const isTool = item.kind === 'tool' || item.kind === 'tool_result'
   const preview = isTool ? '' : eventBody(item)
@@ -290,10 +338,13 @@ function EventRow({ sessionId, item, depth = 0, exchange = false }: { sessionId:
 
   const loadDetail = useCallback(async ({
     page = 1,
+    pages,
     pageSize = 250,
     append = false,
+    replace = !append,
     quiet = false,
-  }: { page?: number; pageSize?: number; append?: boolean; quiet?: boolean } = {}) => {
+  }: { page?: number; pages?: number[]; pageSize?: number; append?: boolean; replace?: boolean; quiet?: boolean } = {}) => {
+    const requestedPages = [...new Set(pages ?? [page])].sort((left, right) => left - right)
     const sequence = ++detailRequestSequence.current
     detailRequestController.current?.abort()
     const controller = new AbortController()
@@ -301,13 +352,37 @@ function EventRow({ sessionId, item, depth = 0, exchange = false }: { sessionId:
     setDetailLoading(true)
     if (!quiet) setDetailError(null)
     try {
-      const next = await api.sessionActivityDetail(sessionId, item.id, controller.signal, page, pageSize)
+      // Polling may need to revalidate several explicitly loaded pages. Keep
+      // those reads serialized so one long-open exchange cannot fan out an
+      // unbounded burst of concurrent SQLite work every refresh interval.
+      const responses: Array<{ requestedPage: number; detail: ActivityItem }> = []
+      let nextCursor = requestedPages[0] > 1
+        ? detailPagesRef.current.get(requestedPages[0] - 1)?.childNextCursor
+        : undefined
+      for (const requestedPage of requestedPages) {
+        const detail = nextCursor == null
+          ? await api.sessionActivityDetail(sessionId, item.id, controller.signal, requestedPage, pageSize)
+          : await api.sessionActivityDetail(sessionId, item.id, controller.signal, requestedPage, pageSize, nextCursor)
+        responses.push({
+          requestedPage,
+          detail,
+        })
+        nextCursor = detail.childNextCursor
+      }
       if (sequence !== detailRequestSequence.current) return
-      setDetail(current => append && current ? mergeActivityDetail(current, next) : next)
+      setDetailPages(current => {
+        const next = replace ? new Map<number, ActivityItem>() : new Map(current)
+        for (const response of responses) {
+          next.set(response.detail.childPage ?? response.requestedPage, response.detail)
+        }
+        return next
+      })
       setDetailError(null)
+      setFailedDetailPages([])
     } catch (error) {
       if (sequence !== detailRequestSequence.current || (error instanceof Error && error.name === 'AbortError')) return
       setDetailError(error instanceof Error ? error.message : 'Could not load activity details')
+      setFailedDetailPages(requestedPages)
     } finally {
       if (sequence === detailRequestSequence.current) {
         detailRequestController.current = null
@@ -335,31 +410,54 @@ function EventRow({ sessionId, item, depth = 0, exchange = false }: { sessionId:
     item.childPageSize,
     item.childTotal,
     item.childHasMore,
+    item.childNextCursor,
   ])
 
   useEffect(() => {
+    const loadedPages = [...detailPagesRef.current.keys()].sort((left, right) => left - right)
+    const pageSize = detailPagesRef.current.get(loadedPages[0])?.childPageSize ?? 250
     if (item.children.length > 0) {
       detailRequestSequence.current += 1
       detailRequestController.current?.abort()
       detailRequestController.current = null
       setDetailLoading(false)
       setDetailError(null)
-      setDetail(item)
+      setFailedDetailPages([])
+      setDetailPages(current => {
+        const next = new Map(current)
+        next.set(item.childPage ?? 1, item)
+        return next
+      })
+      const remainingPages = loadedPages.filter(page => page !== (item.childPage ?? 1))
+      if (open && remainingPages.length > 0) {
+        void loadDetail({ pages: remainingPages, pageSize, replace: false, quiet: true })
+      }
       return
     }
     if (open && hasDetails) {
-      void loadDetail({ quiet: Boolean(detail) })
+      void loadDetail({
+        pages: loadedPages.length > 0 ? loadedPages : [1],
+        pageSize,
+        replace: true,
+        quiet: loadedPages.length > 0,
+      })
       return
     }
-    setDetail(current => {
-      if (!current || current.id !== item.id) return null
-      return { ...current, ...item }
+    setDetailPages(current => {
+      if (current.size === 0) return current
+      const next = new Map(current)
+      const firstPageNumber = Math.min(...next.keys())
+      const firstPage = next.get(firstPageNumber)
+      if (!firstPage || firstPage.id !== item.id) return new Map()
+      next.set(firstPageNumber, { ...firstPage, ...item, children: firstPage.children })
+      return next
     })
-    // itemRevision is the response-level identity that should trigger a
-    // reconciliation. Depending on the whole item would refetch on every
-    // parent render even when polling returned the same event.
+    // itemRevision reconciles parent-visible changes, while refreshRevision
+    // also revalidates an expanded event after every successful parent poll.
+    // Child-only changes are otherwise invisible when the parent row itself
+    // remains byte-for-byte identical.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [itemRevision, open, hasDetails, loadDetail])
+  }, [itemRevision, refreshRevision, open, hasDetails, loadDetail])
 
   function toggle() {
     if (!hasDetails) return
@@ -375,7 +473,8 @@ function EventRow({ sessionId, item, depth = 0, exchange = false }: { sessionId:
   const canLoadMore = Boolean(detail?.childHasMore)
   const loadedChildren = detail ? loadedPagedChildren(detail) : 0
   const communicationText = preview || item.label || eventLabel(item)
-  const showChildDates = exchange && new Set(children.map(child => activityDay(child.timestamp))).size > 1
+  const parentDay = activityDay(item.timestamp)
+  const showChildDates = children.some(child => activityDay(child.timestamp) !== parentDay)
   const copyContent = exchange ? <>
     <span className="event-copy-title exchange-user-line from-user">
       {item.label && <span className="exchange-request"><CompactMarkdown maxLength={150}>{item.label}</CompactMarkdown></span>}
@@ -410,10 +509,10 @@ function EventRow({ sessionId, item, depth = 0, exchange = false }: { sessionId:
           <div className="activity-detail-cell" role={nested ? 'presentation' : 'cell'} aria-colspan={nested ? undefined : 6}>
             <div id={detailId} className="activity-event-details" role="region" aria-label={`${eventLabel(item)} details`}>
           {detailLoading && !detail && <div className="activity-detail-state">Loading details…</div>}
-          {detailError && <div className="activity-detail-state failed"><span>{detailError}</span><button type="button" onClick={() => void loadDetail({
-            page: detail?.childHasMore ? (detail.childPage ?? 1) + 1 : 1,
+          {detailError && <div className="activity-detail-state failed" role="alert" aria-atomic="true"><span>{detailError}</span><button type="button" onClick={() => void loadDetail({
+            pages: failedDetailPages.length > 0 ? failedDetailPages : [detail?.childHasMore ? (detail.childPage ?? 1) + 1 : 1],
             pageSize: detail?.childPageSize ?? 250,
-            append: Boolean(detail?.childHasMore),
+            replace: detailPages.size === 0,
           })}>RETRY</button></div>}
           {detail && <>
             {!exchange && detail.kind === 'user' && body && <UserMessageContent raw={body} fallback={preview} />}
@@ -422,8 +521,8 @@ function EventRow({ sessionId, item, depth = 0, exchange = false }: { sessionId:
               : <pre>{body}</pre>)}
             {children.length > 0 && <div className="activity-child-list" role="list" aria-label={`${eventLabel(item)} events`}>{children.map((child, index) => {
               const day = activityDay(child.timestamp)
-              const previousDay = index > 0 ? activityDay(children[index - 1].timestamp) : null
-              return <Fragment key={child.id}>{showChildDates && day !== previousDay && <div className="activity-child-date" role="presentation" aria-hidden="true">{shortDate(child.timestamp).toUpperCase()}</div>}<EventRow sessionId={sessionId} item={child} depth={depth + 1} /></Fragment>
+              const previousDay = index > 0 ? activityDay(children[index - 1].timestamp) : parentDay
+              return <Fragment key={child.id}>{showChildDates && day !== previousDay && <div className="activity-child-date" role="presentation" aria-hidden="true">{shortDate(child.timestamp).toUpperCase()}</div>}<EventRow sessionId={sessionId} item={child} depth={depth + 1} refreshRevision={refreshRevision} /></Fragment>
             })}</div>}
             {canLoadMore && <div className="activity-detail-pagination" role="status" aria-live="polite"><button type="button" disabled={detailLoading} onClick={() => void loadDetail({
               page: (detail.childPage ?? 1) + 1,
@@ -444,7 +543,20 @@ function ActivityTab({ sessionId }: { sessionId: string }) {
   const rawPage = Number(params.get('page') ?? 1)
   const validRequestedPage = Number.isSafeInteger(rawPage) && rawPage > 0
   const page = validRequestedPage ? rawPage : 1
+  const paginationRef = useRef<{ page: number; totalPages: number; total: number; pageSize: number } | null>(null)
   const { data, error, loading, lastSuccessfulAt, refresh } = useAsync(signal => api.sessionActivity(sessionId, page, signal), [sessionId, page], 30_000)
+  if (data) {
+    paginationRef.current = data.total > 0
+      ? { page: data.page, totalPages: Math.max(1, data.totalPages), total: data.total, pageSize: data.pageSize }
+      : null
+  }
+  const pagination = data?.total ? {
+    page: data.page,
+    totalPages: Math.max(1, data.totalPages),
+    total: data.total,
+    pageSize: data.pageSize,
+  } : paginationRef.current
+  const paginationUnavailable = loading || (!data && Boolean(error))
   useEffect(() => {
     if (!data) return
     const canonicalPage = Math.max(1, data.page)
@@ -454,25 +566,26 @@ function ActivityTab({ sessionId }: { sessionId: string }) {
     if (canonicalPage === 1) next.delete('page'); else next.set('page', String(canonicalPage))
     setParams(next, { replace: true })
   }, [data, page, params, setParams, validRequestedPage])
-  if (loading && !data) return <LoadingLedger rows={10} />
-  if (error && !data) return <ErrorState error={error} onRetry={() => void refresh()} />
-  if (!data) return null
   return (
-    <section className="page-ledger-frame activity-ledger">
-      {error && <DegradedDataNotice error={error} lastSuccessfulAt={lastSuccessfulAt} onRetry={() => void refresh()} />}
-      <div className="activity-table" role="table" aria-label="Session activity">
-        <div role="rowgroup"><div className="activity-head" role="row"><span role="columnheader">TIME</span><span role="columnheader">ACTIVITY</span><span role="columnheader">DURATION</span><span role="columnheader">COST</span><span role="columnheader">API TOKENS</span><span role="columnheader" aria-label="Details" /></div></div>
-        <div role="rowgroup">
-          {data.items.length === 0 ? <div className="no-results" role="row"><span role="cell"><strong>NO ACTIVITY STORED</strong><span>This session has no displayable events.</span></span></div> : data.items.map((item, index) => {
-            const day = activityDay(item.timestamp)
-            const previousDate = index > 0 ? new Date(data.items[index - 1].timestamp) : null
-            const previousDay = previousDate ? activityDay(previousDate.toISOString()) : null
-            const daySummary = data.days.find(summary => summary.date === day)
-            return <Fragment key={item.id}>{day !== previousDay && <div className="activity-date-divider" role="row"><strong role="cell">{shortDate(item.timestamp).toUpperCase()}</strong><span role="cell" /><b role="cell">{daySummary ? duration(daySummary.durationMs) : '—'}</b><b role="cell">{daySummary ? estimatedMoney(daySummary.totals.costUsd, daySummary.totals.unpricedTokens) : '—'}</b><b role="cell">{daySummary ? tokens(daySummary.totals.totalTokens) : '—'}</b><span role="cell" /></div>}<EventRow sessionId={sessionId} item={item} exchange={item.kind === 'exchange'} /></Fragment>
-          })}
+    <section className="page-ledger-frame activity-ledger" aria-busy={loading || undefined}>
+      {error && data && <DegradedDataNotice error={error} lastSuccessfulAt={lastSuccessfulAt} onRetry={() => void refresh()} />}
+      <div className="ledger-scroll activity-scroll" role="region" aria-label="Scrollable session activity ledger" tabIndex={0}>
+        <div className="activity-table" role="table" aria-label="Session activity">
+          <div role="rowgroup"><div className="activity-head" role="row"><span role="columnheader">TIME</span><span role="columnheader">ACTIVITY</span><span role="columnheader">DURATION</span><span role="columnheader">COST</span><span role="columnheader">API TOKENS</span><span role="columnheader" aria-label="Details" /></div></div>
+          <div role="rowgroup">
+            {loading && !data ? <div className="table-state-row" role="row"><div role="cell" aria-colspan={6}><LoadingLedger rows={10} /></div></div> : null}
+            {error && !data ? <div className="table-state-row" role="row"><div role="cell" aria-colspan={6}><ErrorState error={error} onRetry={() => void refresh()} /></div></div> : null}
+            {!data ? null : data.items.length === 0 ? <div className="no-results" role="row"><span role="cell"><strong>NO ACTIVITY STORED</strong><span>This session has no displayable events.</span></span></div> : data.items.map((item, index) => {
+              const day = activityDay(item.timestamp)
+              const previousDate = index > 0 ? new Date(data.items[index - 1].timestamp) : null
+              const previousDay = previousDate ? activityDay(previousDate.toISOString()) : null
+              const daySummary = data.days.find(summary => summary.date === day)
+              return <Fragment key={item.id}>{day !== previousDay && <div className="activity-date-divider" role="row"><strong role="cell">{shortDate(item.timestamp).toUpperCase()}</strong><span role="cell" /><b role="cell">{daySummary ? duration(daySummary.durationMs) : '—'}</b><b role="cell">{daySummary ? estimatedMoney(daySummary.totals.costUsd, daySummary.totals.unpricedTokens) : '—'}</b><b role="cell">{daySummary ? tokens(daySummary.totals.totalTokens) : '—'}</b><span role="cell" /></div>}<EventRow sessionId={sessionId} item={item} exchange={item.kind === 'exchange'} refreshRevision={lastSuccessfulAt} /></Fragment>
+            })}
+          </div>
         </div>
       </div>
-      {data.total > 0 && <Pagination page={data.page} totalPages={Math.max(1, data.totalPages)} total={data.total} pageSize={data.pageSize} onPage={value => { const next = new URLSearchParams(params); next.set('tab', 'activity'); next.set('page', String(value)); setParams(next) }} />}
+      {pagination && <Pagination {...pagination} busy={paginationUnavailable} onPage={value => { const next = new URLSearchParams(params); next.set('tab', 'activity'); next.set('page', String(value)); setParams(next) }} />}
     </section>
   )
 }

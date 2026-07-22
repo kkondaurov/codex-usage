@@ -1,22 +1,24 @@
 use crate::{
+    MAX_JS_SAFE_INTEGER, MAX_PUBLIC_YEAR, MIN_PUBLIC_YEAR, activity_index,
     config::PricingConfig,
     db::Db,
     db_executor::{DbExecutor, WorkClass},
     fixed_price::PriceMicros,
     ingest::{IngestRoots, ScanReport},
-    manual_pricing::{ManualAlias, ManualPrice, MutationError},
+    manual_pricing::{MAX_MODEL_ID_CHARS, ManualAlias, ManualPrice, MutationError},
     model::Totals,
+    money::UsdAmount,
     pricing,
     redaction::redact_data_urls,
 };
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
-    body::Body as AxumBody,
+    body::{Body as AxumBody, to_bytes},
     extract::{Path as AxumPath, Query, State},
     http::{
         HeaderName, HeaderValue, Method, Request, StatusCode, Uri,
-        header::{HOST, ORIGIN},
+        header::{ALLOW, CONTENT_TYPE, HOST, ORIGIN},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -24,17 +26,17 @@ use axum::{
 };
 use chrono::{
     DateTime, Datelike, Duration, Local, LocalResult, Months, NaiveDate, SecondsFormat, TimeZone,
-    Utc,
+    Timelike, Utc,
 };
 use rusqlite::{
     Connection, InterruptHandle, OptionalExtension, Row, Transaction, TransactionBehavior, params,
     params_from_iter,
 };
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
-use serde_json::Number;
 use std::{
-    collections::{HashMap, HashSet},
-    net::{IpAddr, SocketAddr},
+    collections::{BTreeSet, HashMap, HashSet},
+    net::IpAddr,
     path::PathBuf,
     str::FromStr,
     sync::{
@@ -46,6 +48,7 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -94,17 +97,19 @@ pub fn router(state: ApiState) -> Router {
             "/sessions/{id}/activity/{event_id}",
             get(session_activity_detail),
         )
-        .route("/sessions/{id}/usage", get(session_usage))
         .route("/stats", get(stats))
         .route("/settings", get(settings))
         .route("/prices", get(prices))
+        .route("/prices/model-ids", get(price_model_ids))
+        .route("/prices/metadata", get(price_metadata))
         .route("/prices/refresh", post(refresh_prices))
         .route("/prices/{model_id}", put(put_price).delete(delete_price))
         .route(
             "/aliases/{observed_model_id}",
             put(put_alias).delete(delete_alias),
         )
-        .fallback(api_not_found);
+        .fallback(api_not_found)
+        .layer(middleware::from_fn(api_error_contract));
     let mut app = Router::new().nest("/api/v1", api);
     let index = state.frontend.join("index.html");
     if index.is_file() {
@@ -117,6 +122,38 @@ pub fn router(state: ApiState) -> Router {
     app.with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(browser_boundary))
+}
+
+async fn api_error_contract(request: Request<AxumBody>, next: Next) -> Response {
+    let response = next.run(request).await;
+    if !response.status().is_client_error()
+        || response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"))
+    {
+        return response;
+    }
+
+    let status = response.status();
+    let allow = response.headers().get(ALLOW).cloned();
+    let message = to_bytes(response.into_body(), 16 * 1024)
+        .await
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| {
+            status
+                .canonical_reason()
+                .unwrap_or("invalid API request")
+                .to_owned()
+        });
+    let mut response = ApiError { status, message }.into_response();
+    if let Some(allow) = allow {
+        response.headers_mut().insert(ALLOW, allow);
+    }
+    response
 }
 
 async fn browser_boundary(request: Request<AxumBody>, next: Next) -> Response {
@@ -191,14 +228,18 @@ fn is_mutating_method(method: &Method) -> bool {
 }
 
 fn boundary_rejection(message: &'static str) -> Response {
-    (StatusCode::FORBIDDEN, message).into_response()
+    ApiError {
+        status: StatusCode::FORBIDDEN,
+        message: message.to_owned(),
+    }
+    .into_response()
 }
 
-pub async fn serve(state: ApiState, address: SocketAddr) -> Result<()> {
+pub async fn serve(state: ApiState, listener: tokio::net::TcpListener) -> Result<()> {
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(address)
-        .await
-        .with_context(|| format!("failed to bind {address}"))?;
+    let address = listener
+        .local_addr()
+        .context("failed to inspect bound listener")?;
     tracing::info!(%address, "Codex Usage is ready");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -429,9 +470,9 @@ pub struct SessionRow {
     pub agent_count: u64,
     pub tool_count: u64,
     pub total_tokens: u64,
-    pub cost_usd: Option<f64>,
+    pub cost_usd: Option<UsdAmount>,
     pub unpriced_tokens: u64,
-    pub lifetime_cost_usd: Option<f64>,
+    pub lifetime_cost_usd: Option<UsdAmount>,
     pub lifetime_unpriced_tokens: u64,
 }
 
@@ -459,6 +500,8 @@ struct SessionsResponse {
     total_pages: u64,
 }
 
+const MAX_SESSION_SEARCH_CHARS: usize = 256;
+
 async fn sessions(
     State(state): State<ApiState>,
     Query(query): Query<SessionsQuery>,
@@ -468,12 +511,23 @@ async fn sessions(
         query.start.as_deref(),
         query.end.as_deref(),
     )?;
-    let page = query.page.unwrap_or(1).max(1);
+    let page = validated_page(query.page)?;
     let page_size = query.page_size.unwrap_or(50).clamp(1, 200);
     let db = state.db.clone();
     let project = query.project;
     let search = query.q;
+    if search
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > MAX_SESSION_SEARCH_CHARS)
+    {
+        return Err(ApiError::bad_request(format!(
+            "session search must be at most {MAX_SESSION_SEARCH_CHARS} characters"
+        )));
+    }
     let sort = query.sort.unwrap_or_else(|| "recent".into());
+    if !matches!(sort.as_str(), "recent" | "cost") {
+        return Err(ApiError::bad_request("sort must be recent or cost"));
+    }
     let response = run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
         query_sessions_on(
             connection,
@@ -512,7 +566,7 @@ struct PeriodSummary {
     session_count: u64,
     message_count: u64,
     totals: Totals,
-    delta_cost_usd: Option<f64>,
+    delta_cost_usd: Option<UsdAmount>,
     delta_percent: Option<f64>,
 }
 
@@ -528,7 +582,7 @@ struct OverviewPeriods {
 #[serde(rename_all = "camelCase")]
 struct HeatmapDay {
     date: String,
-    cost_usd: Option<f64>,
+    cost_usd: Option<UsdAmount>,
     session_count: u64,
     message_count: u64,
     total_tokens: u64,
@@ -538,14 +592,14 @@ struct HeatmapDay {
 #[serde(rename_all = "camelCase")]
 struct ProjectDriver {
     project: String,
-    cost_usd: Option<f64>,
+    cost_usd: Option<UsdAmount>,
     share: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PricingSummary {
-    known_cost_usd: f64,
+    known_cost_usd: UsdAmount,
     unpriced_tokens: u64,
     complete: bool,
 }
@@ -603,13 +657,131 @@ impl OverviewUsageAggregate {
         }
     }
 
-    fn cost_usd(&self) -> Option<f64> {
-        (self.unpriced_tokens == 0).then_some(self.known_cost_usd())
+    fn cost_usd(&self) -> Option<UsdAmount> {
+        (self.unpriced_tokens == 0)
+            .then_some(UsdAmount::from_cost_numerator(self.known_cost_numerator))
+    }
+}
+
+#[derive(Clone, Default)]
+struct FixedPointUsageTotals {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+    total_tokens: u64,
+    known_cost_numerator: i128,
+    unpriced_tokens: u64,
+}
+
+impl FixedPointUsageTotals {
+    #[allow(clippy::too_many_arguments)]
+    fn add_group(
+        &mut self,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+        total_tokens: u64,
+        known_cost_numerator: i128,
+        unpriced_tokens: u64,
+    ) {
+        self.input_tokens = self.input_tokens.saturating_add(input_tokens);
+        self.cached_input_tokens = self.cached_input_tokens.saturating_add(cached_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(reasoning_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(total_tokens);
+        self.known_cost_numerator = self
+            .known_cost_numerator
+            .saturating_add(known_cost_numerator);
+        self.unpriced_tokens = self.unpriced_tokens.saturating_add(unpriced_tokens);
     }
 
-    fn known_cost_usd(&self) -> f64 {
-        self.known_cost_numerator as f64 / 1_000_000_000_000.0
+    fn merge(&mut self, other: Self) {
+        self.add_group(
+            other.input_tokens,
+            other.cached_input_tokens,
+            other.output_tokens,
+            other.reasoning_tokens,
+            other.total_tokens,
+            other.known_cost_numerator,
+            other.unpriced_tokens,
+        );
     }
+
+    fn finish(self) -> Totals {
+        Totals {
+            input_tokens: self.input_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            output_tokens: self.output_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            total_tokens: self.total_tokens,
+            known_cost_numerator: self.known_cost_numerator,
+            unpriced_tokens: self.unpriced_tokens,
+            ..Totals::default()
+        }
+        .finish()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_usage_fact_to_totals(
+    totals: &mut FixedPointUsageTotals,
+    aliases: &OverviewPriceAliases,
+    prices: &OverviewPriceLedger,
+    timestamp: &str,
+    model: &str,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    total_tokens: i64,
+) {
+    let input_tokens = input_tokens.max(0);
+    let cached_input_tokens = cached_input_tokens.max(0).min(input_tokens);
+    let output_tokens = output_tokens.max(0);
+    let reasoning_tokens = reasoning_tokens.max(0);
+    let total_tokens = total_tokens.max(0) as u64;
+    let (known_cost_numerator, unpriced_tokens) =
+        if let Some((_, price)) = overview_price_for(aliases, prices, model, timestamp) {
+            (
+                overview_cost_for_price(
+                    price,
+                    input_tokens - cached_input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                ),
+                0,
+            )
+        } else {
+            (0, total_tokens)
+        };
+    totals.add_group(
+        input_tokens as u64,
+        cached_input_tokens as u64,
+        output_tokens as u64,
+        reasoning_tokens as u64,
+        total_tokens,
+        known_cost_numerator,
+        unpriced_tokens,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum UsageRollupScope<'a> {
+    All,
+    Thread,
+    Turn(&'a str),
+    Agent(&'a str),
+    Effort(Option<&'a str>),
+}
+
+struct UsageRollupExceptionalQuery<'a> {
+    scope: UsageRollupScope<'a>,
+    thread_id: &'a str,
+    model: &'a str,
+    start: &'a str,
+    end: &'a str,
 }
 
 #[derive(Debug)]
@@ -721,9 +893,7 @@ async fn overview_year(
     Query(query): Query<OverviewYearQuery>,
 ) -> ApiResult<Json<OverviewYearResponse>> {
     let year = query.year.unwrap_or_else(|| Local::now().year());
-    if !(1970..=9998).contains(&year) {
-        return Err(ApiError::bad_request("year must be between 1970 and 9998"));
-    }
+    validate_public_year(year)?;
     let start = sql_timestamp(local_midnight(
         NaiveDate::from_ymd_opt(year, 1, 1).ok_or_else(|| ApiError::bad_request("invalid year"))?,
     ));
@@ -750,7 +920,7 @@ struct ModelUsage {
     output_tokens: u64,
     reasoning_tokens: u64,
     total_tokens: u64,
-    cost_usd: Option<f64>,
+    cost_usd: Option<UsdAmount>,
     unpriced_tokens: u64,
 }
 
@@ -765,7 +935,7 @@ struct AgentSummary {
     turn_count: u64,
     tool_count: u64,
     total_tokens: u64,
-    cost_usd: Option<f64>,
+    cost_usd: Option<UsdAmount>,
     unpriced_tokens: u64,
 }
 
@@ -858,6 +1028,8 @@ struct ActivityItem {
     child_total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     child_has_more: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_next_cursor: Option<String>,
     usage: Option<Totals>,
     counts: Option<ActivityCounts>,
 }
@@ -887,6 +1059,7 @@ const MAX_ACTIVITY_CHILD_PAGE_SIZE: u64 = 500;
 struct ActivityDetailQuery {
     child_page: Option<u64>,
     child_page_size: Option<u64>,
+    child_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -913,7 +1086,7 @@ async fn session_activity(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<PageQuery>,
 ) -> ApiResult<Json<ActivityResponse>> {
-    let page = query.page.unwrap_or(1).max(1);
+    let page = validated_page(query.page)?;
     let page_size = query.page_size.unwrap_or(25).clamp(1, 100);
     let db = state.db.clone();
     run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
@@ -932,79 +1105,35 @@ async fn session_activity_detail(
     AxumPath((id, event_id)): AxumPath<(String, String)>,
     Query(query): Query<ActivityDetailQuery>,
 ) -> ApiResult<Json<ActivityItem>> {
-    let child_page = query.child_page.unwrap_or(1).max(1);
+    let child_page = validated_page(query.child_page)?;
     let child_page_size = query
         .child_page_size
         .unwrap_or(DEFAULT_ACTIVITY_CHILD_PAGE_SIZE)
         .clamp(1, MAX_ACTIVITY_CHILD_PAGE_SIZE);
+    if let Some(cursor) = query.child_cursor.as_deref() {
+        activity_index::validate_cursor_for(cursor, &id, &event_id)
+            .map_err(|_| ApiError::bad_request("invalid Activity cursor"))?;
+    }
+    let child_cursor = query.child_cursor;
     let db = state.db.clone();
     run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
         if query_session_on(connection, &id)?.is_none() {
             return Ok(None);
         }
-        query_activity_detail_page_on(connection, &id, &event_id, child_page, child_page_size)
-            .map(Some)
+        query_activity_detail_cursor_page_on(
+            connection,
+            &id,
+            &event_id,
+            child_page,
+            child_page_size,
+            child_cursor.as_deref(),
+        )
+        .map(Some)
     })
     .await?
     .ok_or_else(|| ApiError::not_found("session not found"))?
     .map(Json)
     .ok_or_else(|| ApiError::not_found("activity event not found"))
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageBreakdown {
-    id: String,
-    label: String,
-    model: Option<String>,
-    agent_run_id: Option<String>,
-    turn_id: Option<String>,
-    effort: Option<String>,
-    totals: Totals,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionUsageResponse {
-    totals: Totals,
-    by_model: Vec<ModelUsage>,
-    by_agent: Vec<UsageBreakdown>,
-    by_turn: Vec<UsageBreakdown>,
-    pricing: PricingSummary,
-}
-
-async fn session_usage(
-    State(state): State<ApiState>,
-    AxumPath(id): AxumPath<String>,
-) -> ApiResult<Json<SessionUsageResponse>> {
-    let db = state.db.clone();
-    run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
-        query_session_usage_on(connection, &id)
-    })
-    .await?
-    .map(Json)
-    .ok_or_else(|| ApiError::not_found("session not found"))
-}
-
-fn query_session_usage_on(
-    connection: &Connection,
-    id: &str,
-) -> Result<Option<SessionUsageResponse>> {
-    if query_session_on(connection, id)?.is_none() {
-        return Ok(None);
-    }
-    let totals = query_totals_on(connection, None, None, Some(id))?;
-    Ok(Some(SessionUsageResponse {
-        pricing: PricingSummary {
-            known_cost_usd: totals.known_cost_usd,
-            unpriced_tokens: totals.unpriced_tokens,
-            complete: totals.pricing_complete,
-        },
-        totals,
-        by_model: query_model_usage_on(connection, id)?,
-        by_agent: query_agent_usage_on(connection, id)?,
-        by_turn: query_turn_usage_on(connection, id)?,
-    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1032,7 +1161,7 @@ struct StatsResponse {
     label: String,
     totals: Totals,
     rows: Vec<StatsRow>,
-    trend: Vec<Option<f64>>,
+    trend: Vec<Option<UsdAmount>>,
 }
 
 async fn stats(
@@ -1045,9 +1174,10 @@ async fn stats(
             "range must be day, week, month, year, or all",
         ));
     }
-    // All-time is data-derived and always ends in the current year. An anchor
-    // has no semantic meaning for it; ignoring it also prevents a caller from
-    // manufacturing thousands of empty future or past year buckets.
+    // All-time is data-derived and ends in the later of the current year or
+    // the latest observed data year. An anchor has no semantic meaning for it;
+    // ignoring it also prevents a caller from manufacturing thousands of
+    // empty future or past year buckets.
     let anchor = if range == "all" {
         Local::now().date_naive()
     } else {
@@ -1058,11 +1188,23 @@ async fn stats(
             .transpose()?
             .unwrap_or_else(|| Local::now().date_naive())
     };
-    let display_anchor = if range == "week" {
-        anchor - Duration::days(anchor.weekday().num_days_from_monday() as i64)
-    } else {
-        anchor
+    let display_anchor = match range.as_str() {
+        "week" => anchor - Duration::days(anchor.weekday().num_days_from_monday() as i64),
+        "month" => NaiveDate::from_ymd_opt(anchor.year(), anchor.month(), 1)
+            .ok_or_else(|| ApiError::bad_request("invalid monthly anchor"))?,
+        "year" => NaiveDate::from_ymd_opt(anchor.year(), 1, 1)
+            .ok_or_else(|| ApiError::bad_request("invalid yearly anchor"))?,
+        _ => anchor,
     };
+    // Weekly anchors are canonicalized to Monday. The first few days of 1970
+    // would otherwise normalize into 1969 and leak a response outside the
+    // public date domain even though the request itself passed validation.
+    if range == "week" && display_anchor.year() < MIN_PUBLIC_YEAR {
+        return Err(ApiError::bad_request(
+            "weekly anchor must be on or after 1970-01-05",
+        ));
+    }
+    validate_public_year(display_anchor.year())?;
     let db = state.db.clone();
     Ok(Json(
         run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
@@ -1128,7 +1270,7 @@ fn stats_totals_from_aggregates(aggregates: &[StatsBucketAggregate]) -> Totals {
             .saturating_add(row.totals.unpriced_tokens);
         total
     });
-    totals.known_cost_usd = total_cost_numerator as f64 / 1_000_000_000_000.0;
+    totals.known_cost_numerator = total_cost_numerator;
     totals.finish()
 }
 
@@ -1209,7 +1351,7 @@ fn query_settings_on(
         session_count: session_count.max(0) as u64,
         database_bytes,
         pricing: PricingSummary {
-            known_cost_usd: totals.known_cost_usd,
+            known_cost_usd: UsdAmount::from_cost_numerator(totals.known_cost_numerator),
             unpriced_tokens: totals.unpriced_tokens,
             complete: totals.pricing_complete,
         },
@@ -1257,8 +1399,6 @@ struct PricesQuery {
 #[serde(rename_all = "camelCase")]
 struct PricesResponse {
     items: Vec<PriceRow>,
-    aliases: Vec<AliasRow>,
-    observed_unknown: Vec<UnknownModelRow>,
     page: u64,
     page_size: u64,
     total: u64,
@@ -1270,14 +1410,52 @@ struct PricesResponse {
     source: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PriceMetadataResponse {
+    aliases: Vec<AliasRow>,
+    aliases_total: u64,
+    observed_unknown: Vec<UnknownModelRow>,
+    observed_unknown_total: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PriceMetadataQuery {
+    unknown_limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PriceModelIdsQuery {
+    q: Option<String>,
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct PriceModelIdsResponse {
+    items: Vec<String>,
+}
+
+const MAX_PRICE_MODEL_ID_RESULTS: u64 = 100;
+const MAX_ALIAS_RESULTS: u64 = 100;
+const MAX_UNKNOWN_MODEL_RESULTS: u64 = 100;
+
 async fn prices(
     State(state): State<ApiState>,
     Query(query): Query<PricesQuery>,
 ) -> ApiResult<Json<PricesResponse>> {
-    let page = query.page.unwrap_or(1).max(1);
+    let page = validated_page(query.page)?;
     let page_size = query.page_size.unwrap_or(25).clamp(1, 100);
     let db = state.db.clone();
     let search = query.q;
+    if search
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > MAX_SESSION_SEARCH_CHARS)
+    {
+        return Err(ApiError::bad_request(format!(
+            "price search must be at most {MAX_SESSION_SEARCH_CHARS} characters"
+        )));
+    }
     Ok(Json(
         run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
             query_prices_on(connection, search.as_deref(), page, page_size)
@@ -1286,20 +1464,51 @@ async fn prices(
     ))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum DecimalInput {
-    String(String),
-    Number(Number),
+async fn price_metadata(
+    State(state): State<ApiState>,
+    Query(query): Query<PriceMetadataQuery>,
+) -> ApiResult<Json<PriceMetadataResponse>> {
+    let unknown_limit = query.unknown_limit.unwrap_or(MAX_UNKNOWN_MODEL_RESULTS);
+    if !(1..=MAX_UNKNOWN_MODEL_RESULTS).contains(&unknown_limit) {
+        return Err(ApiError::bad_request(format!(
+            "unknownLimit must be between 1 and {MAX_UNKNOWN_MODEL_RESULTS}"
+        )));
+    }
+    let db = state.db.clone();
+    Ok(Json(
+        run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
+            query_price_metadata_on(connection, unknown_limit)
+        })
+        .await?,
+    ))
 }
 
-impl DecimalInput {
-    fn text(&self) -> String {
-        match self {
-            Self::String(value) => value.clone(),
-            Self::Number(value) => value.to_string(),
-        }
+async fn price_model_ids(
+    State(state): State<ApiState>,
+    Query(query): Query<PriceModelIdsQuery>,
+) -> ApiResult<Json<PriceModelIdsResponse>> {
+    let limit = query.limit.unwrap_or(MAX_PRICE_MODEL_ID_RESULTS);
+    if !(1..=MAX_PRICE_MODEL_ID_RESULTS).contains(&limit) {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {MAX_PRICE_MODEL_ID_RESULTS}"
+        )));
     }
+    if query.q.as_deref().is_some_and(|value| {
+        value.chars().count() > MAX_SESSION_SEARCH_CHARS
+            || normalize_search_text(value.trim()).chars().count() > MAX_SESSION_SEARCH_CHARS
+    }) {
+        return Err(ApiError::bad_request(format!(
+            "model ID search must be at most {MAX_SESSION_SEARCH_CHARS} characters"
+        )));
+    }
+    let db = state.db.clone();
+    let search = query.q;
+    Ok(Json(
+        run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
+            query_price_model_ids_on(connection, search.as_deref(), limit)
+        })
+        .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1307,9 +1516,9 @@ impl DecimalInput {
 struct PriceInput {
     effective_from: Option<String>,
     effective_to: Option<String>,
-    input_per_million: DecimalInput,
-    cached_input_per_million: Option<DecimalInput>,
-    output_per_million: DecimalInput,
+    input_per_million: String,
+    cached_input_per_million: Option<String>,
+    output_per_million: String,
     currency: Option<String>,
 }
 
@@ -1322,18 +1531,23 @@ async fn put_price(
     if model_id.is_empty() {
         return Err(ApiError::bad_request("model ID is required"));
     }
+    if model_id.chars().count() > MAX_MODEL_ID_CHARS {
+        return Err(ApiError::bad_request(format!(
+            "model ID must be at most {MAX_MODEL_ID_CHARS} characters"
+        )));
+    }
     if input.currency.as_deref().unwrap_or("USD") != "USD" {
         return Err(ApiError::bad_request("only USD prices are supported"));
     }
-    let input_price = PriceMicros::from_per_million_text(&input.input_per_million.text())
+    let input_price = PriceMicros::from_per_million_text(&input.input_per_million)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let cached_price = input
         .cached_input_per_million
         .as_ref()
-        .map(|value| PriceMicros::from_per_million_text(&value.text()))
+        .map(|value| PriceMicros::from_per_million_text(value))
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let output_price = PriceMicros::from_per_million_text(&input.output_per_million.text())
+    let output_price = PriceMicros::from_per_million_text(&input.output_per_million)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let effective_from = canonical_timestamp(
         input
@@ -1479,33 +1693,31 @@ fn query_overview_top_sessions_on(
                  WHERE thread_id=?1 AND timestamp>=?2 AND timestamp<?3),
                 (SELECT COUNT(*) FROM turns
                  WHERE thread_id=?1 AND started_at>=?2 AND started_at<?3),
-                (SELECT COUNT(*) FROM agent_runs WHERE thread_id=?1 AND id<>thread_id),
+                (SELECT COUNT(*) FROM agent_runs
+                 WHERE thread_id=?1 AND id<>thread_id
+                   AND started_at>=?2 AND started_at<?3),
                 (SELECT COUNT(*) FROM tool_calls
                  WHERE thread_id=?1 AND started_at>=?2 AND started_at<?3),
-                ?4,?5,?6,
-                COALESCE(lifetime.cost_usd,0.0),
-                COALESCE(lifetime.unpriced_tokens,0)
+                ?4,?5,?6,'0',0
          FROM threads t
-         LEFT JOIN (
-             SELECT COALESCE(SUM(cost_usd),0.0) cost_usd,
-                    COALESCE(SUM(CASE WHEN price_known=0 THEN total_tokens ELSE 0 END),0)
-                        unpriced_tokens
-             FROM priced_usage WHERE thread_id=?1
-         ) lifetime ON 1=1
          WHERE t.id=?1",
     )?;
     for (thread_id, usage) in ranked {
-        rows.push(statement.query_row(
+        let mut row = statement.query_row(
             params![
                 thread_id,
                 start,
                 end,
                 usage.total_tokens.min(i64::MAX as u64) as i64,
-                usage.known_cost_usd(),
+                usage.known_cost_numerator.to_string(),
                 usage.unpriced_tokens.min(i64::MAX as u64) as i64
             ],
             session_from_row,
-        )?);
+        )?;
+        let lifetime = query_all_time_rollup_totals_on(connection, Some(thread_id))?.finish();
+        row.lifetime_cost_usd = lifetime.cost_usd;
+        row.lifetime_unpriced_tokens = lifetime.unpriced_tokens;
+        rows.push(row);
     }
     Ok(rows)
 }
@@ -1515,163 +1727,426 @@ fn populate_session_sort_costs_on(
     start: Option<&str>,
     end: Option<&str>,
     project: Option<&str>,
-    q_pattern: Option<&str>,
+    q_filter: Option<&str>,
 ) -> Result<()> {
     connection.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS session_sort_costs(
              thread_id TEXT PRIMARY KEY,
              total_tokens INTEGER NOT NULL,
-             cost_usd REAL NOT NULL,
+             cost_numerator TEXT NOT NULL,
              unpriced_tokens INTEGER NOT NULL
          ) WITHOUT ROWID;
          DELETE FROM session_sort_costs;",
     )?;
     let (aliases, prices) = overview_prices_on(connection)?;
-    let groups = {
-        let mut statement = connection.prepare(
-            "SELECT u.thread_id,u.model,
-                    COALESCE(SUM(u.input_tokens-MIN(u.input_tokens,u.cached_input_tokens)),0),
-                    COALESCE(SUM(MIN(u.input_tokens,u.cached_input_tokens)),0),
-                    COALESCE(SUM(u.output_tokens),0),COALESCE(SUM(u.total_tokens),0),
-                    MIN(u.timestamp),MAX(u.timestamp)
-             FROM usage_facts u
-             JOIN threads t ON t.id=u.thread_id
-             WHERE (?1 IS NULL OR u.timestamp>=?1) AND (?2 IS NULL OR u.timestamp<?2)
-               AND (?3 IS NULL OR t.project=?3)
-               AND (?4 IS NULL OR lower(COALESCE(t.title,'')) LIKE ?4
-                    OR lower(COALESCE(t.project,'')) LIKE ?4
-                    OR lower(COALESCE(t.branch,'')) LIKE ?4
-                    OR lower(t.id) LIKE ?4)
-             GROUP BY u.thread_id,u.model",
-        )?;
-        statement
-            .query_map(params![start, end, project, q_pattern], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?.max(0),
-                    row.get::<_, i64>(3)?.max(0),
-                    row.get::<_, i64>(4)?.max(0),
-                    row.get::<_, i64>(5)?.max(0) as u64,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    let mut aggregates = HashMap::<String, OverviewUsageAggregate>::new();
-    for (
-        thread_id,
-        model,
-        uncached_input_tokens,
-        cached_input_tokens,
-        output_tokens,
-        total_tokens,
-        first_timestamp,
-        last_timestamp,
-    ) in groups
-    {
-        let first_price = overview_price_for(&aliases, &prices, &model, &first_timestamp);
-        let last_price = overview_price_for(&aliases, &prices, &model, &last_timestamp);
-        let has_price_boundary = overview_group_has_price_boundary(
-            &aliases,
-            &prices,
-            &model,
-            &first_timestamp,
-            &last_timestamp,
-        );
-        let (known_cost_numerator, unpriced_tokens) = match (first_price, last_price) {
-            (Some((first_index, price)), Some((last_index, _)))
-                if first_index == last_index && !has_price_boundary =>
-            {
-                (
-                    overview_cost_for_price(
-                        price,
-                        uncached_input_tokens,
-                        cached_input_tokens,
-                        output_tokens,
-                    ),
-                    0,
-                )
-            }
-            (None, None)
-                if overview_group_has_no_price(
-                    &aliases,
-                    &prices,
-                    &model,
-                    &first_timestamp,
-                    &last_timestamp,
-                ) =>
-            {
-                (0, total_tokens)
-            }
-            _ => session_exceptional_group_cost_on(
+    if start.is_none() && end.is_none() {
+        let groups = {
+            let mut statement = connection.prepare(
+                "SELECT r.thread_id,r.activity_hour,r.model,
+                        COALESCE(SUM(r.input_tokens),0),
+                        COALESCE(SUM(r.cached_input_tokens),0),
+                        COALESCE(SUM(r.output_tokens),0),
+                        COALESCE(SUM(r.reasoning_tokens),0),
+                        COALESCE(SUM(r.total_tokens),0)
+                 FROM usage_activity_rollups r
+                 JOIN threads t ON t.id=r.thread_id
+                 WHERE (?1 IS NULL OR t.project=?1)
+                   AND (?2 IS NULL OR EXISTS(
+                        SELECT 1 FROM session_search_matches search
+                        WHERE search.thread_id=t.id
+                   ))
+                 GROUP BY r.thread_id,r.activity_hour,r.model",
+            )?;
+            statement
+                .query_map(params![project, q_filter], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?.max(0),
+                        row.get::<_, i64>(4)?.max(0),
+                        row.get::<_, i64>(5)?.max(0),
+                        row.get::<_, i64>(6)?.max(0),
+                        row.get::<_, i64>(7)?.max(0) as u64,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut aggregates = HashMap::<String, FixedPointUsageTotals>::new();
+        for (
+            thread_id,
+            activity_hour,
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            total_tokens,
+        ) in groups
+        {
+            let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
                 connection,
                 &aliases,
                 &prices,
+                UsageRollupScope::Thread,
                 &thread_id,
+                &activity_hour,
                 &model,
-                &first_timestamp,
-                &last_timestamp,
-            )?,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                total_tokens,
+            )?;
+            aggregates.entry(thread_id).or_default().add_group(
+                input_tokens as u64,
+                cached_input_tokens as u64,
+                output_tokens as u64,
+                reasoning_tokens as u64,
+                total_tokens,
+                known_cost_numerator,
+                unpriced_tokens,
+            );
+        }
+        let mut insert = connection.prepare(
+            "INSERT INTO session_sort_costs(
+                 thread_id,total_tokens,cost_numerator,unpriced_tokens
+             ) VALUES(?1,?2,?3,?4)",
+        )?;
+        for (thread_id, aggregate) in aggregates {
+            insert.execute(params![
+                thread_id,
+                aggregate.total_tokens.min(i64::MAX as u64) as i64,
+                sortable_cost_numerator(aggregate.known_cost_numerator),
+                aggregate.unpriced_tokens.min(i64::MAX as u64) as i64,
+            ])?;
+        }
+        return Ok(());
+    }
+    let start_timestamp = start
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .context("invalid bounded session-sort start")?
+        .map(|value| value.with_timezone(&Utc));
+    let end_timestamp = end
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .context("invalid bounded session-sort end")?
+        .map(|value| value.with_timezone(&Utc));
+    let rollup_start = start_timestamp
+        .map(utc_hour_ceil)
+        .transpose()?
+        .map(sql_timestamp);
+    let rollup_end = end_timestamp
+        .map(utc_hour_floor)
+        .transpose()?
+        .map(sql_timestamp);
+    let has_complete_hours = !matches!(
+        (&rollup_start, &rollup_end),
+        (Some(start), Some(end)) if start >= end
+    );
+    let mut aggregates = HashMap::<String, FixedPointUsageTotals>::new();
+    if has_complete_hours {
+        let groups = {
+            let mut statement = connection.prepare(
+                "SELECT r.thread_id,r.activity_hour,r.model,
+                        COALESCE(SUM(r.input_tokens),0),
+                        COALESCE(SUM(r.cached_input_tokens),0),
+                        COALESCE(SUM(r.output_tokens),0),
+                        COALESCE(SUM(r.reasoning_tokens),0),
+                        COALESCE(SUM(r.total_tokens),0)
+                 FROM usage_activity_rollups r
+                 JOIN threads t ON t.id=r.thread_id
+                 WHERE (?1 IS NULL OR r.activity_hour>=?1)
+                   AND (?2 IS NULL OR r.activity_hour<?2)
+                   AND (?3 IS NULL OR t.project=?3)
+                   AND (?4 IS NULL OR EXISTS(
+                        SELECT 1 FROM session_search_matches search
+                        WHERE search.thread_id=t.id
+                   ))
+                 GROUP BY r.thread_id,r.activity_hour,r.model",
+            )?;
+            statement
+                .query_map(
+                    params![rollup_start, rollup_end, project, q_filter],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?.max(0),
+                            row.get::<_, i64>(4)?.max(0),
+                            row.get::<_, i64>(5)?.max(0),
+                            row.get::<_, i64>(6)?.max(0),
+                            row.get::<_, i64>(7)?.max(0) as u64,
+                        ))
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
         };
-        aggregates.entry(thread_id).or_default().add_sums(
+        for (
+            thread_id,
+            activity_hour,
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_tokens,
             total_tokens,
-            known_cost_numerator,
-            unpriced_tokens,
-            &last_timestamp,
-        );
+        ) in groups
+        {
+            let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
+                connection,
+                &aliases,
+                &prices,
+                UsageRollupScope::Thread,
+                &thread_id,
+                &activity_hour,
+                &model,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                total_tokens,
+            )?;
+            aggregates.entry(thread_id).or_default().add_group(
+                input_tokens as u64,
+                cached_input_tokens as u64,
+                output_tokens as u64,
+                reasoning_tokens as u64,
+                total_tokens,
+                known_cost_numerator,
+                unpriced_tokens,
+            );
+        }
+    }
+
+    let mut raw_windows = Vec::<(DateTime<Utc>, DateTime<Utc>)>::new();
+    if let Some(start) = start_timestamp {
+        let mut boundary_end = utc_hour_ceil(start)?;
+        if let Some(end) = end_timestamp {
+            boundary_end = boundary_end.min(end);
+        }
+        if boundary_end > start {
+            raw_windows.push((start, boundary_end));
+        }
+    }
+    if let Some(end) = end_timestamp {
+        let mut boundary_start = utc_hour_floor(end)?;
+        if let Some(start) = start_timestamp {
+            boundary_start = boundary_start.max(start);
+        }
+        if end > boundary_start {
+            raw_windows.push((boundary_start, end));
+        }
+    }
+    raw_windows.sort_unstable_by_key(|(start, _)| *start);
+    let mut merged_windows = Vec::<(DateTime<Utc>, DateTime<Utc>)>::new();
+    for (start, end) in raw_windows {
+        if let Some((_, previous_end)) = merged_windows.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged_windows.push((start, end));
+        }
+    }
+    for (start, end) in merged_windows {
+        accumulate_session_boundary_usage_on(
+            connection,
+            &aliases,
+            &prices,
+            project,
+            q_filter,
+            &sql_timestamp(start),
+            &sql_timestamp(end),
+            &mut aggregates,
+        )?;
     }
     let mut insert = connection.prepare(
-        "INSERT INTO session_sort_costs(thread_id,total_tokens,cost_usd,unpriced_tokens)
-         VALUES(?1,?2,?3,?4)",
+        "INSERT INTO session_sort_costs(
+             thread_id,total_tokens,cost_numerator,unpriced_tokens
+         ) VALUES(?1,?2,?3,?4)",
     )?;
     for (thread_id, aggregate) in aggregates {
         insert.execute(params![
             thread_id,
             aggregate.total_tokens.min(i64::MAX as u64) as i64,
-            aggregate.known_cost_usd(),
+            sortable_cost_numerator(aggregate.known_cost_numerator),
             aggregate.unpriced_tokens.min(i64::MAX as u64) as i64,
         ])?;
     }
     Ok(())
 }
 
-fn session_exceptional_group_cost_on(
-    connection: &Connection,
-    aliases: &HashMap<String, String>,
-    prices: &HashMap<String, Vec<OverviewPrice>>,
-    thread_id: &str,
-    model: &str,
-    first_timestamp: &str,
-    last_timestamp: &str,
-) -> Result<(i128, u64)> {
-    let mut statement = connection.prepare(
-        "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,total_tokens
-         FROM usage_facts
-         WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<=?4",
-    )?;
-    let mut rows = statement.query(params![thread_id, model, first_timestamp, last_timestamp])?;
-    let mut cost_numerator = 0i128;
-    let mut unpriced_tokens = 0u64;
-    while let Some(row) = rows.next()? {
-        let timestamp = row.get_ref(0)?.as_str()?;
-        let input_tokens = row.get::<_, i64>(1)?.max(0);
-        let cached_tokens = input_tokens.min(row.get::<_, i64>(2)?.max(0));
-        let output_tokens = row.get::<_, i64>(3)?.max(0);
-        let total_tokens = row.get::<_, i64>(4)?.max(0) as u64;
-        if let Some((_, price)) = overview_price_for(aliases, prices, model, timestamp) {
-            cost_numerator = cost_numerator.saturating_add(overview_cost_for_price(
-                price,
-                input_tokens - cached_tokens,
-                cached_tokens,
-                output_tokens,
-            ));
-        } else {
-            unpriced_tokens = unpriced_tokens.saturating_add(total_tokens);
-        }
+fn utc_hour_floor(value: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    value
+        .with_minute(0)
+        .and_then(|value| value.with_second(0))
+        .and_then(|value| value.with_nanosecond(0))
+        .context("UTC timestamp cannot be rounded to an hour")
+}
+
+fn utc_hour_ceil(value: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let floor = utc_hour_floor(value)?;
+    if floor == value {
+        Ok(floor)
+    } else {
+        floor
+            .checked_add_signed(Duration::hours(1))
+            .context("UTC timestamp has no following hour")
     }
-    Ok((cost_numerator, unpriced_tokens))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_session_boundary_usage_on(
+    connection: &Connection,
+    aliases: &OverviewPriceAliases,
+    prices: &OverviewPriceLedger,
+    project: Option<&str>,
+    q_filter: Option<&str>,
+    start: &str,
+    end: &str,
+    aggregates: &mut HashMap<String, FixedPointUsageTotals>,
+) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT u.thread_id,u.timestamp,u.model,
+                u.input_tokens,u.cached_input_tokens,u.output_tokens,
+                u.reasoning_tokens,u.total_tokens
+         FROM usage_facts u INDEXED BY idx_usage_time
+         JOIN threads t ON t.id=u.thread_id
+         WHERE u.timestamp>=?1 AND u.timestamp<?2
+           AND (?3 IS NULL OR t.project=?3)
+           AND (?4 IS NULL OR EXISTS(
+                SELECT 1 FROM session_search_matches search
+                WHERE search.thread_id=t.id
+           ))
+         ORDER BY u.timestamp",
+    )?;
+    let mut rows = statement.query(params![start, end, project, q_filter])?;
+    while let Some(row) = rows.next()? {
+        let thread_id = row.get::<_, String>(0)?;
+        let timestamp = row.get::<_, String>(1)?;
+        let model = row.get::<_, String>(2)?;
+        add_usage_fact_to_totals(
+            aggregates.entry(thread_id).or_default(),
+            aliases,
+            prices,
+            &timestamp,
+            &model,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+        );
+    }
+    Ok(())
+}
+
+fn sortable_cost_numerator(value: i128) -> String {
+    // SQLite INTEGER stops at i64, while valid token/price products need i128.
+    // Every cost is nonnegative, so one fixed-width decimal string gives us an
+    // exact lexicographic sort key without converting arithmetic to REAL.
+    format!("{:039}", value.max(0))
+}
+
+fn query_selected_session_totals_on(
+    connection: &Connection,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Result<HashMap<String, FixedPointUsageTotals>> {
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let mut totals = HashMap::<String, FixedPointUsageTotals>::new();
+    if start.is_none() && end.is_none() {
+        let groups = {
+            let mut statement = connection.prepare(
+                "SELECT r.thread_id,r.activity_hour,r.model,
+                        COALESCE(SUM(r.input_tokens),0),
+                        COALESCE(SUM(r.cached_input_tokens),0),
+                        COALESCE(SUM(r.output_tokens),0),
+                        COALESCE(SUM(r.reasoning_tokens),0),
+                        COALESCE(SUM(r.total_tokens),0)
+                 FROM usage_activity_rollups r
+                 JOIN selected_sessions s ON s.id=r.thread_id
+                 GROUP BY r.thread_id,r.activity_hour,r.model",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?.max(0),
+                        row.get::<_, i64>(4)?.max(0),
+                        row.get::<_, i64>(5)?.max(0),
+                        row.get::<_, i64>(6)?.max(0),
+                        row.get::<_, i64>(7)?.max(0) as u64,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (
+            thread_id,
+            activity_hour,
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            total_tokens,
+        ) in groups
+        {
+            let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
+                connection,
+                &aliases,
+                &prices,
+                UsageRollupScope::Thread,
+                &thread_id,
+                &activity_hour,
+                &model,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                total_tokens,
+            )?;
+            totals.entry(thread_id).or_default().add_group(
+                input_tokens as u64,
+                cached_input_tokens as u64,
+                output_tokens as u64,
+                reasoning_tokens as u64,
+                total_tokens,
+                known_cost_numerator,
+                unpriced_tokens,
+            );
+        }
+        return Ok(totals);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT u.thread_id,u.timestamp,u.model,u.input_tokens,u.cached_input_tokens,
+                u.output_tokens,u.reasoning_tokens,u.total_tokens
+         FROM usage_facts u JOIN selected_sessions s ON s.id=u.thread_id
+         WHERE (?1 IS NULL OR u.timestamp>=?1) AND (?2 IS NULL OR u.timestamp<?2)
+         ORDER BY u.thread_id,u.timestamp,u.id",
+    )?;
+    let mut rows = statement.query(params![start, end])?;
+    while let Some(row) = rows.next()? {
+        let thread_id = row.get::<_, String>(0)?;
+        let timestamp = row.get::<_, String>(1)?;
+        let model = row.get::<_, String>(2)?;
+        add_usage_fact_to_totals(
+            totals.entry(thread_id).or_default(),
+            &aliases,
+            &prices,
+            &timestamp,
+            &model,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+        );
+    }
+    Ok(totals)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1686,11 +2161,12 @@ fn query_sessions_on(
     page_size: u64,
     include_projects: bool,
 ) -> Result<SessionsResponse> {
-    let project = project.filter(|value| !value.is_empty() && *value != "all");
-    let q_pattern = q
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("%{}%", value.trim().to_lowercase()));
-    let q_pattern = q_pattern.as_deref();
+    anyhow::ensure!(matches!(sort, "recent" | "cost"), "invalid session sort");
+    let q_filter = q.filter(|value| !value.trim().is_empty());
+    anyhow::ensure!(
+        q_filter.is_none_or(|value| value.chars().count() <= MAX_SESSION_SEARCH_CHARS),
+        "session search exceeds the {MAX_SESSION_SEARCH_CHARS}-character limit"
+    );
     let bounded = start.is_some() || end.is_some();
     let offset = page
         .saturating_sub(1)
@@ -1704,11 +2180,16 @@ fn query_sessions_on(
          CREATE TEMP TABLE IF NOT EXISTS selected_sessions(
              id TEXT PRIMARY KEY,started_at TEXT NOT NULL,last_event_at TEXT NOT NULL,
              title TEXT NOT NULL,project TEXT NOT NULL,branch TEXT,
-             total_tokens INTEGER,cost_usd REAL,unpriced_tokens INTEGER
+             total_tokens INTEGER,unpriced_tokens INTEGER
+         ) WITHOUT ROWID;
+         CREATE TEMP TABLE IF NOT EXISTS session_search_matches(
+             thread_id TEXT PRIMARY KEY
          ) WITHOUT ROWID;
          DELETE FROM session_candidates;
-         DELETE FROM selected_sessions;",
+         DELETE FROM selected_sessions;
+         DELETE FROM session_search_matches;",
     )?;
+    populate_session_search_matches_on(connection, q_filter)?;
 
     if bounded {
         connection.execute(
@@ -1727,10 +2208,10 @@ fn query_sessions_on(
 
     let metadata_filter = r#"
         AND (?1 IS NULL OR t.project=?1)
-        AND (?2 IS NULL OR lower(COALESCE(t.title,'')) LIKE ?2
-             OR lower(COALESCE(t.project,'')) LIKE ?2
-             OR lower(COALESCE(t.branch,'')) LIKE ?2
-             OR lower(t.id) LIKE ?2)
+        AND (?2 IS NULL OR EXISTS(
+             SELECT 1 FROM session_search_matches search
+             WHERE search.thread_id=t.id
+        ))
     "#;
     let total_sql = if bounded {
         format!(
@@ -1747,10 +2228,10 @@ fn query_sessions_on(
         )
     };
     let total: i64 =
-        connection.query_row(&total_sql, params![project, q_pattern], |row| row.get(0))?;
+        connection.query_row(&total_sql, params![project, q_filter], |row| row.get(0))?;
 
     if sort == "cost" {
-        populate_session_sort_costs_on(connection, start, end, project, q_pattern)?;
+        populate_session_sort_costs_on(connection, start, end, project, q_filter)?;
         let source = if bounded {
             "session_candidates c JOIN threads t ON t.id=c.thread_id"
         } else {
@@ -1773,25 +2254,25 @@ fn query_sessions_on(
             INSERT INTO selected_sessions
             SELECT t.id,t.started_at,{last_event},COALESCE(t.title,'Untitled session'),
                 COALESCE(t.project,'—'),t.branch,
-                COALESCE(u.total_tokens,0),COALESCE(u.cost_usd,0.0),
-                COALESCE(u.unpriced_tokens,0)
+                COALESCE(u.total_tokens,0),COALESCE(u.unpriced_tokens,0)
             FROM {source} LEFT JOIN session_sort_costs u ON u.thread_id=t.id
             WHERE (?1 IS NULL OR t.project=?1)
-              AND (?2 IS NULL OR lower(COALESCE(t.title,'')) LIKE ?2
-                   OR lower(COALESCE(t.project,'')) LIKE ?2
-                   OR lower(COALESCE(t.branch,'')) LIKE ?2
-                   OR lower(t.id) LIKE ?2)
+              AND (?2 IS NULL OR EXISTS(
+                   SELECT 1 FROM session_search_matches search
+                   WHERE search.thread_id=t.id
+              ))
               {visibility}
             ORDER BY CASE WHEN COALESCE(u.unpriced_tokens,0)=0 THEN 0 ELSE 1 END,
                 CASE WHEN COALESCE(u.unpriced_tokens,0)=0
-                     THEN COALESCE(u.cost_usd,0.0) ELSE 0.0 END DESC,
+                     THEN COALESCE(u.cost_numerator,'000000000000000000000000000000000000000')
+                     ELSE '' END DESC,
                 CASE WHEN COALESCE(u.unpriced_tokens,0)>0
                      THEN COALESCE(u.total_tokens,0) ELSE 0 END DESC,
                 {last_event} DESC,t.id DESC
             LIMIT ?3 OFFSET ?4
             "#
         );
-        connection.execute(&sql, params![project, q_pattern, page_size as i64, offset])?;
+        connection.execute(&sql, params![project, q_filter, page_size as i64, offset])?;
     } else {
         let (source, last_event, visibility) = if bounded {
             (
@@ -1812,50 +2293,42 @@ fn query_sessions_on(
             r#"
             INSERT INTO selected_sessions(
                 id,started_at,last_event_at,title,project,branch,
-                total_tokens,cost_usd,unpriced_tokens
+                total_tokens,unpriced_tokens
             )
             SELECT t.id,t.started_at,{last_event},COALESCE(t.title,'Untitled session'),
-                COALESCE(t.project,'—'),t.branch,NULL,NULL,NULL
+                COALESCE(t.project,'—'),t.branch,NULL,NULL
             FROM {source}
             WHERE (?1 IS NULL OR t.project=?1)
-              AND (?2 IS NULL OR lower(COALESCE(t.title,'')) LIKE ?2
-                   OR lower(COALESCE(t.project,'')) LIKE ?2
-                   OR lower(COALESCE(t.branch,'')) LIKE ?2
-                   OR lower(t.id) LIKE ?2)
+              AND (?2 IS NULL OR EXISTS(
+                   SELECT 1 FROM session_search_matches search
+                   WHERE search.thread_id=t.id
+              ))
               {visibility}
             ORDER BY {last_event} DESC,t.id DESC LIMIT ?3 OFFSET ?4
             "#
         );
-        connection.execute(&sql, params![project, q_pattern, page_size as i64, offset])?;
+        connection.execute(&sql, params![project, q_filter, page_size as i64, offset])?;
     }
 
     // Everything below this point is bounded by the selected page. In the
     // default recent view, no corpus-wide event/message/tool aggregate is run.
     let order = if sort == "cost" {
-        "CASE WHEN COALESCE(s.unpriced_tokens,u.unpriced_tokens,0)=0 THEN 0 ELSE 1 END,
-         CASE WHEN COALESCE(s.unpriced_tokens,u.unpriced_tokens,0)=0
-              THEN COALESCE(s.cost_usd,u.cost_usd,0.0) ELSE 0.0 END DESC,
-         CASE WHEN COALESCE(s.unpriced_tokens,u.unpriced_tokens,0)>0
-              THEN COALESCE(s.total_tokens,u.total_tokens,0) ELSE 0 END DESC,
+        "CASE WHEN COALESCE(s.unpriced_tokens,0)=0 THEN 0 ELSE 1 END,
+         CASE WHEN COALESCE(s.unpriced_tokens,0)=0
+              THEN COALESCE(
+                   (SELECT exact.cost_numerator FROM session_sort_costs exact
+                    WHERE exact.thread_id=s.id),
+                   '000000000000000000000000000000000000000'
+              ) ELSE '' END DESC,
+         CASE WHEN COALESCE(s.unpriced_tokens,0)>0
+              THEN COALESCE(s.total_tokens,0) ELSE 0 END DESC,
          s.last_event_at DESC,s.id DESC"
     } else {
         "s.last_event_at DESC,s.id DESC"
     };
     let sql = format!(
         r#"
-        WITH usage_page AS (
-            SELECT p.thread_id,COALESCE(SUM(p.total_tokens),0) total_tokens,
-                COALESCE(SUM(p.cost_usd),0.0) cost_usd,
-                COALESCE(SUM(CASE WHEN p.price_known=0 THEN p.total_tokens ELSE 0 END),0) unpriced_tokens
-            FROM selected_sessions s JOIN priced_usage p ON p.thread_id=s.id
-            WHERE (?1 IS NULL OR p.timestamp>=?1) AND (?2 IS NULL OR p.timestamp<?2)
-            GROUP BY p.thread_id
-        ), usage_lifetime AS (
-            SELECT p.thread_id,COALESCE(SUM(p.cost_usd),0.0) cost_usd,
-                COALESCE(SUM(CASE WHEN p.price_known=0 THEN p.total_tokens ELSE 0 END),0) unpriced_tokens
-            FROM selected_sessions s JOIN priced_usage p ON p.thread_id=s.id
-            GROUP BY p.thread_id
-        ), message_page AS (
+        WITH message_page AS (
             SELECT m.thread_id,COUNT(*) value FROM selected_sessions s
             JOIN messages m ON m.thread_id=s.id
             WHERE (?1 IS NULL OR m.timestamp>=?1) AND (?2 IS NULL OR m.timestamp<?2)
@@ -1872,19 +2345,16 @@ fn query_sessions_on(
             GROUP BY tc.thread_id
         ), agent_page AS (
             SELECT a.thread_id,COUNT(*) value FROM selected_sessions s
-            JOIN agent_runs a ON a.thread_id=s.id WHERE a.id<>a.thread_id
+            JOIN agent_runs a ON a.thread_id=s.id
+            WHERE a.id<>a.thread_id
+              AND (?1 IS NULL OR a.started_at>=?1)
+              AND (?2 IS NULL OR a.started_at<?2)
             GROUP BY a.thread_id
         )
         SELECT s.id,s.started_at,s.last_event_at,s.title,s.project,s.branch,
             COALESCE(m.value,0),COALESCE(t.value,0),COALESCE(a.value,0),COALESCE(tc.value,0),
-            COALESCE(s.total_tokens,u.total_tokens,0),
-            COALESCE(s.cost_usd,u.cost_usd,0.0),
-            COALESCE(s.unpriced_tokens,u.unpriced_tokens,0),
-            COALESCE(l.cost_usd,0.0),
-            COALESCE(l.unpriced_tokens,0)
+            0,'0',0,'0',0
         FROM selected_sessions s
-        LEFT JOIN usage_page u ON u.thread_id=s.id
-        LEFT JOIN usage_lifetime l ON l.thread_id=s.id
         LEFT JOIN message_page m ON m.thread_id=s.id
         LEFT JOIN turn_page t ON t.thread_id=s.id
         LEFT JOIN tool_page tc ON tc.thread_id=s.id
@@ -1892,9 +2362,32 @@ fn query_sessions_on(
         ORDER BY {order}
         "#
     );
+    let page_totals = query_selected_session_totals_on(connection, start, end)?;
+    let lifetime_totals = if start.is_none() && end.is_none() {
+        page_totals.clone()
+    } else {
+        query_selected_session_totals_on(connection, None, None)?
+    };
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(params![start, end], session_from_row)?;
-    let items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut items = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    for item in &mut items {
+        let totals = page_totals
+            .get(&item.id)
+            .cloned()
+            .unwrap_or_default()
+            .finish();
+        let lifetime = lifetime_totals
+            .get(&item.id)
+            .cloned()
+            .unwrap_or_default()
+            .finish();
+        item.total_tokens = totals.total_tokens;
+        item.cost_usd = totals.cost_usd;
+        item.unpriced_tokens = totals.unpriced_tokens;
+        item.lifetime_cost_usd = lifetime.cost_usd;
+        item.lifetime_unpriced_tokens = lifetime.unpriced_tokens;
+    }
     let projects = if include_projects {
         list_projects_on(connection)?
     } else {
@@ -1911,12 +2404,50 @@ fn query_sessions_on(
     })
 }
 
+fn normalize_search_text(value: &str) -> String {
+    value
+        .nfkc()
+        .flat_map(char::to_lowercase)
+        .collect::<String>()
+}
+
+fn populate_session_search_matches_on(connection: &Connection, query: Option<&str>) -> Result<()> {
+    let Some(query) = query else {
+        return Ok(());
+    };
+    let needle = normalize_search_text(query.trim());
+    let mut select = connection.prepare(
+        "SELECT id,COALESCE(title,''),COALESCE(project,''),COALESCE(branch,'') FROM threads",
+    )?;
+    let mut insert =
+        connection.prepare("INSERT OR IGNORE INTO session_search_matches(thread_id) VALUES(?1)")?;
+    let mut rows = select.query([])?;
+    while let Some(row) = rows.next()? {
+        let id = row.get::<_, String>(0)?;
+        let matches = (0..4).any(|index| {
+            let value = if index == 0 {
+                id.as_str()
+            } else {
+                row.get_ref(index)
+                    .ok()
+                    .and_then(|value| value.as_str().ok())
+                    .unwrap_or("")
+            };
+            normalize_search_text(value).contains(&needle)
+        });
+        if matches {
+            insert.execute([&id])?;
+        }
+    }
+    Ok(())
+}
+
 fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionRow> {
     let id: String = row.get(0)?;
     let total_tokens = row.get::<_, i64>(10)?.max(0) as u64;
-    let known_cost_usd = row.get::<_, f64>(11)?;
+    let known_cost_numerator = cost_numerator_from_row(row, 11)?;
     let unpriced_tokens = row.get::<_, i64>(12)?.max(0) as u64;
-    let lifetime_known_cost_usd = row.get::<_, f64>(13)?;
+    let lifetime_known_cost_numerator = cost_numerator_from_row(row, 13)?;
     let lifetime_unpriced_tokens = row.get::<_, i64>(14)?.max(0) as u64;
     Ok(SessionRow {
         root_thread_id: id.clone(),
@@ -1931,15 +2462,29 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<SessionRow> {
         agent_count: row.get::<_, i64>(8)?.max(0) as u64,
         tool_count: row.get::<_, i64>(9)?.max(0) as u64,
         total_tokens,
-        cost_usd: (unpriced_tokens == 0).then_some(known_cost_usd),
+        cost_usd: (unpriced_tokens == 0)
+            .then_some(UsdAmount::from_cost_numerator(known_cost_numerator)),
         unpriced_tokens,
-        lifetime_cost_usd: (lifetime_unpriced_tokens == 0).then_some(lifetime_known_cost_usd),
+        lifetime_cost_usd: (lifetime_unpriced_tokens == 0).then_some(
+            UsdAmount::from_cost_numerator(lifetime_known_cost_numerator),
+        ),
         lifetime_unpriced_tokens,
     })
 }
 
+fn cost_numerator_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<i128> {
+    let value = row.get::<_, String>(index)?;
+    value.parse::<i128>().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 fn query_session_on(connection: &Connection, id: &str) -> Result<Option<SessionRow>> {
-    connection
+    let row = connection
         .query_row(
             "SELECT t.id,t.started_at,t.last_event_at,COALESCE(t.title,'Untitled session'),
                 COALESCE(t.project,'—'),t.branch,
@@ -1947,13 +2492,7 @@ fn query_session_on(connection: &Connection, id: &str) -> Result<Option<SessionR
                 (SELECT COUNT(*) FROM turns tr WHERE tr.thread_id=t.id),
                 (SELECT COUNT(*) FROM agent_runs a WHERE a.thread_id=t.id AND a.id<>a.thread_id),
                 (SELECT COUNT(*) FROM tool_calls tc WHERE tc.thread_id=t.id),
-                COALESCE((SELECT SUM(total_tokens) FROM priced_usage p WHERE p.thread_id=t.id),0),
-                COALESCE((SELECT SUM(cost_usd) FROM priced_usage p WHERE p.thread_id=t.id),0.0),
-                COALESCE((SELECT SUM(CASE WHEN price_known=0 THEN total_tokens ELSE 0 END)
-                          FROM priced_usage p WHERE p.thread_id=t.id),0),
-                COALESCE((SELECT SUM(cost_usd) FROM priced_usage p WHERE p.thread_id=t.id),0.0),
-                COALESCE((SELECT SUM(CASE WHEN price_known=0 THEN total_tokens ELSE 0 END)
-                          FROM priced_usage p WHERE p.thread_id=t.id),0)
+                0,'0',0,'0',0
          FROM threads t WHERE t.id=?1 AND (
             EXISTS(SELECT 1 FROM events e WHERE e.thread_id=t.id)
             OR EXISTS(SELECT 1 FROM usage_facts u WHERE u.thread_id=t.id)
@@ -1961,8 +2500,17 @@ fn query_session_on(connection: &Connection, id: &str) -> Result<Option<SessionR
             [id],
             session_from_row,
         )
-        .optional()
-        .map_err(Into::into)
+        .optional()?;
+    let Some(mut row) = row else {
+        return Ok(None);
+    };
+    let totals = query_all_time_rollup_totals_on(connection, Some(id))?.finish();
+    row.total_tokens = totals.total_tokens;
+    row.cost_usd = totals.cost_usd;
+    row.unpriced_tokens = totals.unpriced_tokens;
+    row.lifetime_cost_usd = totals.cost_usd;
+    row.lifetime_unpriced_tokens = totals.unpriced_tokens;
+    Ok(Some(row))
 }
 
 fn list_projects_on(connection: &Connection) -> Result<Vec<String>> {
@@ -2183,46 +2731,12 @@ fn query_totals_on(
     end: Option<&str>,
     thread_id: Option<&str>,
 ) -> Result<Totals> {
-    let mut sql = String::from(
-        "SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(cached_input_tokens),0),
-                COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),
-                COALESCE(SUM(total_tokens),0),COALESCE(SUM(cost_usd),0.0),
-                COALESCE(SUM(CASE WHEN price_known=0 THEN total_tokens ELSE 0 END),0)
-         FROM priced_usage",
-    );
-    let mut predicates = Vec::new();
-    let mut values = Vec::new();
-    if let Some(start) = start {
-        values.push(start);
-        predicates.push(format!("timestamp>=?{}", values.len()));
+    if start.is_none() && end.is_none() {
+        query_all_time_rollup_totals_on(connection, thread_id).map(FixedPointUsageTotals::finish)
+    } else {
+        query_raw_usage_totals_on(connection, start, end, thread_id)
+            .map(FixedPointUsageTotals::finish)
     }
-    if let Some(end) = end {
-        values.push(end);
-        predicates.push(format!("timestamp<?{}", values.len()));
-    }
-    if let Some(thread_id) = thread_id {
-        values.push(thread_id);
-        predicates.push(format!("thread_id=?{}", values.len()));
-    }
-    if !predicates.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&predicates.join(" AND "));
-    }
-    Ok(connection.query_row(&sql, params_from_iter(values), totals_from_row)?)
-}
-
-fn totals_from_row(row: &Row<'_>) -> rusqlite::Result<Totals> {
-    Ok(Totals {
-        input_tokens: row.get::<_, i64>(0)?.max(0) as u64,
-        cached_input_tokens: row.get::<_, i64>(1)?.max(0) as u64,
-        output_tokens: row.get::<_, i64>(2)?.max(0) as u64,
-        reasoning_tokens: row.get::<_, i64>(3)?.max(0) as u64,
-        total_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-        known_cost_usd: row.get(5)?,
-        unpriced_tokens: row.get::<_, i64>(6)?.max(0) as u64,
-        ..Totals::default()
-    }
-    .finish())
 }
 
 const OVERVIEW_SUMMARY_USAGE_SQL: &str = "SELECT timestamp,model,
@@ -2363,7 +2877,7 @@ fn query_overview_summary_usage_on(
         }
     }
     for (aggregate, cost_numerator) in totals.iter_mut().zip(cost_numerators) {
-        aggregate.known_cost_usd = cost_numerator as f64 / 1_000_000_000_000.0;
+        aggregate.known_cost_numerator = cost_numerator;
         *aggregate = std::mem::take(aggregate).finish();
     }
     Ok(totals)
@@ -2409,14 +2923,14 @@ fn overview_period_summary(
     session_count: u64,
     message_count: u64,
 ) -> PeriodSummary {
-    let delta_cost_usd = totals
-        .cost_usd
-        .zip(previous.cost_usd)
-        .map(|(current, prior)| current - prior);
-    let delta_percent = totals
-        .cost_usd
-        .zip(previous.cost_usd)
-        .and_then(|(current, prior)| (prior > 0.0).then_some((current - prior) / prior * 100.0));
+    let current_cost = totals.cost_usd.map(UsdAmount::cost_numerator);
+    let previous_cost = previous.cost_usd.map(UsdAmount::cost_numerator);
+    let delta_cost_usd = current_cost
+        .zip(previous_cost)
+        .map(|(current, prior)| UsdAmount::from_cost_numerator(current - prior));
+    let delta_percent = current_cost
+        .zip(previous_cost)
+        .and_then(|(current, prior)| exact_ratio_percent(current - prior, prior));
     PeriodSummary {
         label: label.into(),
         start: bounds.start_at.clone(),
@@ -2427,6 +2941,15 @@ fn overview_period_summary(
         delta_cost_usd,
         delta_percent,
     }
+}
+
+fn exact_ratio_percent(numerator: i128, denominator: i128) -> Option<f64> {
+    if denominator <= 0 {
+        return None;
+    }
+    (Decimal::from_i128_with_scale(numerator, 0) / Decimal::from_i128_with_scale(denominator, 0)
+        * Decimal::from(100))
+    .to_f64()
 }
 
 #[derive(Debug, Serialize)]
@@ -2463,7 +2986,7 @@ const BUCKET_AGGREGATES_SQL: &str = "WITH bounds AS MATERIALIZED (
                    COALESCE(SUM(p.output_tokens),0) output_tokens,
                    COALESCE(SUM(p.reasoning_tokens),0) reasoning_tokens,
                    COALESCE(SUM(p.total_tokens),0) total_tokens,
-                   COALESCE(SUM(p.cost_usd),0.0) known_cost_usd,
+                   COALESCE(SUM(p.cost_numerator),0) known_cost_numerator,
                    COALESCE(SUM(CASE WHEN p.price_known=0
                                      THEN p.total_tokens ELSE 0 END),0) unpriced_tokens
             FROM bounds b
@@ -2498,7 +3021,7 @@ const BUCKET_AGGREGATES_SQL: &str = "WITH bounds AS MATERIALIZED (
                 COALESCE(u.output_tokens,0),
                 COALESCE(u.reasoning_tokens,0),
                 COALESCE(u.total_tokens,0),
-                COALESCE(u.known_cost_usd,0.0),
+                COALESCE(u.known_cost_numerator,0),
                 COALESCE(u.unpriced_tokens,0),
                 COALESCE(m.message_count,0),
                 COALESCE(s.session_count,0)
@@ -2538,7 +3061,7 @@ fn query_bucket_aggregates_on(
                         output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
                         reasoning_tokens: row.get::<_, i64>(4)?.max(0) as u64,
                         total_tokens: row.get::<_, i64>(5)?.max(0) as u64,
-                        known_cost_usd: row.get(6)?,
+                        known_cost_numerator: i128::from(row.get::<_, i64>(6)?),
                         unpriced_tokens: row.get::<_, i64>(7)?.max(0) as u64,
                         ..Totals::default()
                     }
@@ -2847,8 +3370,7 @@ fn query_stats_bucket_aggregates_on(
     }
     for ((_, session_count), aggregate) in session_rows.into_iter().zip(&mut aggregates) {
         aggregate.session_count = session_count;
-        aggregate.totals.known_cost_usd =
-            aggregate.known_cost_numerator as f64 / 1_000_000_000_000.0;
+        aggregate.totals.known_cost_numerator = aggregate.known_cost_numerator;
         aggregate.totals = std::mem::take(&mut aggregate.totals).finish();
     }
     Ok(aggregates)
@@ -2898,11 +3420,12 @@ fn overview_year_buckets(year: i32) -> Result<Vec<StatsBucket>> {
     let limit = NaiveDate::from_ymd_opt(year + 1, 1, 1).context("invalid year")?;
     while date < limit {
         let next_date = date + Duration::days(1);
-        buckets.push((
+        push_nonempty_stats_bucket(
+            &mut buckets,
             local_midnight(date),
             local_midnight(next_date),
             date.to_string(),
-        ));
+        );
         date = next_date;
     }
     Ok(buckets)
@@ -3018,6 +3541,443 @@ fn overview_group_has_price_boundary(
                 })
         })
     })
+}
+
+fn usage_rollup_hour_window(activity_hour: &str) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
+    let start = DateTime::parse_from_rfc3339(activity_hour)
+        .with_context(|| format!("invalid UTC usage rollup hour {activity_hour}"))?
+        .with_timezone(&Utc);
+    let end = start
+        .checked_add_signed(Duration::hours(1))
+        .context("usage rollup hour has no successor")?;
+    Ok((start, end))
+}
+
+fn usage_rollup_bucket_dates<Tz: TimeZone>(
+    hour_start: DateTime<Utc>,
+    hour_end: DateTime<Utc>,
+    timezone: &Tz,
+) -> (NaiveDate, NaiveDate) {
+    let occupied_end = hour_end
+        .checked_sub_signed(Duration::nanoseconds(1))
+        .unwrap_or(hour_start);
+    (
+        hour_start.with_timezone(timezone).date_naive(),
+        occupied_end.with_timezone(timezone).date_naive(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn usage_rollup_cost_on(
+    connection: &Connection,
+    aliases: &OverviewPriceAliases,
+    prices: &OverviewPriceLedger,
+    scope: UsageRollupScope<'_>,
+    thread_id: &str,
+    activity_hour: &str,
+    model: &str,
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: u64,
+) -> Result<(i128, u64)> {
+    let (start, end) = usage_rollup_hour_window(activity_hour)?;
+    let first_timestamp = sql_timestamp(start);
+    let last_timestamp = sql_timestamp(
+        end.checked_sub_signed(Duration::nanoseconds(1))
+            .unwrap_or(start),
+    );
+    let cached_input_tokens = input_tokens.min(cached_input_tokens.max(0));
+    let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
+    let first_price = overview_price_for(aliases, prices, model, &first_timestamp);
+    let last_price = overview_price_for(aliases, prices, model, &last_timestamp);
+    let has_price_boundary = overview_group_has_price_boundary(
+        aliases,
+        prices,
+        model,
+        &first_timestamp,
+        &last_timestamp,
+    );
+    match (first_price, last_price) {
+        (Some((first_index, price)), Some((last_index, _)))
+            if first_index == last_index && !has_price_boundary =>
+        {
+            Ok((
+                overview_cost_for_price(
+                    price,
+                    uncached_input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                ),
+                0,
+            ))
+        }
+        (None, None)
+            if overview_group_has_no_price(
+                aliases,
+                prices,
+                model,
+                &first_timestamp,
+                &last_timestamp,
+            ) =>
+        {
+            Ok((0, total_tokens))
+        }
+        _ => usage_rollup_exceptional_cost_on(
+            connection,
+            aliases,
+            prices,
+            UsageRollupExceptionalQuery {
+                scope,
+                thread_id,
+                model,
+                start: &first_timestamp,
+                end: &sql_timestamp(end),
+            },
+        ),
+    }
+}
+
+fn usage_rollup_exceptional_cost_on(
+    connection: &Connection,
+    aliases: &OverviewPriceAliases,
+    prices: &OverviewPriceLedger,
+    query: UsageRollupExceptionalQuery<'_>,
+) -> Result<(i128, u64)> {
+    let sql = match query.scope {
+        UsageRollupScope::All => {
+            "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,total_tokens
+             FROM usage_facts INDEXED BY idx_usage_model_time
+             WHERE model=?1 AND timestamp>=?2 AND timestamp<?3"
+        }
+        UsageRollupScope::Thread => {
+            "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,total_tokens
+             FROM usage_facts INDEXED BY idx_usage_thread_model_time
+             WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<?4"
+        }
+        UsageRollupScope::Turn(_) => {
+            "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,total_tokens
+             FROM usage_facts INDEXED BY idx_usage_turn_model_time
+             WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<?4
+               AND turn_id=?5"
+        }
+        UsageRollupScope::Agent(_) => {
+            "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,total_tokens
+             FROM usage_facts INDEXED BY idx_usage_agent_run
+             WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<?4
+               AND agent_run_id=?5"
+        }
+        UsageRollupScope::Effort(_) => {
+            "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,total_tokens
+             FROM usage_facts INDEXED BY idx_usage_thread_model_time
+             WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<?4
+               AND effort IS ?5"
+        }
+    };
+    let mut statement = connection.prepare(sql)?;
+    let mut rows = match query.scope {
+        UsageRollupScope::All => statement.query(params![query.model, query.start, query.end])?,
+        UsageRollupScope::Thread => statement.query(params![
+            query.thread_id,
+            query.model,
+            query.start,
+            query.end
+        ])?,
+        UsageRollupScope::Turn(turn_id) => statement.query(params![
+            query.thread_id,
+            query.model,
+            query.start,
+            query.end,
+            turn_id
+        ])?,
+        UsageRollupScope::Agent(agent_run_id) => statement.query(params![
+            query.thread_id,
+            query.model,
+            query.start,
+            query.end,
+            agent_run_id
+        ])?,
+        UsageRollupScope::Effort(effort) => statement.query(params![
+            query.thread_id,
+            query.model,
+            query.start,
+            query.end,
+            effort
+        ])?,
+    };
+    let mut cost_numerator = 0i128;
+    let mut unpriced_tokens = 0u64;
+    while let Some(row) = rows.next()? {
+        let timestamp = row.get_ref(0)?.as_str()?;
+        let input_tokens = row.get::<_, i64>(1)?.max(0);
+        let cached_tokens = input_tokens.min(row.get::<_, i64>(2)?.max(0));
+        let output_tokens = row.get::<_, i64>(3)?.max(0);
+        let total_tokens = row.get::<_, i64>(4)?.max(0) as u64;
+        if let Some((_, price)) = overview_price_for(aliases, prices, query.model, timestamp) {
+            cost_numerator = cost_numerator.saturating_add(overview_cost_for_price(
+                price,
+                input_tokens - cached_tokens,
+                cached_tokens,
+                output_tokens,
+            ));
+        } else {
+            unpriced_tokens = unpriced_tokens.saturating_add(total_tokens);
+        }
+    }
+    Ok((cost_numerator, unpriced_tokens))
+}
+
+fn usage_rollup_local_day_splits_on(
+    connection: &Connection,
+    aliases: &OverviewPriceAliases,
+    prices: &OverviewPriceLedger,
+    query: UsageRollupExceptionalQuery<'_>,
+) -> Result<HashMap<NaiveDate, FixedPointUsageTotals>> {
+    let sql = match query.scope {
+        UsageRollupScope::All => {
+            "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,
+                    reasoning_tokens,total_tokens
+             FROM usage_facts INDEXED BY idx_usage_model_time
+             WHERE model=?1 AND timestamp>=?2 AND timestamp<?3"
+        }
+        UsageRollupScope::Thread => {
+            "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,
+                    reasoning_tokens,total_tokens
+             FROM usage_facts INDEXED BY idx_usage_thread_model_time
+             WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<?4"
+        }
+        UsageRollupScope::Turn(_) => {
+            "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,
+                    reasoning_tokens,total_tokens
+             FROM usage_facts INDEXED BY idx_usage_turn_model_time
+             WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<?4
+               AND turn_id=?5"
+        }
+        UsageRollupScope::Agent(_) => {
+            "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,
+                    reasoning_tokens,total_tokens
+             FROM usage_facts INDEXED BY idx_usage_agent_run
+             WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<?4
+               AND agent_run_id=?5"
+        }
+        UsageRollupScope::Effort(_) => {
+            "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,
+                    reasoning_tokens,total_tokens
+             FROM usage_facts INDEXED BY idx_usage_thread_model_time
+             WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<?4
+               AND effort IS ?5"
+        }
+    };
+    let mut statement = connection.prepare(sql)?;
+    let mut rows = match query.scope {
+        UsageRollupScope::All => statement.query(params![query.model, query.start, query.end])?,
+        UsageRollupScope::Thread => statement.query(params![
+            query.thread_id,
+            query.model,
+            query.start,
+            query.end
+        ])?,
+        UsageRollupScope::Turn(turn_id) => statement.query(params![
+            query.thread_id,
+            query.model,
+            query.start,
+            query.end,
+            turn_id
+        ])?,
+        UsageRollupScope::Agent(agent_run_id) => statement.query(params![
+            query.thread_id,
+            query.model,
+            query.start,
+            query.end,
+            agent_run_id
+        ])?,
+        UsageRollupScope::Effort(effort) => statement.query(params![
+            query.thread_id,
+            query.model,
+            query.start,
+            query.end,
+            effort
+        ])?,
+    };
+    let mut totals = HashMap::<NaiveDate, FixedPointUsageTotals>::new();
+    while let Some(row) = rows.next()? {
+        let timestamp = row.get_ref(0)?.as_str()?;
+        let parsed = DateTime::parse_from_rfc3339(timestamp)
+            .with_context(|| format!("invalid usage timestamp {timestamp}"))?;
+        let date = parsed.with_timezone(&Local).date_naive();
+        let input_tokens = row.get::<_, i64>(1)?.max(0);
+        let cached_input_tokens = input_tokens.min(row.get::<_, i64>(2)?.max(0));
+        let output_tokens = row.get::<_, i64>(3)?.max(0);
+        let reasoning_tokens = row.get::<_, i64>(4)?.max(0);
+        let total_tokens = row.get::<_, i64>(5)?.max(0) as u64;
+        let (known_cost_numerator, unpriced_tokens) =
+            overview_price_for(aliases, prices, query.model, timestamp).map_or(
+                (0, total_tokens),
+                |(_, price)| {
+                    (
+                        overview_cost_for_price(
+                            price,
+                            input_tokens - cached_input_tokens,
+                            cached_input_tokens,
+                            output_tokens,
+                        ),
+                        0,
+                    )
+                },
+            );
+        totals.entry(date).or_default().add_group(
+            input_tokens as u64,
+            cached_input_tokens as u64,
+            output_tokens as u64,
+            reasoning_tokens as u64,
+            total_tokens,
+            known_cost_numerator,
+            unpriced_tokens,
+        );
+    }
+    Ok(totals)
+}
+
+fn query_all_time_rollup_totals_on(
+    connection: &Connection,
+    thread_id: Option<&str>,
+) -> Result<FixedPointUsageTotals> {
+    let groups = if let Some(thread_id) = thread_id {
+        let mut statement = connection.prepare(
+            "SELECT activity_hour,model,
+                    COALESCE(SUM(input_tokens),0),
+                    COALESCE(SUM(cached_input_tokens),0),
+                    COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0),
+                    COALESCE(SUM(total_tokens),0)
+             FROM usage_activity_rollups
+             WHERE thread_id=?1
+             GROUP BY activity_hour,model",
+        )?;
+        statement
+            .query_map([thread_id], usage_rollup_group_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        let mut statement = connection.prepare(
+            "SELECT activity_hour,model,
+                    COALESCE(SUM(input_tokens),0),
+                    COALESCE(SUM(cached_input_tokens),0),
+                    COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0),
+                    COALESCE(SUM(total_tokens),0)
+             FROM usage_activity_rollups
+             GROUP BY activity_hour,model",
+        )?;
+        statement
+            .query_map([], usage_rollup_group_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let mut totals = FixedPointUsageTotals::default();
+    for (
+        activity_hour,
+        model,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        total_tokens,
+    ) in groups
+    {
+        let scope = if thread_id.is_some() {
+            UsageRollupScope::Thread
+        } else {
+            UsageRollupScope::All
+        };
+        let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
+            connection,
+            &aliases,
+            &prices,
+            scope,
+            thread_id.unwrap_or(""),
+            &activity_hour,
+            &model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            total_tokens,
+        )?;
+        totals.add_group(
+            input_tokens as u64,
+            cached_input_tokens as u64,
+            output_tokens as u64,
+            reasoning_tokens as u64,
+            total_tokens,
+            known_cost_numerator,
+            unpriced_tokens,
+        );
+    }
+    Ok(totals)
+}
+
+type UsageRollupGroup = (String, String, i64, i64, i64, i64, u64);
+
+fn usage_rollup_group_from_row(row: &Row<'_>) -> rusqlite::Result<UsageRollupGroup> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get::<_, i64>(2)?.max(0),
+        row.get::<_, i64>(3)?.max(0),
+        row.get::<_, i64>(4)?.max(0),
+        row.get::<_, i64>(5)?.max(0),
+        row.get::<_, i64>(6)?.max(0) as u64,
+    ))
+}
+
+fn query_raw_usage_totals_on(
+    connection: &Connection,
+    start: Option<&str>,
+    end: Option<&str>,
+    thread_id: Option<&str>,
+) -> Result<FixedPointUsageTotals> {
+    let mut sql = String::from(
+        "SELECT timestamp,model,input_tokens,cached_input_tokens,output_tokens,
+                reasoning_tokens,total_tokens FROM usage_facts",
+    );
+    let mut predicates = Vec::new();
+    let mut values = Vec::new();
+    if let Some(start) = start {
+        values.push(start);
+        predicates.push(format!("timestamp>=?{}", values.len()));
+    }
+    if let Some(end) = end {
+        values.push(end);
+        predicates.push(format!("timestamp<?{}", values.len()));
+    }
+    if let Some(thread_id) = thread_id {
+        values.push(thread_id);
+        predicates.push(format!("thread_id=?{}", values.len()));
+    }
+    if !predicates.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&predicates.join(" AND "));
+    }
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let mut statement = connection.prepare(&sql)?;
+    let mut rows = statement.query(params_from_iter(values))?;
+    let mut totals = FixedPointUsageTotals::default();
+    while let Some(row) = rows.next()? {
+        let timestamp = row.get::<_, String>(0)?;
+        let model = row.get::<_, String>(1)?;
+        add_usage_fact_to_totals(
+            &mut totals,
+            &aliases,
+            &prices,
+            &timestamp,
+            &model,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+        );
+    }
+    Ok(totals)
 }
 
 fn overview_exceptional_group_cost_on(
@@ -3296,11 +4256,13 @@ fn query_overview_year_projects_on(
         .map(|(project, usage)| ProjectDriver {
             project,
             cost_usd: usage.cost_usd(),
-            share: usage.cost_usd().map(|known_cost_usd| {
+            share: usage.cost_usd().and_then(|_| {
                 if total_priced_cost_numerator > 0 {
-                    known_cost_usd / (total_priced_cost_numerator as f64 / 1_000_000_000_000.0)
+                    (Decimal::from_i128_with_scale(usage.known_cost_numerator, 0)
+                        / Decimal::from_i128_with_scale(total_priced_cost_numerator, 0))
+                    .to_f64()
                 } else {
-                    0.0
+                    Some(0.0)
                 }
             }),
         })
@@ -3386,71 +4348,212 @@ fn query_heatmap_on(connection: &Connection, year: i32) -> Result<Vec<HeatmapDay
 }
 
 fn query_model_usage_on(connection: &Connection, thread_id: &str) -> Result<Vec<ModelUsage>> {
-    let mut statement = connection.prepare(
-        "SELECT model,effort,COALESCE(SUM(input_tokens),0),COALESCE(SUM(cached_input_tokens),0),
-                COALESCE(SUM(output_tokens),0),COALESCE(SUM(reasoning_tokens),0),
-                COALESCE(SUM(total_tokens),0),COALESCE(SUM(cost_usd),0.0),
-                COALESCE(SUM(CASE WHEN price_known=0 THEN total_tokens ELSE 0 END),0)
-         FROM priced_usage WHERE thread_id=?1 GROUP BY model,effort ORDER BY 7 DESC",
-    )?;
-    Ok(statement
-        .query_map([thread_id], |row| {
-            let total_tokens = row.get::<_, i64>(6)?.max(0) as u64;
-            let known_cost_usd = row.get::<_, f64>(7)?;
-            let unpriced_tokens = row.get::<_, i64>(8)?.max(0) as u64;
-            Ok(ModelUsage {
-                model: row.get(0)?,
-                effort: row.get(1)?,
-                input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                cached_input_tokens: row.get::<_, i64>(3)?.max(0) as u64,
-                output_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                reasoning_tokens: row.get::<_, i64>(5)?.max(0) as u64,
-                total_tokens,
-                cost_usd: (unpriced_tokens == 0).then_some(known_cost_usd),
-                unpriced_tokens,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?)
+    let groups = {
+        let mut statement = connection.prepare(
+            "SELECT model,effort,
+                    strftime('%Y-%m-%dT%H:00:00.000000000Z',timestamp) activity_hour,
+                    COALESCE(SUM(input_tokens),0),
+                    COALESCE(SUM(cached_input_tokens),0),
+                    COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0),
+                    COALESCE(SUM(total_tokens),0)
+             FROM usage_facts
+             WHERE thread_id=?1
+             GROUP BY model,effort,activity_hour",
+        )?;
+        statement
+            .query_map([thread_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?.max(0),
+                    row.get::<_, i64>(4)?.max(0),
+                    row.get::<_, i64>(5)?.max(0),
+                    row.get::<_, i64>(6)?.max(0),
+                    row.get::<_, i64>(7)?.max(0) as u64,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let mut totals = HashMap::<(String, Option<String>), FixedPointUsageTotals>::new();
+    for (
+        model,
+        effort,
+        activity_hour,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        total_tokens,
+    ) in groups
+    {
+        let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
+            connection,
+            &aliases,
+            &prices,
+            UsageRollupScope::Effort(effort.as_deref()),
+            thread_id,
+            &activity_hour,
+            &model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            total_tokens,
+        )?;
+        totals.entry((model, effort)).or_default().add_group(
+            input_tokens as u64,
+            cached_input_tokens as u64,
+            output_tokens as u64,
+            reasoning_tokens as u64,
+            total_tokens,
+            known_cost_numerator,
+            unpriced_tokens,
+        );
+    }
+    let mut usage = totals
+        .into_iter()
+        .map(|((model, effort), totals)| {
+            let totals = totals.finish();
+            ModelUsage {
+                model,
+                effort,
+                input_tokens: totals.input_tokens,
+                cached_input_tokens: totals.cached_input_tokens,
+                output_tokens: totals.output_tokens,
+                reasoning_tokens: totals.reasoning_tokens,
+                total_tokens: totals.total_tokens,
+                cost_usd: totals.cost_usd,
+                unpriced_tokens: totals.unpriced_tokens,
+            }
+        })
+        .collect::<Vec<_>>();
+    usage.sort_by(|left, right| {
+        right
+            .total_tokens
+            .cmp(&left.total_tokens)
+            .then_with(|| left.model.cmp(&right.model))
+            .then_with(|| left.effort.cmp(&right.effort))
+    });
+    Ok(usage)
+}
+
+fn query_agent_totals_on(
+    connection: &Connection,
+    thread_id: &str,
+) -> Result<HashMap<String, FixedPointUsageTotals>> {
+    let groups = {
+        let mut statement = connection.prepare(
+            "SELECT agent_run_id,
+                    strftime('%Y-%m-%dT%H:00:00.000000000Z',timestamp) activity_hour,
+                    model,COALESCE(SUM(input_tokens),0),
+                    COALESCE(SUM(cached_input_tokens),0),
+                    COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0),
+                    COALESCE(SUM(total_tokens),0)
+             FROM usage_facts
+             WHERE thread_id=?1 AND agent_run_id IS NOT NULL
+             GROUP BY agent_run_id,activity_hour,model",
+        )?;
+        statement
+            .query_map([thread_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?.max(0),
+                    row.get::<_, i64>(4)?.max(0),
+                    row.get::<_, i64>(5)?.max(0),
+                    row.get::<_, i64>(6)?.max(0),
+                    row.get::<_, i64>(7)?.max(0) as u64,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let mut totals = HashMap::<String, FixedPointUsageTotals>::new();
+    for (
+        agent_run_id,
+        activity_hour,
+        model,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        total_tokens,
+    ) in groups
+    {
+        let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
+            connection,
+            &aliases,
+            &prices,
+            UsageRollupScope::Agent(&agent_run_id),
+            thread_id,
+            &activity_hour,
+            &model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            total_tokens,
+        )?;
+        totals.entry(agent_run_id).or_default().add_group(
+            input_tokens as u64,
+            cached_input_tokens as u64,
+            output_tokens as u64,
+            reasoning_tokens as u64,
+            total_tokens,
+            known_cost_numerator,
+            unpriced_tokens,
+        );
+    }
+    Ok(totals)
 }
 
 fn query_agent_summary_on(connection: &Connection, thread_id: &str) -> Result<Vec<AgentSummary>> {
     let mut statement = connection.prepare(
         "SELECT a.id,a.agent_path,a.nickname,COALESCE(a.status,'running'),
                 (SELECT COUNT(*) FROM turns tr WHERE tr.agent_run_id=a.id),
-                (SELECT COUNT(*) FROM tool_calls tc WHERE tc.agent_run_id=a.id),
-                COALESCE(SUM(p.total_tokens),0),COALESCE(SUM(p.cost_usd),0.0),
-                COALESCE(SUM(CASE WHEN p.price_known=0 THEN p.total_tokens ELSE 0 END),0)
-         FROM agent_runs a LEFT JOIN priced_usage p
-              ON p.agent_run_id=a.id AND p.thread_id=?1
+                (SELECT COUNT(*) FROM tool_calls tc WHERE tc.agent_run_id=a.id)
+         FROM agent_runs a
          WHERE a.thread_id=?1 AND a.id<>a.thread_id
-         GROUP BY a.id ORDER BY a.started_at",
+         ORDER BY a.started_at",
     )?;
-    Ok(statement
+    let rows = statement
         .query_map([thread_id], |row| {
-            let id: String = row.get(0)?;
-            let path: Option<String> = row.get(1)?;
-            let nickname: Option<String> = row.get(2)?;
-            let total_tokens = row.get::<_, i64>(6)?.max(0) as u64;
-            let known_cost_usd = row.get::<_, f64>(7)?;
-            let unpriced_tokens = row.get::<_, i64>(8)?.max(0) as u64;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?.max(0) as u64,
+                row.get::<_, i64>(5)?.max(0) as u64,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut usage = query_agent_totals_on(connection, thread_id)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, path, nickname, status, turn_count, tool_count)| {
+            let totals = usage.remove(&id).unwrap_or_default().finish();
             let label = nickname
                 .clone()
                 .or_else(|| path.clone())
                 .unwrap_or_else(|| "Primary agent".into());
-            Ok(AgentSummary {
+            AgentSummary {
                 id,
                 label,
                 path,
                 nickname,
-                status: row.get(3)?,
-                turn_count: row.get::<_, i64>(4)?.max(0) as u64,
-                tool_count: row.get::<_, i64>(5)?.max(0) as u64,
-                total_tokens,
-                cost_usd: (unpriced_tokens == 0).then_some(known_cost_usd),
-                unpriced_tokens,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?)
+                status,
+                turn_count,
+                tool_count,
+                total_tokens: totals.total_tokens,
+                cost_usd: totals.cost_usd,
+                unpriced_tokens: totals.unpriced_tokens,
+            }
+        })
+        .collect())
 }
 
 fn query_tool_summary_on(connection: &Connection, thread_id: &str) -> Result<Vec<ToolSummary>> {
@@ -3516,91 +4619,6 @@ fn display_tool_name(namespace: Option<&str>, name: &str) -> String {
     }
 }
 
-fn query_agent_usage_on(connection: &Connection, thread_id: &str) -> Result<Vec<UsageBreakdown>> {
-    let mut statement = connection.prepare(
-        "SELECT a.id,a.agent_path,a.nickname,
-                COALESCE(SUM(p.input_tokens),0),COALESCE(SUM(p.cached_input_tokens),0),
-                COALESCE(SUM(p.output_tokens),0),COALESCE(SUM(p.reasoning_tokens),0),
-                COALESCE(SUM(p.total_tokens),0),COALESCE(SUM(p.cost_usd),0.0),
-                COALESCE(SUM(CASE WHEN p.price_known=0 THEN p.total_tokens ELSE 0 END),0)
-         FROM agent_runs a LEFT JOIN priced_usage p
-              ON p.agent_run_id=a.id AND p.thread_id=?1
-         WHERE a.thread_id=?1 GROUP BY a.id ORDER BY a.started_at",
-    )?;
-    Ok(statement
-        .query_map([thread_id], |row| {
-            let id: String = row.get(0)?;
-            let path: Option<String> = row.get(1)?;
-            let nickname: Option<String> = row.get(2)?;
-            Ok(UsageBreakdown {
-                id: id.clone(),
-                label: nickname.or(path).unwrap_or_else(|| "Primary agent".into()),
-                model: None,
-                agent_run_id: Some(id),
-                turn_id: None,
-                effort: None,
-                totals: Totals {
-                    input_tokens: row.get::<_, i64>(3)?.max(0) as u64,
-                    cached_input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                    output_tokens: row.get::<_, i64>(5)?.max(0) as u64,
-                    reasoning_tokens: row.get::<_, i64>(6)?.max(0) as u64,
-                    total_tokens: row.get::<_, i64>(7)?.max(0) as u64,
-                    known_cost_usd: row.get(8)?,
-                    unpriced_tokens: row.get::<_, i64>(9)?.max(0) as u64,
-                    ..Totals::default()
-                }
-                .finish(),
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?)
-}
-
-fn query_turn_usage_on(connection: &Connection, thread_id: &str) -> Result<Vec<UsageBreakdown>> {
-    let mut statement = connection.prepare(
-        "SELECT t.id,t.started_at,t.model,t.effort,
-                COALESCE(SUM(p.input_tokens),0),COALESCE(SUM(p.cached_input_tokens),0),
-                COALESCE(SUM(p.output_tokens),0),COALESCE(SUM(p.reasoning_tokens),0),
-                COALESCE(SUM(p.total_tokens),0),COALESCE(SUM(p.cost_usd),0.0),
-                COALESCE(SUM(CASE WHEN p.price_known=0 THEN p.total_tokens ELSE 0 END),0)
-         FROM turns t LEFT JOIN priced_usage p
-              ON p.turn_id=t.id AND p.thread_id=?1
-         WHERE t.thread_id=?1 GROUP BY t.id ORDER BY t.started_at",
-    )?;
-    Ok(statement
-        .query_map([thread_id], |row| {
-            let turn_id: String = row.get(0)?;
-            let started_at: String = row.get(1)?;
-            let totals = Totals {
-                input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                cached_input_tokens: row.get::<_, i64>(5)?.max(0) as u64,
-                output_tokens: row.get::<_, i64>(6)?.max(0) as u64,
-                reasoning_tokens: row.get::<_, i64>(7)?.max(0) as u64,
-                total_tokens: row.get::<_, i64>(8)?.max(0) as u64,
-                known_cost_usd: row.get(9)?,
-                unpriced_tokens: row.get::<_, i64>(10)?.max(0) as u64,
-                ..Totals::default()
-            }
-            .finish();
-            Ok(UsageBreakdown {
-                id: turn_id.clone(),
-                label: DateTime::parse_from_rfc3339(&started_at)
-                    .map(|value| {
-                        value
-                            .with_timezone(&Local)
-                            .format("%b %-d, %H:%M")
-                            .to_string()
-                    })
-                    .unwrap_or(started_at),
-                model: row.get(2)?,
-                agent_run_id: None,
-                turn_id: Some(turn_id),
-                effort: row.get(3)?,
-                totals,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?)
-}
-
 const ACTIVITY_PREVIEW_CHARS: i64 = 240;
 const LEGACY_ACTIVITY_PREFIX: &str = "legacy:";
 
@@ -3644,7 +4662,7 @@ struct ActivityBatch {
     descendant_turns: Vec<ActivityTurnSummary>,
     tool_calls_by_turn: HashMap<String, u64>,
     orphan_tool_calls_by_root: HashMap<String, u64>,
-    totals_by_turn: HashMap<String, Totals>,
+    totals_by_turn: HashMap<String, FixedPointUsageTotals>,
 }
 
 impl ActivityBatch {
@@ -3755,7 +4773,7 @@ impl ActivityBatch {
             batch.model_calls.insert(turn_id, count.max(0) as u64);
         }
 
-        connection.execute(
+        let explicit_agent_count = connection.execute(
             "INSERT OR IGNORE INTO activity_explicit_agents(agent_key)
              SELECT json_extract(link.payload_json,'$.agent_thread_id')
              FROM events link
@@ -3763,14 +4781,20 @@ impl ActivityBatch {
                ON root_turn.id=link.turn_id AND root_turn.thread_id=link.thread_id
              WHERE link.thread_id=?1 AND link.kind='subagent'
                AND root_turn.rollout_id=?2
-               AND json_extract(link.payload_json,'$.agent_thread_id') IS NOT NULL",
+               AND json_extract(link.payload_json,'$.agent_thread_id') IS NOT NULL
+               AND EXISTS(
+                    SELECT 1 FROM turns descendant
+                    WHERE descendant.thread_id=?1 AND descendant.rollout_id<>?2
+                    LIMIT 1
+               )",
             params![thread_id, root_rollout_id],
         )?;
         // Agent clocks can place the first child turn just before its spawn
         // event. Keep that first interval open on the left; every later link
         // transfers the reused identity to the newly linked root exchange.
-        connection.execute(
-            "INSERT OR IGNORE INTO selected_activity_agent_intervals(
+        if explicit_agent_count > 0 {
+            connection.execute(
+                "INSERT OR IGNORE INTO selected_activity_agent_intervals(
                  link_id,agent_key,root_turn_id,linked_at,next_linked_at
              )
              SELECT link.link_id,link.agent_key,link.root_turn_id,
@@ -3801,8 +4825,9 @@ impl ActivityBatch {
              ) link
              JOIN selected_activity_roots selected
                ON selected.turn_id=link.root_turn_id",
-            params![thread_id, root_rollout_id],
-        )?;
+                params![thread_id, root_rollout_id],
+            )?;
+        }
         let mut statement = connection.prepare(
             "SELECT agent_key,NULL,NULL,NULL FROM activity_explicit_agents
              UNION ALL
@@ -3936,57 +4961,133 @@ impl ActivityBatch {
             }
         }
 
-        // A usage fact can survive without a turn link (for example when a
-        // partially written trace is reconciled). Root exchanges still form a
-        // complete, deterministic timeline: the first exchange is open on the
-        // left, every other exchange starts at its root timestamp, and the last
-        // exchange is open on the right. The second UNION arm gives each such
-        // fact exactly one owner without adding another query to Activity's
-        // fixed statement budget.
+        let (aliases, prices) = overview_prices_on(connection)?;
+        let mut usage_by_turn = HashMap::<String, FixedPointUsageTotals>::new();
+        let rollup_groups = {
+            let mut statement = connection.prepare(
+                "SELECT r.turn_key,r.activity_hour,r.model,
+                        COALESCE(SUM(r.input_tokens),0),
+                        COALESCE(SUM(r.cached_input_tokens),0),
+                        COALESCE(SUM(r.output_tokens),0),
+                        COALESCE(SUM(r.reasoning_tokens),0),
+                        COALESCE(SUM(r.total_tokens),0)
+                 FROM usage_activity_rollups r
+                 JOIN selected_activity_turns selected ON selected.turn_id=r.turn_key
+                 WHERE r.thread_id=?1
+                 GROUP BY r.turn_key,r.activity_hour,r.model",
+            )?;
+            statement
+                .query_map([thread_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?.max(0),
+                        row.get::<_, i64>(4)?.max(0),
+                        row.get::<_, i64>(5)?.max(0),
+                        row.get::<_, i64>(6)?.max(0),
+                        row.get::<_, i64>(7)?.max(0) as u64,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (
+            turn_id,
+            activity_hour,
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            total_tokens,
+        ) in rollup_groups
+        {
+            let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
+                connection,
+                &aliases,
+                &prices,
+                UsageRollupScope::Turn(&turn_id),
+                thread_id,
+                &activity_hour,
+                &model,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                total_tokens,
+            )?;
+            usage_by_turn.entry(turn_id).or_default().add_group(
+                input_tokens as u64,
+                cached_input_tokens as u64,
+                output_tokens as u64,
+                reasoning_tokens as u64,
+                total_tokens,
+                known_cost_numerator,
+                unpriced_tokens,
+            );
+        }
+
+        // A usage fact can survive without a turn link. These rows cannot be
+        // pre-attributed to an exchange because ownership is interval based,
+        // but they are sparse. Seek only the NULL-turn slice and price it in
+        // fixed point rather than materializing priced_usage for every linked
+        // fact in the selected turns.
         let mut statement = connection.prepare(
-            "SELECT p.turn_id,COALESCE(SUM(p.input_tokens),0),
-                    COALESCE(SUM(p.cached_input_tokens),0),COALESCE(SUM(p.output_tokens),0),
-                    COALESCE(SUM(p.reasoning_tokens),0),COALESCE(SUM(p.total_tokens),0),
-                    COALESCE(SUM(p.cost_usd),0.0),
-                    COALESCE(SUM(CASE WHEN p.price_known=0 THEN p.total_tokens ELSE 0 END),0)
-             FROM priced_usage p
-             JOIN selected_activity_turns selected ON selected.turn_id=p.turn_id
-             WHERE p.thread_id=?1 GROUP BY p.turn_id
-             UNION ALL
-             SELECT selected.turn_id,COALESCE(SUM(p.input_tokens),0),
-                    COALESCE(SUM(p.cached_input_tokens),0),COALESCE(SUM(p.output_tokens),0),
-                    COALESCE(SUM(p.reasoning_tokens),0),COALESCE(SUM(p.total_tokens),0),
-                    COALESCE(SUM(p.cost_usd),0.0),
-                    COALESCE(SUM(CASE WHEN p.price_known=0 THEN p.total_tokens ELSE 0 END),0)
+            "SELECT selected.turn_id,u.timestamp,u.model,u.input_tokens,
+                    u.cached_input_tokens,u.output_tokens,u.reasoning_tokens,u.total_tokens
              FROM selected_activity_roots selected
-             JOIN priced_usage p
-               ON p.thread_id=?1 AND p.turn_id IS NULL
-              AND (selected.open_left=1 OR p.timestamp>=selected.started_at)
-              AND (selected.next_started_at IS NULL
-                   OR p.timestamp<selected.next_started_at)
-             GROUP BY selected.turn_id",
+             JOIN usage_facts u INDEXED BY idx_usage_turn_model_time
+               ON u.thread_id=?1 AND u.turn_id IS NULL
+              AND (selected.open_left=1 OR u.timestamp>=selected.started_at)
+              AND (selected.next_started_at IS NULL OR u.timestamp<selected.next_started_at)",
         )?;
         for row in statement.query_map([thread_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                Totals {
-                    input_tokens: row.get::<_, i64>(1)?.max(0) as u64,
-                    cached_input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                    output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
-                    reasoning_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                    total_tokens: row.get::<_, i64>(5)?.max(0) as u64,
-                    known_cost_usd: row.get(6)?,
-                    unpriced_tokens: row.get::<_, i64>(7)?.max(0) as u64,
-                    ..Totals::default()
-                },
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?.max(0),
+                row.get::<_, i64>(4)?.max(0),
+                row.get::<_, i64>(5)?.max(0),
+                row.get::<_, i64>(6)?.max(0),
+                row.get::<_, i64>(7)?.max(0) as u64,
             ))
         })? {
-            let (turn_id, totals) = row?;
-            add_activity_usage(batch.totals_by_turn.entry(turn_id).or_default(), &totals);
+            let (
+                turn_id,
+                timestamp,
+                model,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                total_tokens,
+            ) = row?;
+            let cached_input_tokens = input_tokens.min(cached_input_tokens);
+            let (known_cost_numerator, unpriced_tokens) = overview_price_for(
+                &aliases, &prices, &model, &timestamp,
+            )
+            .map_or((0, total_tokens), |(_, price)| {
+                (
+                    overview_cost_for_price(
+                        price,
+                        input_tokens - cached_input_tokens,
+                        cached_input_tokens,
+                        output_tokens,
+                    ),
+                    0,
+                )
+            });
+            usage_by_turn.entry(turn_id).or_default().add_group(
+                input_tokens as u64,
+                cached_input_tokens as u64,
+                output_tokens as u64,
+                reasoning_tokens as u64,
+                total_tokens,
+                known_cost_numerator,
+                unpriced_tokens,
+            );
         }
-        for totals in batch.totals_by_turn.values_mut() {
-            *totals = std::mem::take(totals).finish();
-        }
+        batch.totals_by_turn = usage_by_turn;
         Ok(batch)
     }
 
@@ -4060,13 +5161,26 @@ impl ActivityBatch {
     }
 
     fn exchange_totals(&self, root_turn_id: &str, descendants: &[AttributedDescendant]) -> Totals {
-        let mut totals = Totals::default();
+        let mut totals = FixedPointUsageTotals::default();
         if let Some(root) = self.totals_by_turn.get(root_turn_id) {
-            add_activity_usage(&mut totals, root);
+            totals.merge(root.clone());
         }
         for descendant in descendants {
             if let Some(usage) = self.totals_by_turn.get(&descendant.id) {
-                add_activity_usage(&mut totals, usage);
+                totals.merge(usage.clone());
+            }
+        }
+        totals.finish()
+    }
+
+    fn descendant_totals(&self, descendants: &[AttributedDescendant], reviews: bool) -> Totals {
+        let mut totals = FixedPointUsageTotals::default();
+        for descendant in descendants
+            .iter()
+            .filter(|descendant| descendant.review == reviews)
+        {
+            if let Some(usage) = self.totals_by_turn.get(&descendant.id) {
+                totals.merge(usage.clone());
             }
         }
         totals.finish()
@@ -4098,7 +5212,8 @@ impl ActivityBatch {
                         self.totals_by_turn
                             .get(&turn.id)
                             .cloned()
-                            .unwrap_or_else(|| Totals::default().finish()),
+                            .unwrap_or_default()
+                            .finish(),
                     ),
                     id: turn.id.clone(),
                     turn_id: Some(turn.id.clone()),
@@ -4125,6 +5240,7 @@ impl ActivityBatch {
                     child_page_size: None,
                     child_total: None,
                     child_has_more: None,
+                    child_next_cursor: None,
                     counts: None,
                 }
             })
@@ -4285,6 +5401,7 @@ fn query_activity_on(
             child_page_size: None,
             child_total: None,
             child_has_more: None,
+            child_next_cursor: None,
             usage: Some(totals),
             counts: Some(counts),
         });
@@ -4394,6 +5511,7 @@ fn query_legacy_activity_item(
                 child_page_size: None,
                 child_total: None,
                 child_has_more: None,
+                child_next_cursor: None,
                 usage: None,
                 counts: None,
             });
@@ -4496,6 +5614,7 @@ fn query_legacy_activity_item(
         child_page_size: None,
         child_total: None,
         child_has_more: None,
+        child_next_cursor: None,
         usage: Some(totals),
         counts: None,
     }))
@@ -4560,7 +5679,7 @@ fn query_exchange_groups(
     let mut groups = Vec::new();
     let agent_turns = batch.turn_summaries(descendants, false);
     if !agent_turns.is_empty() {
-        let agent_usage = sum_activity_usage(&agent_turns);
+        let agent_usage = batch.descendant_totals(descendants, false);
         let agent_duration = activity_items_union_duration(&agent_turns);
         let mut labels = Vec::new();
         let mut seen = HashSet::new();
@@ -4595,6 +5714,7 @@ fn query_exchange_groups(
             child_page_size: None,
             child_total: None,
             child_has_more: None,
+            child_next_cursor: None,
             usage: Some(agent_usage),
             counts: None,
         });
@@ -4602,7 +5722,7 @@ fn query_exchange_groups(
 
     let review_turns = batch.turn_summaries(descendants, true);
     if !review_turns.is_empty() {
-        let review_usage = sum_activity_usage(&review_turns);
+        let review_usage = batch.descendant_totals(descendants, true);
         let review_duration = activity_items_union_duration(&review_turns);
         groups.push(ActivityItem {
             id: format!("group:reviews:{root_turn_id}"),
@@ -4626,6 +5746,7 @@ fn query_exchange_groups(
             child_page_size: None,
             child_total: None,
             child_has_more: None,
+            child_next_cursor: None,
             usage: Some(review_usage),
             counts: None,
         });
@@ -4649,28 +5770,6 @@ fn group_status(items: &[ActivityItem]) -> String {
     } else {
         "completed".into()
     }
-}
-
-fn sum_activity_usage(items: &[ActivityItem]) -> Totals {
-    let mut totals = Totals::default();
-    for usage in items.iter().filter_map(|item| item.usage.as_ref()) {
-        add_activity_usage(&mut totals, usage);
-    }
-    totals.finish()
-}
-
-fn add_activity_usage(target: &mut Totals, usage: &Totals) {
-    target.input_tokens = target.input_tokens.saturating_add(usage.input_tokens);
-    target.cached_input_tokens = target
-        .cached_input_tokens
-        .saturating_add(usage.cached_input_tokens);
-    target.output_tokens = target.output_tokens.saturating_add(usage.output_tokens);
-    target.reasoning_tokens = target
-        .reasoning_tokens
-        .saturating_add(usage.reasoning_tokens);
-    target.total_tokens = target.total_tokens.saturating_add(usage.total_tokens);
-    target.known_cost_usd += usage.known_cost_usd;
-    target.unpriced_tokens = target.unpriced_tokens.saturating_add(usage.unpriced_tokens);
 }
 
 fn activity_items_union_duration(items: &[ActivityItem]) -> Option<i64> {
@@ -4712,89 +5811,126 @@ fn query_activity_day_summaries_batched(
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
     )?;
     let thread_bounds = parse_activity_thread_bounds(&raw_thread_bounds.0, &raw_thread_bounds.1);
-    let mut statement = connection.prepare(
-        "WITH activity_rows(is_turn,started_at,completed_at,duration_ms) AS (
-             SELECT 1,started_at,completed_at,duration_ms FROM turns WHERE thread_id=?1
-             UNION ALL
-             SELECT 0,timestamp,NULL,duration_ms FROM events WHERE thread_id=?1
-             UNION ALL
-             SELECT 0,timestamp,NULL,NULL FROM messages WHERE thread_id=?1
-             UNION ALL
-             SELECT 0,timestamp,NULL,NULL FROM usage_facts WHERE thread_id=?1
-         )
-         SELECT * FROM activity_rows",
-    )?;
-    let rows = statement.query_map([thread_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)? != 0,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<i64>>(3)?,
-        ))
-    })?;
+    let intervals_may_cross_local_date = match thread_bounds {
+        Some((start, end)) => {
+            let occupied_end = end
+                .checked_sub_signed(Duration::milliseconds(1))
+                .unwrap_or(end);
+            start.with_timezone(&Local).date_naive()
+                != occupied_end.with_timezone(&Local).date_naive()
+        }
+        None => true,
+    };
     let mut dates = HashSet::new();
     let mut turn_intervals = Vec::new();
-    for row in rows {
-        let (is_turn, raw_start, raw_end, duration_ms) = row?;
+    let mut statement = connection.prepare(
+        "SELECT started_at,completed_at,duration_ms
+         FROM turns INDEXED BY idx_turns_thread_time
+         WHERE thread_id=?1",
+    )?;
+    for row in statement.query_map([thread_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
+    })? {
+        let (raw_start, raw_end, duration_ms) = row?;
         record_activity_row(
             &mut dates,
             &mut turn_intervals,
-            is_turn,
+            true,
             &raw_start,
             raw_end.as_deref(),
             duration_ms,
             thread_bounds,
         );
     }
+    drop(statement);
 
-    // Tool calls dominate large sessions. Their start dates can be collapsed inside SQLite;
-    // only the rare interval that crosses a local calendar boundary needs exact Rust parsing.
-    // This preserves day occupancy while avoiding one Rust allocation and RFC 3339 parse per
-    // historical call on the ordinary collapsed Activity page.
+    // Point activity is overwhelmingly concentrated in a handful of calendar days, but a
+    // large session can contain hundreds of thousands of rows on each one. Seek the first
+    // indexed timestamp at or after each local midnight, record that occupied date, then
+    // jump straight to the next midnight. This makes the collapsed Activity query
+    // proportional to occupied days instead of raw events/tool calls and also avoids the
+    // temporary B-trees created by GROUP BY date(...,'localtime').
     let mut statement = connection.prepare(
-        "SELECT date(started_at,'localtime'),
-                SUM(CASE WHEN date(
-                    COALESCE(
-                        CASE WHEN julianday(completed_at) IS NOT NULL THEN completed_at END,
-                        datetime(
-                            julianday(started_at)
-                            + CAST(MAX(COALESCE(duration_ms,0),0) AS REAL) / 86400000.0
-                        ),
-                        started_at
-                    ),
-                    'localtime'
-                )<>date(started_at,'localtime') THEN 1 ELSE 0 END)
-         FROM tool_calls
-         WHERE thread_id=?1 AND date(started_at,'localtime') IS NOT NULL
-         GROUP BY date(started_at,'localtime')",
+        "SELECT MIN(activity_at) FROM (
+             SELECT (
+                 SELECT timestamp FROM events INDEXED BY idx_events_thread_time
+                 WHERE thread_id=?1 AND timestamp>=?2
+                 ORDER BY timestamp,source_line LIMIT 1
+             ) activity_at
+             UNION ALL
+             SELECT (
+                 SELECT timestamp FROM messages INDEXED BY idx_messages_thread_time
+                 WHERE thread_id=?1 AND timestamp>=?2
+                 ORDER BY timestamp LIMIT 1
+             )
+             UNION ALL
+             SELECT (
+                 SELECT started_at FROM tool_calls INDEXED BY idx_tools_thread_time
+                 WHERE thread_id=?1 AND started_at>=?2
+                 ORDER BY started_at LIMIT 1
+             )
+         )
+         WHERE activity_at IS NOT NULL",
     )?;
-    let mut has_crossing_tool_intervals = false;
-    for row in statement.query_map([thread_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })? {
-        let (raw_date, crossing_intervals) = row?;
-        if let Ok(date) = NaiveDate::parse_from_str(&raw_date, "%Y-%m-%d") {
-            dates.insert(date);
+    let mut cursor = "0001-01-01T00:00:00".to_owned();
+    loop {
+        let next_timestamp = statement
+            .query_row(params![thread_id, cursor], |row| {
+                row.get::<_, Option<String>>(0)
+            })?
+            .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok());
+        let Some(next_timestamp) = next_timestamp else {
+            break;
+        };
+        let date = next_timestamp.with_timezone(&Local).date_naive();
+        dates.insert(date);
+        let Some(next_date) = date.succ_opt() else {
+            break;
+        };
+        let next_cursor = local_midnight(next_date)
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        if next_cursor <= cursor {
+            break;
         }
-        has_crossing_tool_intervals |= crossing_intervals > 0;
+        cursor = next_cursor;
     }
     drop(statement);
-    if has_crossing_tool_intervals {
+
+    // Exact interval handling is only needed when the trustworthy thread bounds cross a
+    // local date. The ordinary (and pathological dense) one-day case performs no interval
+    // scan at all; multi-day sessions keep the previous exact cross-midnight behavior.
+    if intervals_may_cross_local_date {
+        let mut statement = connection.prepare(
+            "SELECT timestamp,duration_ms
+             FROM events INDEXED BY idx_events_thread_time
+             WHERE thread_id=?1 AND COALESCE(duration_ms,0)>0",
+        )?;
+        let rows = statement.query_map([thread_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        for row in rows {
+            let (raw_start, duration_ms) = row?;
+            record_activity_row(
+                &mut dates,
+                &mut turn_intervals,
+                false,
+                &raw_start,
+                None,
+                duration_ms,
+                thread_bounds,
+            );
+        }
+
         let mut statement = connection.prepare(
             "SELECT started_at,completed_at,duration_ms
-             FROM tool_calls
+             FROM tool_calls INDEXED BY idx_tools_thread_time
              WHERE thread_id=?1
-               AND date(
-                    COALESCE(
-                        CASE WHEN julianday(completed_at) IS NOT NULL THEN completed_at END,
-                        datetime(
-                            julianday(started_at)
-                            + CAST(MAX(COALESCE(duration_ms,0),0) AS REAL) / 86400000.0
-                        ),
-                        started_at
-                    ),
-                    'localtime'
-               )<>date(started_at,'localtime')",
+               AND (completed_at IS NOT NULL OR COALESCE(duration_ms,0)>0)",
         )?;
         let rows = statement.query_map([thread_id], |row| {
             Ok((
@@ -4817,38 +5953,86 @@ fn query_activity_day_summaries_batched(
         }
     }
 
-    let mut totals_by_date = HashMap::<NaiveDate, Totals>::new();
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let mut totals_by_date = HashMap::<NaiveDate, FixedPointUsageTotals>::new();
     let mut statement = connection.prepare(
-        "SELECT timestamp,input_tokens,cached_input_tokens,output_tokens,
-                reasoning_tokens,total_tokens,COALESCE(cost_usd,0.0),
-                CASE WHEN price_known=0 THEN total_tokens ELSE 0 END
-         FROM priced_usage WHERE thread_id=?1",
+        "SELECT activity_hour,model,
+                COALESCE(SUM(input_tokens),0),
+                COALESCE(SUM(cached_input_tokens),0),
+                COALESCE(SUM(output_tokens),0),
+                COALESCE(SUM(reasoning_tokens),0),
+                COALESCE(SUM(total_tokens),0)
+         FROM usage_activity_rollups
+         WHERE thread_id=?1
+         GROUP BY activity_hour,model",
     )?;
     for row in statement.query_map([thread_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
-            Totals {
-                input_tokens: row.get::<_, i64>(1)?.max(0) as u64,
-                cached_input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
-                reasoning_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                total_tokens: row.get::<_, i64>(5)?.max(0) as u64,
-                known_cost_usd: row.get(6)?,
-                unpriced_tokens: row.get::<_, i64>(7)?.max(0) as u64,
-                ..Totals::default()
-            },
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?.max(0),
+            row.get::<_, i64>(3)?.max(0),
+            row.get::<_, i64>(4)?.max(0),
+            row.get::<_, i64>(5)?.max(0),
+            row.get::<_, i64>(6)?.max(0) as u64,
         ))
     })? {
-        let (timestamp, usage) = row?;
-        let Ok(timestamp) = DateTime::parse_from_rfc3339(&timestamp) else {
-            continue;
-        };
-        add_activity_usage(
-            totals_by_date
-                .entry(timestamp.with_timezone(&Local).date_naive())
-                .or_default(),
-            &usage,
-        );
+        let (
+            activity_hour,
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            total_tokens,
+        ) = row?;
+        let (hour_start, hour_end) = usage_rollup_hour_window(&activity_hour)?;
+        let (start_date, end_date) = usage_rollup_bucket_dates(hour_start, hour_end, &Local);
+        if start_date == end_date {
+            let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
+                connection,
+                &aliases,
+                &prices,
+                UsageRollupScope::Thread,
+                thread_id,
+                &activity_hour,
+                &model,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                total_tokens,
+            )?;
+            dates.insert(start_date);
+            totals_by_date.entry(start_date).or_default().add_group(
+                input_tokens as u64,
+                cached_input_tokens as u64,
+                output_tokens as u64,
+                reasoning_tokens as u64,
+                total_tokens,
+                known_cost_numerator,
+                unpriced_tokens,
+            );
+        } else {
+            // Sub-hour UTC offsets can place local midnight inside a UTC-hour
+            // bucket. Only that boundary bucket falls back to raw indexed rows;
+            // every full bucket remains compact and time-zone independent.
+            let split_totals = usage_rollup_local_day_splits_on(
+                connection,
+                &aliases,
+                &prices,
+                UsageRollupExceptionalQuery {
+                    scope: UsageRollupScope::Thread,
+                    thread_id,
+                    model: &model,
+                    start: &sql_timestamp(hour_start),
+                    end: &sql_timestamp(hour_end),
+                },
+            )?;
+            for (date, totals) in split_totals {
+                dates.insert(date);
+                totals_by_date.entry(date).or_default().merge(totals);
+            }
+        }
     }
 
     let mut dates = dates.into_iter().collect::<Vec<_>>();
@@ -4966,7 +6150,9 @@ fn insert_activity_interval_dates(
 
 fn activity_day_window(date: NaiveDate) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
     let next_date = date.succ_opt()?;
-    Some((local_midnight(date), local_midnight(next_date)))
+    let start = local_midnight(date);
+    let end = local_midnight(next_date);
+    (start < end).then_some((start, end))
 }
 
 fn activity_union_duration(
@@ -5023,12 +6209,31 @@ fn query_activity_detail_on(
     )
 }
 
+#[cfg(test)]
 fn query_activity_detail_page_on(
     connection: &Connection,
     thread_id: &str,
     item_id: &str,
     child_page: u64,
     child_page_size: u64,
+) -> Result<Option<ActivityItem>> {
+    query_activity_detail_cursor_page_on(
+        connection,
+        thread_id,
+        item_id,
+        child_page,
+        child_page_size,
+        None,
+    )
+}
+
+fn query_activity_detail_cursor_page_on(
+    connection: &Connection,
+    thread_id: &str,
+    item_id: &str,
+    child_page: u64,
+    child_page_size: u64,
+    child_cursor: Option<&str>,
 ) -> Result<Option<ActivityItem>> {
     let root_rollout_id = query_root_rollout_id(connection, thread_id)?;
     if item_id == legacy_activity_id(thread_id) {
@@ -5092,6 +6297,7 @@ fn query_activity_detail_page_on(
                     child_page_size: None,
                     child_total: None,
                     child_has_more: None,
+                    child_next_cursor: None,
                     usage: None,
                     counts: None,
                 })
@@ -5140,12 +6346,13 @@ fn query_activity_detail_page_on(
             );
             turn.counts = Some(counts.clone());
             turn.usage = Some(batch.exchange_totals(item_id, &descendants));
-            let child_page = query_activity_child_previews_page(
+            let child_page = query_activity_child_previews_cursor_page(
                 connection,
                 thread_id,
                 item_id,
                 child_page,
                 child_page_size,
+                child_cursor,
             )?;
             turn.children = child_page.items;
             let mut groups =
@@ -5163,6 +6370,7 @@ fn query_activity_detail_page_on(
             turn.child_page_size = Some(child_page.page_size);
             turn.child_total = Some(child_page.total);
             turn.child_has_more = Some(child_page.has_more);
+            turn.child_next_cursor = child_page.next_cursor;
             turn.children.sort_by(|left, right| {
                 right
                     .timestamp
@@ -5182,18 +6390,20 @@ fn query_activity_detail_page_on(
                     "Agent response".into()
                 }
             }));
-            let child_page = query_activity_child_previews_page(
+            let child_page = query_activity_child_previews_cursor_page(
                 connection,
                 thread_id,
                 item_id,
                 child_page,
                 child_page_size,
+                child_cursor,
             )?;
             turn.children = child_page.items;
             turn.child_page = Some(child_page.page);
             turn.child_page_size = Some(child_page.page_size);
             turn.child_total = Some(child_page.total);
             turn.child_has_more = Some(child_page.has_more);
+            turn.child_next_cursor = child_page.next_cursor;
             turn.usage = Some(query_activity_turn_totals_on(
                 connection, thread_id, item_id,
             )?);
@@ -5216,7 +6426,7 @@ fn query_activity_detail_page_on(
         return Ok(Some(turn));
     }
 
-    let mut event = connection
+    let event = connection
         .query_row(
             "SELECT e.id,e.turn_id,e.rollout_id,e.agent_run_id,e.timestamp,e.kind,e.role,e.label,
                     COALESCE(e.body,m.content),COALESCE(tc.status,e.status),
@@ -5226,7 +6436,8 @@ fn query_activity_detail_page_on(
                             CAST(ROUND((julianday(tc.completed_at)-julianday(tc.started_at))*86400000.0)
                                 AS INTEGER)
                         END),
-                    e.model,e.effort,a.nickname,a.agent_path,tc.namespace,e.source_line
+                    e.model,e.effort,a.nickname,a.agent_path,tc.namespace,e.source_line,
+                    e.call_id
              FROM events e
              LEFT JOIN messages m
                ON m.id=COALESCE(e.call_id,e.id) AND m.thread_id=e.thread_id
@@ -5252,44 +6463,195 @@ fn query_activity_detail_page_on(
                     .get::<_, Option<String>>(14)?
                     .or(row.get::<_, Option<String>>(15)?);
                 let tool_namespace = row.get::<_, Option<String>>(16)?;
-                Ok(ActivityItem {
-                    id: row.get(0)?,
-                    turn_id: row.get(1)?,
-                    rollout_id: row.get(2)?,
-                    agent_run_id: row.get(3)?,
-                    agent_label,
-                    timestamp: row.get(4)?,
-                    kind: normalize_activity_kind(&stored_kind, role.as_deref()),
-                    role,
-                    label: row.get(7)?,
-                    has_details: body.is_some(),
-                    body,
-                    status: row.get(9)?,
-                    tool_name: stored_tool_name
-                        .map(|name| display_tool_name(tool_namespace.as_deref(), &name)),
-                    duration_ms: row.get(11)?,
-                    model: row.get(12)?,
-                    effort: row.get(13)?,
-                    children: Vec::new(),
-                    child_page: None,
-                    child_page_size: None,
-                    child_total: None,
-                    child_has_more: None,
-                    usage: None,
-                    counts: None,
-                })
+                let kind = normalize_activity_kind(&stored_kind, role.as_deref());
+                Ok((
+                    ActivityItem {
+                        id: row.get(0)?,
+                        turn_id: row.get(1)?,
+                        rollout_id: row.get(2)?,
+                        agent_run_id: row.get(3)?,
+                        agent_label,
+                        timestamp: row.get(4)?,
+                        kind,
+                        role,
+                        label: row.get(7)?,
+                        has_details: body.is_some(),
+                        body,
+                        status: row.get(9)?,
+                        tool_name: stored_tool_name
+                            .map(|name| display_tool_name(tool_namespace.as_deref(), &name)),
+                        duration_ms: row.get(11)?,
+                        model: row.get(12)?,
+                        effort: row.get(13)?,
+                        children: Vec::new(),
+                        child_page: None,
+                        child_page_size: None,
+                        child_total: None,
+                        child_has_more: None,
+                        child_next_cursor: None,
+                        usage: None,
+                        counts: None,
+                    },
+                    stored_kind,
+                    row.get::<_, i64>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                ))
             },
         )
         .optional()?;
-    if let Some(item) = event.as_mut()
-        && let Some(turn_id) = item.turn_id.as_deref()
-    {
-        item.usage = query_activity_child_previews(connection, thread_id, Some(turn_id))?
-            .into_iter()
-            .find(|preview| preview.id == item.id)
-            .and_then(|preview| preview.usage);
+    let Some((mut item, stored_kind, source_line, call_id)) = event else {
+        return Ok(None);
+    };
+    if item.turn_id.is_some() {
+        item.usage = query_activity_event_usage_on(
+            connection,
+            thread_id,
+            &item,
+            &stored_kind,
+            source_line,
+            call_id.as_deref(),
+        )?;
     }
-    Ok(event)
+    Ok(Some(item))
+}
+
+fn query_activity_event_usage_on(
+    connection: &Connection,
+    thread_id: &str,
+    item: &ActivityItem,
+    stored_kind: &str,
+    source_line: i64,
+    call_id: Option<&str>,
+) -> Result<Option<Totals>> {
+    if !matches!(
+        item.kind.as_str(),
+        "assistant" | "update" | "final" | "reasoning" | "tool" | "subagent"
+    ) {
+        return Ok(None);
+    }
+    let turn_id = item.turn_id.as_deref();
+    let visible = if stored_kind == "tool_call" && call_id.is_some() {
+        connection.query_row(
+            "SELECT NOT EXISTS(
+                 SELECT 1 FROM events earlier
+                 WHERE earlier.thread_id=?1 AND earlier.rollout_id=?2
+                   AND earlier.turn_id IS ?3 AND earlier.kind='tool_call'
+                   AND earlier.call_id=?4
+                   AND (earlier.source_line<?5
+                        OR (earlier.source_line=?5 AND earlier.id<?6))
+             )",
+            params![
+                thread_id,
+                item.rollout_id,
+                turn_id,
+                call_id,
+                source_line,
+                item.id
+            ],
+            |row| row.get::<_, i64>(0),
+        )? != 0
+    } else if stored_kind == "turn_completed" {
+        connection.query_row(
+            "SELECT NOT EXISTS(
+                 SELECT 1
+                 FROM events final_event
+                 LEFT JOIN messages final_message
+                   ON final_message.id=COALESCE(final_event.call_id,final_event.id)
+                  AND final_message.thread_id=final_event.thread_id
+                 WHERE final_event.thread_id=?1 AND final_event.turn_id IS ?2
+                   AND final_event.kind='final'
+                   AND trim(COALESCE(
+                       final_event.body,final_message.content,''
+                   ))<>''
+             )",
+            params![thread_id, turn_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0
+    } else {
+        true
+    };
+    if !visible {
+        return Ok(None);
+    }
+
+    let next_source_line = source_line.saturating_add(1);
+    let following_owner = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM events e
+             WHERE e.thread_id=?1 AND e.rollout_id=?2 AND e.turn_id IS ?3
+               AND e.source_line=?4
+               AND (
+                    e.kind IN (
+                        'assistant','update','final','reasoning','tool_call','subagent',
+                        'turn_completed'
+                    )
+                    OR (e.kind='message' AND COALESCE(e.role,'')<>'user')
+               )
+               AND (e.kind<>'turn_completed' OR NOT EXISTS(
+                    SELECT 1
+                    FROM events final_event
+                    LEFT JOIN messages final_message
+                      ON final_message.id=COALESCE(final_event.call_id,final_event.id)
+                     AND final_message.thread_id=final_event.thread_id
+                    WHERE final_event.thread_id=e.thread_id
+                      AND final_event.turn_id=e.turn_id
+                      AND final_event.kind='final'
+                      AND trim(COALESCE(
+                          final_event.body,final_message.content,''
+                      ))<>''
+               ))
+               AND (e.kind<>'tool_call' OR e.call_id IS NULL OR NOT EXISTS(
+                    SELECT 1 FROM events earlier
+                    WHERE earlier.thread_id=e.thread_id
+                      AND earlier.rollout_id=e.rollout_id
+                      AND earlier.turn_id IS e.turn_id
+                      AND earlier.kind='tool_call' AND earlier.call_id=e.call_id
+                      AND (earlier.source_line<e.source_line
+                           OR (earlier.source_line=e.source_line AND earlier.id<e.id))
+               ))
+             LIMIT 1
+         )",
+        params![thread_id, item.rollout_id, turn_id, next_source_line],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    let second_source_line = source_line.saturating_add(2);
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let mut statement = connection.prepare(
+        "SELECT timestamp,model,input_tokens,cached_input_tokens,output_tokens,
+                reasoning_tokens,total_tokens
+         FROM usage_facts
+         WHERE thread_id=?1 AND rollout_id=?2 AND turn_id IS ?3
+           AND (source_line=?4 OR (source_line=?5 AND ?6=0))
+         ORDER BY source_line,id",
+    )?;
+    let mut rows = statement.query(params![
+        thread_id,
+        item.rollout_id,
+        turn_id,
+        next_source_line,
+        second_source_line,
+        i64::from(following_owner)
+    ])?;
+    let mut totals = FixedPointUsageTotals::default();
+    let mut usage_rows = 0u64;
+    while let Some(row) = rows.next()? {
+        let timestamp = row.get::<_, String>(0)?;
+        let model = row.get::<_, String>(1)?;
+        add_usage_fact_to_totals(
+            &mut totals,
+            &aliases,
+            &prices,
+            &timestamp,
+            &model,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+        );
+        usage_rows += 1;
+    }
+    Ok((usage_rows > 0).then(|| totals.finish()))
 }
 
 fn parse_activity_group_id(item_id: &str) -> Option<(bool, &str)> {
@@ -5378,6 +6740,10 @@ fn page_existing_activity_children(item: &mut ActivityItem, page: u64, page_size
     item.child_page_size = Some(page_size);
     item.child_total = Some(total);
     item.child_has_more = Some(page < total_pages);
+    // Legacy and synthetic group children are already bounded in memory and
+    // retain numeric pagination. Never leak a stale cursor from an Activity
+    // item that was previously populated through the indexed turn path.
+    item.child_next_cursor = None;
 }
 
 fn query_activity_turn_totals_on(
@@ -5385,30 +6751,68 @@ fn query_activity_turn_totals_on(
     thread_id: &str,
     turn_id: &str,
 ) -> Result<Totals> {
-    connection
-        .query_row(
-            "SELECT COALESCE(SUM(input_tokens),0),
-                    COALESCE(SUM(cached_input_tokens),0),COALESCE(SUM(output_tokens),0),
-                    COALESCE(SUM(reasoning_tokens),0),COALESCE(SUM(total_tokens),0),
-                    COALESCE(SUM(cost_usd),0.0),
-                    COALESCE(SUM(CASE WHEN price_known=0 THEN total_tokens ELSE 0 END),0)
-             FROM priced_usage WHERE thread_id=?1 AND turn_id=?2",
-            params![thread_id, turn_id],
-            |row| {
-                Ok(Totals {
-                    input_tokens: row.get::<_, i64>(0)?.max(0) as u64,
-                    cached_input_tokens: row.get::<_, i64>(1)?.max(0) as u64,
-                    output_tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                    reasoning_tokens: row.get::<_, i64>(3)?.max(0) as u64,
-                    total_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                    known_cost_usd: row.get(5)?,
-                    unpriced_tokens: row.get::<_, i64>(6)?.max(0) as u64,
-                    ..Totals::default()
-                }
-                .finish())
-            },
-        )
-        .map_err(Into::into)
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let groups = {
+        let mut statement = connection.prepare(
+            "SELECT activity_hour,model,
+                    COALESCE(SUM(input_tokens),0),
+                    COALESCE(SUM(cached_input_tokens),0),
+                    COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(reasoning_tokens),0),
+                    COALESCE(SUM(total_tokens),0)
+             FROM usage_activity_rollups INDEXED BY idx_usage_activity_rollups_turn
+             WHERE thread_id=?1 AND turn_key=?2
+             GROUP BY activity_hour,model",
+        )?;
+        statement
+            .query_map(params![thread_id, turn_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.max(0),
+                    row.get::<_, i64>(3)?.max(0),
+                    row.get::<_, i64>(4)?.max(0),
+                    row.get::<_, i64>(5)?.max(0),
+                    row.get::<_, i64>(6)?.max(0) as u64,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut totals = FixedPointUsageTotals::default();
+    for (
+        activity_hour,
+        model,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        total_tokens,
+    ) in groups
+    {
+        let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
+            connection,
+            &aliases,
+            &prices,
+            UsageRollupScope::Turn(turn_id),
+            thread_id,
+            &activity_hour,
+            &model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            total_tokens,
+        )?;
+        totals.add_group(
+            input_tokens as u64,
+            cached_input_tokens as u64,
+            output_tokens as u64,
+            reasoning_tokens as u64,
+            total_tokens,
+            known_cost_numerator,
+            unpriced_tokens,
+        );
+    }
+    Ok(totals.finish())
 }
 
 fn query_activity_child_previews(
@@ -5416,8 +6820,12 @@ fn query_activity_child_previews(
     thread_id: &str,
     turn_id: Option<&str>,
 ) -> Result<Vec<ActivityItem>> {
-    populate_activity_child_events(connection, thread_id, turn_id)?;
-    query_activity_child_preview_rows(connection, thread_id, turn_id, -1, 0)
+    let indexed = if let Some(turn_id) = turn_id {
+        activity_index::query_all_in_turn(connection, thread_id, turn_id)?
+    } else {
+        activity_index::query_all(connection, thread_id)?
+    };
+    query_activity_child_preview_rows(connection, thread_id, turn_id, &indexed)
 }
 
 struct ActivityChildrenPage {
@@ -5426,8 +6834,10 @@ struct ActivityChildrenPage {
     page_size: u64,
     total: u64,
     has_more: bool,
+    next_cursor: Option<String>,
 }
 
+#[cfg(test)]
 fn query_activity_child_previews_page(
     connection: &rusqlite::Connection,
     thread_id: &str,
@@ -5435,84 +6845,84 @@ fn query_activity_child_previews_page(
     page: u64,
     page_size: u64,
 ) -> Result<ActivityChildrenPage> {
-    let total = populate_activity_child_events(connection, thread_id, Some(turn_id))?;
-    let total_pages = total.div_ceil(page_size).max(1);
-    let page = page.min(total_pages).max(1);
-    let offset = page
-        .saturating_sub(1)
-        .saturating_mul(page_size)
-        .min(i64::MAX as u64) as i64;
-    let items = query_activity_child_preview_rows(
+    query_activity_child_previews_cursor_page(connection, thread_id, turn_id, page, page_size, None)
+}
+
+fn query_activity_child_previews_cursor_page(
+    connection: &rusqlite::Connection,
+    thread_id: &str,
+    turn_id: &str,
+    page: u64,
+    page_size: u64,
+    cursor: Option<&str>,
+) -> Result<ActivityChildrenPage> {
+    let requested_page = page.max(1);
+    let fallback_offset = requested_page.saturating_sub(1).saturating_mul(page_size);
+    let mut indexed = activity_index::query_page(
         connection,
         thread_id,
-        Some(turn_id),
-        page_size.min(i64::MAX as u64) as i64,
-        offset,
+        turn_id,
+        page_size,
+        cursor,
+        fallback_offset,
     )?;
+    let total = indexed.total;
+    let total_pages = total.div_ceil(page_size).max(1);
+    // Numeric pages remain a compatibility path for old bookmarks and direct
+    // tests. The browser uses the opaque cursor, so ordinary Load More calls
+    // never walk an OFFSET proportional to the complete turn history.
+    let page = if cursor.is_some() {
+        requested_page
+    } else {
+        requested_page.min(total_pages)
+    };
+    if cursor.is_none() && page != requested_page {
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
+        indexed =
+            activity_index::query_page(connection, thread_id, turn_id, page_size, None, offset)?;
+    }
+    let items =
+        query_activity_child_preview_rows(connection, thread_id, Some(turn_id), &indexed.events)?;
     Ok(ActivityChildrenPage {
         items,
         page,
         page_size,
         total,
-        has_more: page < total_pages,
+        has_more: indexed.next_cursor.is_some(),
+        next_cursor: indexed.next_cursor,
     })
-}
-
-fn populate_activity_child_events(
-    connection: &rusqlite::Connection,
-    thread_id: &str,
-    turn_id: Option<&str>,
-) -> Result<u64> {
-    connection.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS selected_activity_child_events(
-             event_id TEXT PRIMARY KEY
-         ) WITHOUT ROWID;
-         DELETE FROM selected_activity_child_events;",
-    )?;
-    let inserted = connection.execute(
-        "WITH ranked_tool_calls AS MATERIALIZED (
-             SELECT e.id,ROW_NUMBER() OVER (
-                 PARTITION BY e.rollout_id,e.call_id
-                 ORDER BY e.source_line,e.id
-             ) lifecycle_rank
-             FROM events e
-             WHERE e.thread_id=?1 AND e.kind='tool_call' AND e.call_id IS NOT NULL
-         ), first_tool_calls AS (
-             SELECT id FROM ranked_tool_calls WHERE lifecycle_rank=1
-         ), turns_with_final AS MATERIALIZED (
-             SELECT DISTINCT final_event.turn_id
-             FROM events final_event
-             LEFT JOIN messages final_message
-               ON final_message.id=COALESCE(final_event.call_id,final_event.id)
-              AND final_message.thread_id=final_event.thread_id
-             WHERE final_event.thread_id=?1
-               AND (?2 IS NULL OR final_event.turn_id=?2)
-               AND final_event.kind='final'
-               AND trim(COALESCE(final_event.body,final_message.content,''))<>''
-         )
-         INSERT INTO selected_activity_child_events(event_id)
-         SELECT e.id
-         FROM events e
-         LEFT JOIN first_tool_calls first_tool ON first_tool.id=e.id
-         LEFT JOIN turns_with_final final ON final.turn_id=e.turn_id
-         WHERE e.thread_id=?1 AND (?2 IS NULL OR e.turn_id=?2)
-           AND e.kind NOT IN ('turn_started','system','tool_output','tool_completed')
-           AND (e.kind<>'tool_call' OR e.call_id IS NULL OR first_tool.id IS NOT NULL)
-           AND (e.kind<>'turn_completed' OR final.turn_id IS NULL)",
-        params![thread_id, turn_id],
-    )?;
-    Ok(inserted as u64)
 }
 
 fn query_activity_child_preview_rows(
     connection: &rusqlite::Connection,
     thread_id: &str,
     turn_id: Option<&str>,
-    limit: i64,
-    offset: i64,
+    indexed: &[activity_index::IndexedActivityEvent],
 ) -> Result<Vec<ActivityItem>> {
+    if indexed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let requested = serde_json::to_string(
+        &indexed
+            .iter()
+            .enumerate()
+            .map(|(ordinal, event)| {
+                serde_json::json!({
+                    "ordinal": ordinal,
+                    "eventId": event.event_id,
+                    "sourceLine": event.source_line,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )?;
     let mut statement = connection.prepare(
-        "SELECT e.id,e.turn_id,e.rollout_id,e.agent_run_id,e.timestamp,e.kind,e.role,e.label,
+        "WITH selected AS MATERIALIZED (
+             SELECT CAST(key AS INTEGER) ordinal,
+                    json_extract(value,'$.eventId') event_id,
+                    CAST(json_extract(value,'$.sourceLine') AS INTEGER) source_line
+             FROM json_each(?1)
+         )
+         SELECT e.id,e.turn_id,e.rollout_id,e.agent_run_id,e.timestamp,e.kind,e.role,e.label,
                 CASE WHEN e.kind='user' OR e.role='user' THEN
                     COALESCE(NULLIF(e.body,''),NULLIF(m.content,''))
                 WHEN e.kind='tool_call' THEN NULL
@@ -5524,9 +6934,9 @@ fn query_activity_child_preview_rows(
                             AS INTEGER)
                     END),e.model,e.effort,
                 CASE WHEN e.body IS NOT NULL OR m.content IS NOT NULL THEN 1 ELSE 0 END,
-                a.nickname,a.agent_path,tc.namespace,e.source_line
-         FROM selected_activity_child_events selected
-         JOIN events e ON e.id=selected.event_id
+                a.nickname,a.agent_path,tc.namespace,selected.source_line
+         FROM selected
+         JOIN events e ON e.id=selected.event_id AND e.thread_id=?2
          LEFT JOIN messages m
            ON m.id=COALESCE(e.call_id,e.id) AND m.thread_id=e.thread_id
          LEFT JOIN tool_calls tc
@@ -5534,12 +6944,10 @@ fn query_activity_child_preview_rows(
           AND tc.thread_id=e.thread_id
          LEFT JOIN agent_runs a
            ON a.id=e.agent_run_id AND a.thread_id=e.thread_id
-         WHERE e.thread_id=?1 AND (?2 IS NULL OR e.turn_id=?2)
-         ORDER BY e.timestamp DESC,e.source_line DESC,e.id DESC
-         LIMIT ?4 OFFSET ?5",
+         ORDER BY selected.ordinal",
     )?;
     let rows = statement.query_map(
-        params![thread_id, turn_id, ACTIVITY_PREVIEW_CHARS, limit, offset],
+        params![requested, thread_id, ACTIVITY_PREVIEW_CHARS],
         |row| {
             let stored_kind: String = row.get(5)?;
             let role: Option<String> = row.get(6)?;
@@ -5578,6 +6986,7 @@ fn query_activity_child_preview_rows(
                     child_page_size: None,
                     child_total: None,
                     child_has_more: None,
+                    child_next_cursor: None,
                     usage: None,
                     counts: None,
                 },
@@ -5597,74 +7006,141 @@ fn query_activity_child_preview_rows(
 fn attribute_activity_usage(
     connection: &rusqlite::Connection,
     thread_id: &str,
-    turn_id: Option<&str>,
+    _turn_id: Option<&str>,
     items: &mut [(ActivityItem, i64)],
 ) -> Result<()> {
-    let owners = items
-        .iter()
-        .enumerate()
-        .filter(|(_, (item, _))| {
-            matches!(
-                item.kind.as_str(),
-                "assistant" | "update" | "final" | "reasoning" | "tool" | "subagent"
-            )
-        })
-        .map(|(index, (item, source_line))| {
-            (
-                (item.rollout_id.clone(), item.turn_id.clone(), *source_line),
-                index,
-            )
-        })
-        .collect::<HashMap<_, _>>();
+    // Attribution is an intrinsic property of the complete event stream, not of
+    // whichever neighboring owners happen to be present on this page. Resolve
+    // every returned owner against its indexed source-line window in one
+    // statement. Besides making every representation agree, this changes a
+    // child page from a full-turn usage scan to at most two usage source lines
+    // per visible owner without introducing an N+1 query pattern.
+    if items.is_empty() {
+        return Ok(());
+    }
+    let requested = serde_json::Value::Array(
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, (item, _))| {
+                matches!(
+                    item.kind.as_str(),
+                    "assistant" | "update" | "final" | "reasoning" | "tool" | "subagent"
+                )
+            })
+            .map(|(index, (item, source_line))| {
+                serde_json::json!({
+                    "ordinal": index,
+                    "rolloutId": item.rollout_id,
+                    "turnId": item.turn_id,
+                    "sourceLine": source_line,
+                })
+            })
+            .collect(),
+    );
+    let requested = serde_json::to_string(&requested)?;
     let mut statement = connection.prepare(
-        "SELECT rollout_id,turn_id,source_line,input_tokens,cached_input_tokens,
-                output_tokens,reasoning_tokens,total_tokens,COALESCE(cost_usd,0.0),
-                CASE WHEN price_known=0 THEN total_tokens ELSE 0 END
-         FROM priced_usage
-         WHERE thread_id=?1 AND (?2 IS NULL OR turn_id=?2)
-         ORDER BY timestamp,source_line,id",
+        "WITH requested AS MATERIALIZED (
+             SELECT CAST(json_extract(value,'$.ordinal') AS INTEGER) ordinal,
+                    json_extract(value,'$.rolloutId') rollout_id,
+                    json_extract(value,'$.turnId') turn_id,
+                    CAST(json_extract(value,'$.sourceLine') AS INTEGER) source_line
+             FROM json_each(?1)
+         )
+         SELECT requested.ordinal,p.timestamp,p.model,p.input_tokens,
+                p.cached_input_tokens,p.output_tokens,p.reasoning_tokens,p.total_tokens
+         FROM requested
+         JOIN usage_facts p
+           ON p.thread_id=?2 AND p.rollout_id=requested.rollout_id
+          AND p.turn_id IS requested.turn_id
+          AND (
+               p.source_line=requested.source_line+1
+               OR (
+                    p.source_line=requested.source_line+2
+                    AND NOT EXISTS(
+                        SELECT 1 FROM events e
+                        WHERE e.thread_id=?2
+                          AND e.rollout_id=requested.rollout_id
+                          AND e.turn_id IS requested.turn_id
+                          AND e.source_line=requested.source_line+1
+                          AND (
+                               e.kind IN (
+                                   'assistant','update','final','reasoning','tool_call',
+                                   'subagent','turn_completed'
+                               )
+                               OR (e.kind='message' AND COALESCE(e.role,'')<>'user')
+                          )
+                          AND (e.kind<>'turn_completed' OR NOT EXISTS(
+                               SELECT 1
+                               FROM events final_event
+                               LEFT JOIN messages final_message
+                                 ON final_message.id=COALESCE(final_event.call_id,final_event.id)
+                                AND final_message.thread_id=final_event.thread_id
+                               WHERE final_event.thread_id=e.thread_id
+                                 AND final_event.turn_id=e.turn_id
+                                 AND final_event.kind='final'
+                                 AND trim(COALESCE(
+                                     final_event.body,final_message.content,''
+                                 ))<>''
+                          ))
+                          AND (e.kind<>'tool_call' OR e.call_id IS NULL OR NOT EXISTS(
+                               SELECT 1 FROM events earlier
+                               WHERE earlier.thread_id=e.thread_id
+                                 AND earlier.rollout_id=e.rollout_id
+                                 AND earlier.turn_id IS e.turn_id
+                                 AND earlier.kind='tool_call'
+                                 AND earlier.call_id=e.call_id
+                                 AND (earlier.source_line<e.source_line
+                                      OR (earlier.source_line=e.source_line
+                                          AND earlier.id<e.id))
+                          ))
+                        LIMIT 1
+                    )
+               )
+          )
+         ORDER BY requested.ordinal,p.source_line,p.id",
     )?;
-    let usage_rows = statement.query_map(params![thread_id, turn_id], |row| {
+    let rows = statement.query_map(params![requested, thread_id], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, i64>(2)?,
-            Totals {
-                input_tokens: row.get::<_, i64>(3)?.max(0) as u64,
-                cached_input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                output_tokens: row.get::<_, i64>(5)?.max(0) as u64,
-                reasoning_tokens: row.get::<_, i64>(6)?.max(0) as u64,
-                total_tokens: row.get::<_, i64>(7)?.max(0) as u64,
-                known_cost_usd: row.get(8)?,
-                unpriced_tokens: row.get::<_, i64>(9)?.max(0) as u64,
-                ..Totals::default()
-            },
+            row.get::<_, i64>(0)?.max(0) as usize,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
         ))
     })?;
-    for usage_row in usage_rows {
-        let (rollout_id, usage_turn_id, source_line, usage) = usage_row?;
-        let owner_index = [1_i64, 2_i64].into_iter().find_map(|distance| {
-            owners
-                .get(&(
-                    rollout_id.clone(),
-                    usage_turn_id.clone(),
-                    source_line.saturating_sub(distance),
-                ))
-                .copied()
-        });
-        if let Some(owner_index) = owner_index {
-            add_activity_usage(
-                items[owner_index]
-                    .0
-                    .usage
-                    .get_or_insert_with(Totals::default),
-                &usage,
-            );
-        }
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let mut totals_by_ordinal = HashMap::<usize, FixedPointUsageTotals>::new();
+    for row in rows {
+        let (
+            ordinal,
+            timestamp,
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            total_tokens,
+        ) = row?;
+        add_usage_fact_to_totals(
+            totals_by_ordinal.entry(ordinal).or_default(),
+            &aliases,
+            &prices,
+            &timestamp,
+            &model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            total_tokens,
+        );
     }
-    for (item, _) in items {
-        if let Some(usage) = item.usage.take() {
-            item.usage = Some(usage.finish());
+    for (ordinal, totals) in totals_by_ordinal {
+        if let Some((item, _)) = items.get_mut(ordinal) {
+            item.usage = Some(totals.finish());
         }
     }
     Ok(())
@@ -5701,11 +7177,6 @@ fn normalize_activity_kind(kind: &str, role: Option<&str>) -> String {
 
 type StatsBucket = (DateTime<Utc>, DateTime<Utc>, String);
 
-// This is a corruption/adversarial-input guard rather than a retention rule.
-// Normal Codex history spans only a few years, while an unbounded loop here
-// can manufacture an arbitrarily large JSON response from one bad timestamp.
-const MAX_ALL_TIME_YEAR_BUCKETS: i32 = 200;
-
 fn stats_buckets_on(
     connection: &Connection,
     range: &str,
@@ -5722,20 +7193,35 @@ fn stats_buckets_on(
                 buckets.push((
                     cursor,
                     next,
-                    cursor.with_timezone(&Local).format("%H:00").to_string(),
+                    cursor.with_timezone(&Local).format("%H:%M").to_string(),
                 ));
                 cursor = next;
+            }
+            let labels = disambiguate_repeated_labels(
+                buckets
+                    .iter()
+                    .map(|(start, _, label)| {
+                        (
+                            label.clone(),
+                            start.with_timezone(&Local).format("%:z").to_string(),
+                        )
+                    })
+                    .collect(),
+            );
+            for ((_, _, label), disambiguated) in buckets.iter_mut().zip(labels) {
+                *label = disambiguated;
             }
         }
         "week" => {
             let monday = anchor - Duration::days(anchor.weekday().num_days_from_monday() as i64);
             for offset in 0..7 {
                 let date = monday + Duration::days(offset);
-                buckets.push((
+                push_nonempty_stats_bucket(
+                    &mut buckets,
                     local_midnight(date),
                     local_midnight(date + Duration::days(1)),
                     date.format("%a %-d").to_string(),
-                ));
+                );
             }
         }
         "month" => {
@@ -5745,11 +7231,12 @@ fn stats_buckets_on(
                 .checked_add_months(Months::new(1))
                 .context("invalid month")?;
             while date < end {
-                buckets.push((
+                push_nonempty_stats_bucket(
+                    &mut buckets,
                     local_midnight(date),
                     local_midnight(date + Duration::days(1)),
                     date.format("%Y-%m-%d").to_string(),
-                ));
+                );
                 date += Duration::days(1);
             }
         }
@@ -5760,44 +7247,115 @@ fn stats_buckets_on(
                 let next = date
                     .checked_add_months(Months::new(1))
                     .context("invalid month")?;
-                buckets.push((
+                push_nonempty_stats_bucket(
+                    &mut buckets,
                     local_midnight(date),
                     local_midnight(next),
                     date.format("%b").to_string(),
-                ));
+                );
             }
         }
         _ => {
-            let first: Option<String> = connection.query_row(
-                "SELECT MIN(timestamp) FROM (
-                    SELECT MIN(timestamp) timestamp FROM events
-                    UNION ALL SELECT MIN(timestamp) FROM usage_facts
-                    UNION ALL SELECT MIN(timestamp) FROM messages
-                 )",
-                [],
-                |row| row.get(0),
-            )?;
-            let first_year = first
-                .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
-                .map(|value| value.with_timezone(&Local).year())
-                .unwrap_or(anchor.year());
-            let year_count = anchor
-                .year()
-                .checked_sub(first_year)
-                .and_then(|difference| difference.checked_add(1))
-                .context("invalid all-time year span")?;
-            anyhow::ensure!(
-                (1..=MAX_ALL_TIME_YEAR_BUCKETS).contains(&year_count),
-                "all-time usage spans {year_count} years; maximum supported span is {MAX_ALL_TIME_YEAR_BUCKETS}"
-            );
-            for year in first_year..=anchor.year() {
+            let mut years = occupied_local_years_on(connection)?;
+            if years.is_empty() || years.iter().any(|year| *year <= anchor.year()) {
+                years.insert(anchor.year());
+            }
+            let public_start = NaiveDate::from_ymd_opt(MIN_PUBLIC_YEAR, 1, 1)
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .context("invalid public timestamp lower boundary")?
+                .and_utc();
+            let public_end = NaiveDate::from_ymd_opt(MAX_PUBLIC_YEAR + 1, 1, 1)
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .context("invalid public timestamp upper boundary")?
+                .and_utc();
+            for year in years {
                 let date = NaiveDate::from_ymd_opt(year, 1, 1).context("invalid year")?;
                 let next = NaiveDate::from_ymd_opt(year + 1, 1, 1).context("invalid year")?;
-                buckets.push((local_midnight(date), local_midnight(next), year.to_string()));
+                let start = if year == MIN_PUBLIC_YEAR {
+                    public_start
+                } else {
+                    local_midnight(date)
+                };
+                let end = if year == MAX_PUBLIC_YEAR {
+                    public_end
+                } else {
+                    local_midnight(next)
+                };
+                push_nonempty_stats_bucket(&mut buckets, start, end, year.to_string());
             }
         }
     }
     Ok(buckets)
+}
+
+fn disambiguate_repeated_labels(labels: Vec<(String, String)>) -> Vec<String> {
+    let mut counts = HashMap::<String, usize>::new();
+    for (label, _) in &labels {
+        *counts.entry(label.clone()).or_default() += 1;
+    }
+    labels
+        .into_iter()
+        .map(|(label, suffix)| {
+            if counts.get(&label).copied().unwrap_or_default() > 1 {
+                format!("{label} ({suffix})")
+            } else {
+                label
+            }
+        })
+        .collect()
+}
+
+fn occupied_local_years_on(connection: &Connection) -> Result<BTreeSet<i32>> {
+    let mut years = BTreeSet::new();
+    let mut next_activity = connection.prepare(
+        "SELECT MIN(timestamp) FROM (
+            SELECT MIN(timestamp) timestamp FROM events WHERE timestamp>=?1
+            UNION ALL SELECT MIN(timestamp) FROM usage_facts WHERE timestamp>=?1
+            UNION ALL SELECT MIN(timestamp) FROM messages WHERE timestamp>=?1
+         )",
+    )?;
+    let mut lower_bound = format!("{MIN_PUBLIC_YEAR:04}-01-01T00:00:00.000000000Z");
+    loop {
+        let timestamp =
+            next_activity.query_row([&lower_bound], |row| row.get::<_, Option<String>>(0))?;
+        let Some(timestamp) = timestamp else {
+            break;
+        };
+        let year = DateTime::parse_from_rfc3339(&timestamp)
+            .with_context(|| format!("invalid stored activity timestamp {timestamp}"))?
+            .with_timezone(&Local)
+            .year();
+        anyhow::ensure!(
+            (MIN_PUBLIC_YEAR - 1..=MAX_PUBLIC_YEAR + 1).contains(&year),
+            "stored activity local year is outside the supported range"
+        );
+        years.insert(year.clamp(MIN_PUBLIC_YEAR, MAX_PUBLIC_YEAR));
+        if year >= MAX_PUBLIC_YEAR {
+            break;
+        }
+        let next = NaiveDate::from_ymd_opt(year + 1, 1, 1).context("invalid year")?;
+        let next_bound = sql_timestamp(local_midnight(next));
+        anyhow::ensure!(
+            next_bound > lower_bound,
+            "all-time year scan did not advance"
+        );
+        lower_bound = next_bound;
+    }
+    Ok(years)
+}
+
+fn push_nonempty_stats_bucket(
+    buckets: &mut Vec<StatsBucket>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    label: String,
+) {
+    // A political timezone change can delete an entire civil date (for
+    // example, Samoa's 2011-12-30). Such a date has no UTC interval and must
+    // not become a zero-duration analytical bucket.
+    if start < end {
+        buckets.push((start, end, label));
+    }
 }
 
 fn query_prices_on(
@@ -5806,26 +7364,49 @@ fn query_prices_on(
     page: u64,
     page_size: u64,
 ) -> Result<PricesResponse> {
-    let pattern = q
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| format!("%{}%", value.trim().to_lowercase()));
+    let q_filter = q.filter(|value| !value.trim().is_empty());
+    connection.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS price_search_matches(
+             model_id TEXT PRIMARY KEY
+         ) WITHOUT ROWID;
+         DELETE FROM price_search_matches;",
+    )?;
+    if let Some(query) = q_filter {
+        let needle = normalize_search_text(query.trim());
+        let mut select = connection.prepare("SELECT model_id FROM resolved_model_prices")?;
+        let mut insert = connection
+            .prepare("INSERT OR IGNORE INTO price_search_matches(model_id) VALUES(?1)")?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            let model_id = row.get::<_, String>(0)?;
+            if normalize_search_text(&model_id).contains(&needle) {
+                insert.execute([&model_id])?;
+            }
+        }
+    }
     let total: i64 = connection.query_row(
         "SELECT COUNT(*) FROM resolved_model_prices
-         WHERE ?1 IS NULL OR lower(model_id) LIKE ?1",
-        [pattern.as_deref()],
+         WHERE ?1 IS NULL OR EXISTS(
+             SELECT 1 FROM price_search_matches search
+             WHERE search.model_id=resolved_model_prices.model_id
+         )",
+        [q_filter],
         |row| row.get(0),
     )?;
     let mut statement = connection.prepare(
         "SELECT model_id,effective_from,effective_to,input_microusd_per_million,
                 cached_input_microusd_per_million,output_microusd_per_million,currency,source
          FROM resolved_model_prices
-         WHERE ?1 IS NULL OR lower(model_id) LIKE ?1
+         WHERE ?1 IS NULL OR EXISTS(
+             SELECT 1 FROM price_search_matches search
+             WHERE search.model_id=resolved_model_prices.model_id
+         )
          ORDER BY model_id,effective_from DESC LIMIT ?2 OFFSET ?3",
     )?;
     let raw_items = statement
         .query_map(
             params![
-                pattern,
+                q_filter,
                 page_size as i64,
                 price_page_offset(page, page_size)
             ],
@@ -5863,32 +7444,6 @@ fn query_prices_on(
             },
         )
         .collect::<Result<Vec<_>>>()?;
-    let mut statement = connection.prepare(
-        "SELECT observed_model_id,canonical_model_id
-         FROM resolved_model_aliases ORDER BY observed_model_id",
-    )?;
-    let aliases = statement
-        .query_map([], |row| {
-            Ok(AliasRow {
-                observed_model_id: row.get(0)?,
-                canonical_model_id: row.get(1)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut statement = connection.prepare(
-        "SELECT model,COUNT(*),SUM(total_tokens),MAX(timestamp) FROM priced_usage
-         WHERE price_known=0 GROUP BY model ORDER BY SUM(total_tokens) DESC",
-    )?;
-    let observed_unknown = statement
-        .query_map([], |row| {
-            Ok(UnknownModelRow {
-                model_id: row.get(0)?,
-                usage_count: row.get::<_, i64>(1)?.max(0) as u64,
-                total_tokens: row.get::<_, i64>(2)?.max(0) as u64,
-                last_seen_at: row.get(3)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
     let total = total.max(0) as u64;
     let last_refresh_at = connection
         .query_row(
@@ -5928,8 +7483,6 @@ fn query_prices_on(
         .optional()?;
     Ok(PricesResponse {
         items,
-        aliases,
-        observed_unknown,
         page,
         page_size,
         total,
@@ -5942,6 +7495,110 @@ fn query_prices_on(
     })
 }
 
+fn query_price_metadata_on(
+    connection: &Connection,
+    unknown_limit: u64,
+) -> Result<PriceMetadataResponse> {
+    anyhow::ensure!(
+        (1..=MAX_UNKNOWN_MODEL_RESULTS).contains(&unknown_limit),
+        "invalid unknown model result limit"
+    );
+    let aliases_total: i64 =
+        connection.query_row("SELECT COUNT(*) FROM resolved_model_aliases", [], |row| {
+            row.get(0)
+        })?;
+    let mut statement = connection.prepare(
+        "SELECT observed_model_id,canonical_model_id
+         FROM resolved_model_aliases
+         WHERE length(observed_model_id) BETWEEN 1 AND ?1
+           AND length(canonical_model_id) BETWEEN 1 AND ?1
+         ORDER BY observed_model_id LIMIT ?2",
+    )?;
+    let aliases = statement
+        .query_map(
+            params![MAX_MODEL_ID_CHARS as i64, MAX_ALIAS_RESULTS as i64],
+            |row| {
+                Ok(AliasRow {
+                    observed_model_id: row.get(0)?,
+                    canonical_model_id: row.get(1)?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let observed_unknown_total: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT model FROM priced_usage WHERE price_known=0 GROUP BY model
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT model,COUNT(*),SUM(total_tokens),MAX(timestamp) FROM priced_usage
+         WHERE price_known=0 AND length(model) BETWEEN 1 AND ?1 GROUP BY model
+         ORDER BY SUM(total_tokens) DESC,model LIMIT ?2",
+    )?;
+    let observed_unknown = statement
+        .query_map(
+            params![MAX_MODEL_ID_CHARS as i64, unknown_limit as i64],
+            |row| {
+                Ok(UnknownModelRow {
+                    model_id: row.get(0)?,
+                    usage_count: row.get::<_, i64>(1)?.max(0) as u64,
+                    total_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    last_seen_at: row.get(3)?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(PriceMetadataResponse {
+        aliases,
+        aliases_total: aliases_total.max(0) as u64,
+        observed_unknown,
+        observed_unknown_total: observed_unknown_total.max(0) as u64,
+    })
+}
+
+fn query_price_model_ids_on(
+    connection: &Connection,
+    q: Option<&str>,
+    limit: u64,
+) -> Result<PriceModelIdsResponse> {
+    anyhow::ensure!(
+        (1..=MAX_PRICE_MODEL_ID_RESULTS).contains(&limit),
+        "invalid model ID result limit"
+    );
+    let needle = q
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| normalize_search_text(value.trim()));
+    anyhow::ensure!(
+        needle
+            .as_deref()
+            .is_none_or(|value| value.chars().count() <= MAX_SESSION_SEARCH_CHARS),
+        "model ID search exceeds the {MAX_SESSION_SEARCH_CHARS}-character limit"
+    );
+
+    let mut statement = connection
+        .prepare("SELECT DISTINCT model_id FROM resolved_model_prices ORDER BY model_id")?;
+    let mut rows = statement.query([])?;
+    let mut items = Vec::with_capacity(limit as usize);
+    while let Some(row) = rows.next()? {
+        let model_id = row.get::<_, String>(0)?;
+        if model_id.chars().count() > MAX_MODEL_ID_CHARS {
+            continue;
+        }
+        if needle
+            .as_deref()
+            .is_none_or(|needle| normalize_search_text(&model_id).contains(needle))
+        {
+            items.push(model_id);
+            if items.len() == limit as usize {
+                break;
+            }
+        }
+    }
+    Ok(PriceModelIdsResponse { items })
+}
+
 fn public_price_source(source: &str) -> String {
     source.strip_prefix("remote:").unwrap_or(source).to_owned()
 }
@@ -5950,6 +7607,17 @@ fn price_page_offset(page: u64, page_size: u64) -> i64 {
     page.saturating_sub(1)
         .saturating_mul(page_size)
         .min(i64::MAX as u64) as i64
+}
+
+fn validated_page(page: Option<u64>) -> ApiResult<u64> {
+    let page = page.unwrap_or(1).max(1);
+    if page > MAX_JS_SAFE_INTEGER {
+        Err(ApiError::bad_request(format!(
+            "page must not exceed {MAX_JS_SAFE_INTEGER}"
+        )))
+    } else {
+        Ok(page)
+    }
 }
 
 fn query_bounds(
@@ -5978,6 +7646,7 @@ fn query_bounds(
 
 fn parse_boundary(value: &str, inclusive_date_end: bool) -> ApiResult<String> {
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
+        validate_public_year(timestamp.year())?;
         return Ok(sql_timestamp(timestamp.with_timezone(&Utc)));
     }
     let date = parse_date(value)?;
@@ -5994,15 +7663,36 @@ fn sql_timestamp(value: DateTime<Utc>) -> String {
 }
 
 fn parse_date(value: &str) -> ApiResult<NaiveDate> {
-    NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map_err(|_| ApiError::bad_request("expected a YYYY-MM-DD date"))
+    let exact_shape = value.len() == 10
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        });
+    if !exact_shape {
+        return Err(ApiError::bad_request("expected a YYYY-MM-DD date"));
+    }
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| ApiError::bad_request("expected a YYYY-MM-DD date"))?;
+    validate_public_year(date.year())?;
+    Ok(date)
+}
+
+fn validate_public_year(year: i32) -> ApiResult<()> {
+    if (MIN_PUBLIC_YEAR..=MAX_PUBLIC_YEAR).contains(&year) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!(
+            "year must be between {MIN_PUBLIC_YEAR} and {MAX_PUBLIC_YEAR}"
+        )))
+    }
 }
 
 fn parse_timestamp(value: &str) -> ApiResult<DateTime<Utc>> {
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(value) {
+        validate_public_year(timestamp.year())?;
         return Ok(timestamp.with_timezone(&Utc));
     }
-    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+    if let Ok(date) = parse_date(value) {
         return Ok(local_midnight(date));
     }
     Err(ApiError::bad_request(
@@ -6015,16 +7705,17 @@ fn canonical_timestamp(value: &str) -> ApiResult<String> {
 }
 
 fn local_midnight(date: NaiveDate) -> DateTime<Utc> {
-    let naive = date.and_hms_opt(0, 0, 0).expect("midnight is valid");
-    match Local.from_local_datetime(&naive) {
-        LocalResult::Single(value) => value.with_timezone(&Utc),
-        LocalResult::Ambiguous(first, _) => first.with_timezone(&Utc),
-        LocalResult::None => Local
-            .from_local_datetime(&(naive + Duration::hours(1)))
-            .earliest()
-            .unwrap_or_else(Local::now)
-            .with_timezone(&Utc),
-    }
+    let midnight = date.and_hms_opt(0, 0, 0).expect("midnight is valid");
+    (0..=48 * 60)
+        .find_map(|offset_minutes| {
+            let candidate = midnight + Duration::minutes(offset_minutes);
+            match Local.from_local_datetime(&candidate) {
+                LocalResult::Single(value) => Some(value.with_timezone(&Utc)),
+                LocalResult::Ambiguous(first, _) => Some(first.with_timezone(&Utc)),
+                LocalResult::None => None,
+            }
+        })
+        .expect("the local timezone must contain an instant within 48 hours of a civil midnight")
 }
 
 #[cfg(test)]
@@ -6033,8 +7724,9 @@ mod tests {
         ApiState, BUCKET_AGGREGATES_SQL, OVERVIEW_YEAR_USAGE_SQL, PricesQuery,
         STATS_BUCKET_SESSIONS_SQL, STATS_BUCKET_USAGE_SQL, STATS_FEW_BUCKET_SESSIONS_SQL,
         SqlBucketBounds, StatsBucketAggregate, activity_day_window, display_tool_name,
-        first_prompt_for_display, price_page_offset, prices, query_activity_day_summaries_batched,
-        query_activity_detail_on, query_activity_on, query_heatmap_on, query_overview_year_on,
+        first_prompt_for_display, price_page_offset, prices, query_activity_child_previews_page,
+        query_activity_day_summaries_batched, query_activity_detail_on,
+        query_activity_detail_page_on, query_activity_on, query_heatmap_on, query_overview_year_on,
         query_stats_on, run_snapshot_work, settings, stats_totals_from_aggregates,
     };
     use crate::{
@@ -6043,8 +7735,12 @@ mod tests {
         db_executor::{DbExecutor, WorkClass},
         ingest::IngestRoots,
         model::Totals,
+        money::UsdAmount,
     };
-    use axum::extract::{Query, State};
+    use axum::{
+        extract::{Path as AxumPath, Query, State},
+        http::StatusCode,
+    };
     use chrono::NaiveDate;
     use rusqlite::params;
     use std::{
@@ -6075,6 +7771,92 @@ mod tests {
         assert_eq!(price_page_offset(1, 25), 0);
         assert_eq!(price_page_offset(3, 25), 50);
         assert_eq!(price_page_offset(u64::MAX, 100), i64::MAX);
+    }
+
+    #[test]
+    fn price_metadata_bounds_twenty_thousand_unknown_models() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('unknowns','Unknowns','2026-01-01T00:00:00.000000000Z',
+                        '2026-01-01T00:00:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('unknowns','unknowns','2026-01-01T00:00:00.000000000Z',
+                        '2026-01-01T00:00:00.000000000Z',0);
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL SELECT value+1 FROM sequence WHERE value<19999
+                 )
+                 INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,timestamp,source_line,model,
+                    input_tokens,cached_input_tokens,output_tokens,
+                    reasoning_tokens,total_tokens,native
+                 )
+                 SELECT printf('unknown-fact-%05d',value),'unknowns','unknowns',
+                        '2026-01-01T00:00:00.000000000Z',value+1,
+                        printf('unknown-model-%05d',value),1,0,0,0,1,1
+                 FROM sequence;
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL SELECT value+1 FROM sequence WHERE value<199
+                 )
+                 INSERT INTO model_aliases(
+                    observed_model_id,canonical_model_id,created_at,source
+                 )
+                 SELECT printf('bounded-alias-%03d',value),'gpt-5.5',
+                        '2026-01-01T00:00:00.000000000Z','remote:test'
+                 FROM sequence;
+                 INSERT INTO model_aliases(
+                    observed_model_id,canonical_model_id,created_at,source
+                 ) VALUES(
+                    replace(hex(zeroblob(300)),'00','x'),'gpt-5.5',
+                    '2026-01-01T00:00:00.000000000Z','remote:test'
+                 );
+                 INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,timestamp,source_line,model,
+                    input_tokens,cached_input_tokens,output_tokens,
+                    reasoning_tokens,total_tokens,native
+                 ) VALUES(
+                    'unknown-fact-overlong','unknowns','unknowns',
+                    '2026-01-01T00:00:00.000000000Z',20001,
+                    replace(hex(zeroblob(300)),'00','y'),1000000,0,0,0,1000000,1
+                 );",
+            )
+            .unwrap();
+
+        let metadata = super::query_price_metadata_on(&connection, 100).unwrap();
+        assert_eq!(metadata.aliases_total, 202);
+        assert_eq!(metadata.aliases.len(), 100);
+        assert!(metadata.aliases.iter().all(|row| {
+            row.observed_model_id.chars().count() <= super::MAX_MODEL_ID_CHARS
+                && row.canonical_model_id.chars().count() <= super::MAX_MODEL_ID_CHARS
+        }));
+        assert_eq!(metadata.observed_unknown_total, 20_001);
+        assert_eq!(metadata.observed_unknown.len(), 100);
+        assert!(
+            metadata
+                .observed_unknown
+                .iter()
+                .all(|row| row.model_id.chars().count() <= super::MAX_MODEL_ID_CHARS)
+        );
+        assert!(serde_json::to_vec(&metadata).unwrap().len() < 64 * 1024);
+    }
+
+    #[test]
+    fn utc_rollup_hour_detects_midnight_in_fractional_offset_zones() {
+        let (hour_start, hour_end) =
+            super::usage_rollup_hour_window("2026-07-01T18:00:00.000000000Z").unwrap();
+        let nepal = chrono::FixedOffset::east_opt(5 * 60 * 60 + 45 * 60).unwrap();
+        let (start_date, end_date) = super::usage_rollup_bucket_dates(hour_start, hour_end, &nepal);
+        assert_eq!(
+            start_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()
+        );
+        assert_eq!(
+            end_date,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6211,12 +7993,12 @@ mod tests {
     }
 
     #[test]
-    fn stats_grand_total_converts_fixed_point_once() {
+    fn stats_grand_total_preserves_fixed_point_exactly() {
         let aggregates = (0..10)
             .map(|_| StatsBucketAggregate {
                 totals: Totals {
                     total_tokens: 1,
-                    known_cost_usd: 0.1,
+                    known_cost_numerator: 100_000_000_000,
                     ..Totals::default()
                 }
                 .finish(),
@@ -6226,48 +8008,118 @@ mod tests {
             .collect::<Vec<_>>();
 
         let totals = stats_totals_from_aggregates(&aggregates);
-        let exact_once = 1.0_f64;
-        let floating_bucket_sum = aggregates
-            .iter()
-            .map(|aggregate| aggregate.totals.known_cost_usd)
-            .sum::<f64>();
-
-        assert_eq!(totals.known_cost_usd.to_bits(), exact_once.to_bits());
-        assert_ne!(floating_bucket_sum.to_bits(), exact_once.to_bits());
+        assert_eq!(totals.known_cost_numerator, 1_000_000_000_000);
+        assert_eq!(totals.cost_usd.unwrap().decimal_string(), "1.00");
     }
 
     #[test]
-    fn all_time_stats_reject_implausibly_large_data_derived_year_spans() {
+    fn all_time_stats_use_sparse_occupied_years_for_far_future_data() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open(temp.path().join("usage.db")).unwrap();
         let connection = db.connect().unwrap();
         connection
             .execute_batch(
-                "INSERT INTO threads(id,title,started_at,last_event_at)
-                 VALUES('ancient-thread','Ancient','1826-01-01T00:00:00.000000000Z',
-                        '1826-01-01T00:00:00.000000000Z');
-                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
-                 VALUES('ancient-rollout','ancient-thread',
-                        '1826-01-01T00:00:00.000000000Z',
-                        '1826-01-01T00:00:00.000000000Z',0);
+                "INSERT INTO threads(id,title,started_at,last_event_at) VALUES
+                    ('past-thread','Past','2025-01-01T00:00:00.000000000Z',
+                     '2025-01-01T00:00:00.000000000Z'),
+                    ('future-thread','Future','2500-01-01T00:00:00.000000000Z',
+                     '2500-01-01T00:00:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived) VALUES
+                    ('past-rollout','past-thread','2025-01-01T00:00:00.000000000Z',
+                     '2025-01-01T00:00:00.000000000Z',0),
+                    ('future-rollout','future-thread','2500-01-01T00:00:00.000000000Z',
+                     '2500-01-01T00:00:00.000000000Z',0);
                  INSERT INTO events(
                     id,thread_id,rollout_id,timestamp,source_line,kind,native
-                 ) VALUES(
-                    'ancient-event','ancient-thread','ancient-rollout',
-                    '1826-01-01T00:00:00.000000000Z',1,'state',1
-                 );",
+                 ) VALUES
+                    ('past-event','past-thread','past-rollout',
+                     '2025-01-01T00:00:00.000000000Z',1,'state',1),
+                    ('future-event','future-thread','future-rollout',
+                     '2500-01-01T00:00:00.000000000Z',1,'state',1);",
             )
             .unwrap();
 
-        let error = super::stats_buckets_on(
+        let buckets = super::stats_buckets_on(
             &connection,
             "all",
             NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
         )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("maximum supported span is 200"),
-            "unexpected all-time guard error: {error:#}"
+        .unwrap();
+        assert_eq!(
+            buckets
+                .iter()
+                .map(|(_, _, label)| label.as_str())
+                .collect::<Vec<_>>(),
+            ["2025", "2026", "2500"]
+        );
+    }
+
+    #[test]
+    fn all_time_stats_include_future_only_and_mixed_future_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at) VALUES
+                    ('future-thread','Future','2027-01-01T00:00:00Z','2027-01-01T00:00:00Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived) VALUES
+                    ('future-rollout','future-thread','2027-01-01T00:00:00Z','2027-01-01T00:00:00Z',0);
+                 INSERT INTO events(id,thread_id,rollout_id,timestamp,source_line,kind,native) VALUES
+                    ('future-event','future-thread','future-rollout','2027-01-01T00:00:00Z',1,'state',1);",
+            )
+            .unwrap();
+        let anchor = NaiveDate::from_ymd_opt(2026, 7, 19).unwrap();
+
+        let future_only = super::stats_buckets_on(&connection, "all", anchor).unwrap();
+        assert_eq!(
+            future_only
+                .iter()
+                .map(|(_, _, label)| label.as_str())
+                .collect::<Vec<_>>(),
+            ["2027"]
+        );
+
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at) VALUES
+                    ('past-thread','Past','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived) VALUES
+                    ('past-rollout','past-thread','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z',0);
+                 INSERT INTO events(id,thread_id,rollout_id,timestamp,source_line,kind,native) VALUES
+                    ('past-event','past-thread','past-rollout','2025-01-01T00:00:00Z',1,'state',1);",
+            )
+            .unwrap();
+        let mixed = super::stats_buckets_on(&connection, "all", anchor).unwrap();
+        assert_eq!(
+            mixed
+                .iter()
+                .map(|(_, _, label)| label.as_str())
+                .collect::<Vec<_>>(),
+            ["2025", "2026", "2027"]
+        );
+    }
+
+    #[test]
+    fn stats_omit_civil_dates_without_a_utc_interval() {
+        let boundary = chrono::DateTime::parse_from_rfc3339("2011-12-30T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut buckets = Vec::new();
+        super::push_nonempty_stats_bucket(&mut buckets, boundary, boundary, "2011-12-30".into());
+        assert!(buckets.is_empty());
+    }
+
+    #[test]
+    fn duplicate_hour_labels_receive_offsets_while_unique_labels_stay_plain() {
+        assert_eq!(
+            super::disambiguate_repeated_labels(vec![
+                ("01:00".into(), "+02:00".into()),
+                ("02:00".into(), "+02:00".into()),
+                ("02:00".into(), "+01:00".into()),
+                ("03:00".into(), "+01:00".into()),
+            ]),
+            ["01:00", "02:00 (+02:00)", "02:00 (+01:00)", "03:00"]
         );
     }
 
@@ -6335,7 +8187,7 @@ mod tests {
         let empty = query_heatmap_on(&connection, 2026).unwrap();
         assert_eq!(empty.len(), 365);
         assert!(empty.iter().all(|day| {
-            day.cost_usd == Some(0.0)
+            day.cost_usd == Some(UsdAmount::ZERO)
                 && day.session_count == 0
                 && day.message_count == 0
                 && day.total_tokens == 0
@@ -6375,7 +8227,7 @@ mod tests {
         assert_eq!(populated.session_count, 1);
         assert_eq!(populated.message_count, 1);
         assert_eq!(populated.total_tokens, 110);
-        assert!(populated.cost_usd.unwrap() > 0.0);
+        assert!(populated.cost_usd.unwrap().cost_numerator() > 0);
         assert!(sparse.iter().filter(|day| day.total_tokens > 0).count() == 1);
         assert!(sparse.iter().filter(|day| day.message_count > 0).count() == 1);
     }
@@ -6470,6 +8322,59 @@ mod tests {
     }
 
     #[test]
+    fn session_cost_sort_and_transport_keep_fixed_point_differences() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO model_prices(
+                    model_id,effective_from,input_microusd_per_million,
+                    cached_input_microusd_per_million,output_microusd_per_million,
+                    currency,source
+                 ) VALUES(
+                    'precise-sort','1970-01-01T00:00:00.000000000Z',
+                    1000000000,1000000000,1,
+                    'USD','manual'
+                 );
+                 INSERT INTO threads(id,title,started_at,last_event_at) VALUES
+                    ('a-higher','Higher','2026-07-15T12:00:00.000000000Z',
+                     '2026-07-15T12:00:00.000000000Z'),
+                    ('z-lower','Lower','2026-07-15T12:00:00.000000000Z',
+                     '2026-07-15T12:00:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at) VALUES
+                    ('higher-rollout','a-higher','2026-07-15T12:00:00.000000000Z',
+                     '2026-07-15T12:00:00.000000000Z'),
+                    ('lower-rollout','z-lower','2026-07-15T12:00:00.000000000Z',
+                     '2026-07-15T12:00:00.000000000Z');
+                 INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,timestamp,source_line,model,
+                    input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens
+                 ) VALUES
+                    ('higher-usage','a-higher','higher-rollout',
+                     '2026-07-15T12:00:00.000000000Z',1,'precise-sort',
+                     3999999999,0,1,0,4000000000),
+                    ('lower-usage','z-lower','lower-rollout',
+                     '2026-07-15T12:00:00.000000000Z',1,'precise-sort',
+                     3999999999,0,0,0,3999999999);",
+            )
+            .unwrap();
+
+        let sorted =
+            super::query_sessions_on(&connection, None, None, None, None, "cost", 1, 2, false)
+                .unwrap();
+        assert_eq!(
+            sorted
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a-higher", "z-lower"]
+        );
+        assert!(sorted.items[0].cost_usd.unwrap() > sorted.items[1].cost_usd.unwrap());
+    }
+
+    #[test]
     fn grouped_pricing_matches_priced_usage_across_boundaries_and_gaps() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open(temp.path().join("usage.db")).unwrap();
@@ -6528,7 +8433,7 @@ mod tests {
         for thread_id in ["boundary-thread", "gap-thread"] {
             let expected = connection
                 .query_row(
-                    "SELECT COALESCE(SUM(cost_usd),0.0),
+                    "SELECT COALESCE(SUM(cost_numerator),0),
                             COALESCE(SUM(CASE WHEN price_known=0
                                               THEN total_tokens ELSE 0 END),0),
                             COALESCE(SUM(total_tokens),0)
@@ -6536,7 +8441,7 @@ mod tests {
                     [thread_id],
                     |row| {
                         Ok((
-                            row.get::<_, f64>(0)?,
+                            i128::from(row.get::<_, i64>(0)?),
                             row.get::<_, i64>(1)?.max(0) as u64,
                             row.get::<_, i64>(2)?.max(0) as u64,
                         ))
@@ -6544,7 +8449,7 @@ mod tests {
                 )
                 .unwrap();
             let actual = sessions.get(thread_id).unwrap();
-            assert!((actual.known_cost_usd() - expected.0).abs() < 1e-12);
+            assert_eq!(actual.known_cost_numerator, expected.0);
             assert_eq!(actual.unpriced_tokens, expected.1);
             assert_eq!(actual.total_tokens, expected.2);
         }
@@ -6560,7 +8465,7 @@ mod tests {
         for item in &sorted.items {
             let expected = connection
                 .query_row(
-                    "SELECT COALESCE(SUM(cost_usd),0.0),
+                    "SELECT COALESCE(SUM(cost_numerator),0),
                             COALESCE(SUM(CASE WHEN price_known=0
                                               THEN total_tokens ELSE 0 END),0),
                             COALESCE(SUM(total_tokens),0)
@@ -6568,7 +8473,7 @@ mod tests {
                     [&item.id],
                     |row| {
                         Ok((
-                            row.get::<_, f64>(0)?,
+                            i128::from(row.get::<_, i64>(0)?),
                             row.get::<_, i64>(1)?.max(0) as u64,
                             row.get::<_, i64>(2)?.max(0) as u64,
                         ))
@@ -6578,7 +8483,55 @@ mod tests {
             assert_eq!(item.unpriced_tokens, expected.1);
             assert_eq!(item.total_tokens, expected.2);
             if expected.1 == 0 {
-                assert!((item.cost_usd.unwrap() - expected.0).abs() < 1e-12);
+                assert_eq!(item.cost_usd.unwrap().cost_numerator(), expected.0);
+            } else {
+                assert_eq!(item.cost_usd, None);
+            }
+        }
+
+        // The bounded path must combine the compact 12:00 UTC rollup with raw
+        // facts from the two partial boundary hours. The selected full hour also
+        // contains both a price override and an unpriced gap, so this exercises
+        // the exceptional per-fact repricing fallback instead of merely summing
+        // one constant-price bucket.
+        let bounded_start = "2026-07-15T11:30:00.000000000Z";
+        let bounded_end = "2026-07-15T13:30:00.000000000Z";
+        let bounded = super::query_sessions_on(
+            &connection,
+            Some(bounded_start),
+            Some(bounded_end),
+            None,
+            None,
+            "cost",
+            1,
+            50,
+            false,
+        )
+        .unwrap();
+        assert_eq!(bounded.items.len(), 2);
+        for item in &bounded.items {
+            let expected = connection
+                .query_row(
+                    "SELECT COALESCE(SUM(cost_numerator),0),
+                            COALESCE(SUM(CASE WHEN price_known=0
+                                              THEN total_tokens ELSE 0 END),0),
+                            COALESCE(SUM(total_tokens),0)
+                     FROM priced_usage
+                     WHERE thread_id=?1 AND timestamp>=?2 AND timestamp<?3",
+                    params![item.id, bounded_start, bounded_end],
+                    |row| {
+                        Ok((
+                            i128::from(row.get::<_, i64>(0)?),
+                            row.get::<_, i64>(1)?.max(0) as u64,
+                            row.get::<_, i64>(2)?.max(0) as u64,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(item.unpriced_tokens, expected.1);
+            assert_eq!(item.total_tokens, expected.2);
+            if expected.1 == 0 {
+                assert_eq!(item.cost_usd.unwrap().cost_numerator(), expected.0);
             } else {
                 assert_eq!(item.cost_usd, None);
             }
@@ -6586,7 +8539,7 @@ mod tests {
 
         let expected = connection
             .query_row(
-                "SELECT COALESCE(SUM(cost_usd),0.0),
+                "SELECT COALESCE(SUM(cost_numerator),0),
                         COALESCE(SUM(CASE WHEN price_known=0
                                           THEN total_tokens ELSE 0 END),0),
                         COALESCE(SUM(input_tokens),0),
@@ -6598,7 +8551,7 @@ mod tests {
                 [],
                 |row| {
                     Ok((
-                        row.get::<_, f64>(0)?,
+                        i128::from(row.get::<_, i64>(0)?),
                         row.get::<_, i64>(1)?.max(0) as u64,
                         row.get::<_, i64>(2)?.max(0) as u64,
                         row.get::<_, i64>(3)?.max(0) as u64,
@@ -6615,7 +8568,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 7, 15).unwrap(),
         )
         .unwrap();
-        assert!((stats.totals.known_cost_usd - expected.0).abs() < 1e-12);
+        assert_eq!(stats.totals.known_cost_numerator, expected.0);
         assert_eq!(stats.totals.unpriced_tokens, expected.1);
         assert_eq!(stats.totals.input_tokens, expected.2);
         assert_eq!(stats.totals.cached_input_tokens, expected.3);
@@ -6644,15 +8597,18 @@ mod tests {
                 .unwrap();
         assert_eq!(repriced.items[0].id, "gap-thread");
         assert_eq!(repriced.items[0].unpriced_tokens, 0);
-        let expected_gap_cost: f64 = connection
+        let expected_gap_cost: i128 = connection
             .query_row(
-                "SELECT COALESCE(SUM(cost_usd),0.0)
+                "SELECT COALESCE(SUM(cost_numerator),0)
                  FROM priced_usage WHERE thread_id='gap-thread'",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, i64>(0).map(i128::from),
             )
             .unwrap();
-        assert!((repriced.items[0].cost_usd.unwrap() - expected_gap_cost).abs() < 1e-12);
+        assert_eq!(
+            repriced.items[0].cost_usd.unwrap().cost_numerator(),
+            expected_gap_cost
+        );
     }
 
     #[test]
@@ -6778,7 +8734,7 @@ mod tests {
             assert_eq!(actual.total_tokens, expected.total_tokens);
             assert_eq!(actual.unpriced_tokens, expected.unpriced_tokens);
             assert_eq!(actual.cost_usd.is_some(), expected.cost_usd.is_some());
-            assert!((actual.known_cost_usd - expected.known_cost_usd).abs() < 1e-12);
+            assert_eq!(actual.known_cost_numerator, expected.known_cost_numerator);
         }
         assert!(actual[0].pricing_complete);
         assert!(!actual[1].pricing_complete);
@@ -6810,8 +8766,12 @@ mod tests {
             sessions[0],
             messages[0],
         );
-        let expected_delta = actual[0].cost_usd.unwrap() - actual[3].cost_usd.unwrap();
-        assert!((priced_delta.delta_cost_usd.unwrap() - expected_delta).abs() < 1e-12);
+        let expected_delta = actual[0].cost_usd.unwrap().cost_numerator()
+            - actual[3].cost_usd.unwrap().cost_numerator();
+        assert_eq!(
+            priced_delta.delta_cost_usd.unwrap().cost_numerator(),
+            expected_delta
+        );
         assert!(priced_delta.delta_percent.is_some());
     }
 
@@ -7316,8 +9276,14 @@ mod tests {
         assert_eq!(all.items.len(), 12);
         let all_count = QUERY_COUNT.swap(0, Ordering::SeqCst);
         assert_eq!(all_count, one_count, "page size must not amplify SQL");
+        // Fixed-point rollup repricing adds five bounded statements: two ledger
+        // reads for day totals, two for exchange totals, and one sparse
+        // NULL-turn usage probe alongside the rollup query it replaces. Indexed
+        // occupied-date seeking keeps turn intervals and point activity in two
+        // separate statements. The equality above is the essential guard:
+        // neither page size nor raw usage-fact count may amplify the budget.
         assert!(
-            all_count <= 13,
+            all_count <= 19,
             "collapsed Activity used {all_count} SELECTs"
         );
 
@@ -7341,17 +9307,404 @@ mod tests {
             many_descendant_count, one_descendant_count,
             "expanded detail must not issue SQL per descendant"
         );
+        // The canonical child projection uses one bounded COUNT plus one
+        // indexed page seek. That adds a single statement while removing the
+        // repeated full-turn materialization from every page.
         assert!(
-            many_descendant_count <= 13,
+            many_descendant_count <= 19,
             "expanded Activity used {many_descendant_count} SELECTs"
         );
         connection.trace(None);
     }
 
     #[test]
+    fn activity_child_page_is_turn_scoped_and_deduplicates_tool_lifecycles_deterministically() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('activity-child-scope','Child scope',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:10:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('activity-child-scope','activity-child-scope',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:10:00.000000000Z',0);
+                 INSERT INTO turns(id,thread_id,rollout_id,started_at,status)
+                 VALUES
+                    ('selected-turn','activity-child-scope','activity-child-scope',
+                     '2026-07-01T00:00:00.000000000Z','completed'),
+                    ('other-turn','activity-child-scope','activity-child-scope',
+                     '2026-07-01T00:05:00.000000000Z','completed');
+                 INSERT INTO events(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,kind,call_id,native
+                 ) VALUES
+                    ('tool-z','activity-child-scope','activity-child-scope','selected-turn',
+                     '2026-07-01T00:00:01.000000000Z',10,'tool_call','selected-call',1),
+                    ('tool-b','activity-child-scope','activity-child-scope','selected-turn',
+                     '2026-07-01T00:00:01.000000000Z',5,'tool_call','selected-call',1),
+                    ('tool-a','activity-child-scope','activity-child-scope','selected-turn',
+                     '2026-07-01T00:00:01.000000000Z',5,'tool_call','selected-call',1);
+                 INSERT INTO tool_calls(
+                    id,call_id,thread_id,rollout_id,turn_id,started_at,name,status
+                 ) VALUES(
+                    'selected-tool','selected-call','activity-child-scope',
+                    'activity-child-scope','selected-turn',
+                    '2026-07-01T00:00:01.000000000Z','exec','completed'
+                 );
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0
+                    UNION ALL
+                    SELECT value + 1 FROM sequence WHERE value + 1 < 64
+                 )
+                 INSERT INTO events(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,kind,call_id,native
+                 )
+                 SELECT printf('other-tool-%02d',value),
+                        'activity-child-scope','activity-child-scope','other-turn',
+                        '2026-07-01T00:05:01.000000000Z',value + 100,'tool_call',
+                        printf('other-call-%02d',value),1
+                 FROM sequence;",
+            )
+            .unwrap();
+
+        let page = query_activity_child_previews_page(
+            &connection,
+            "activity-child-scope",
+            "selected-turn",
+            1,
+            25,
+        )
+        .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, "tool-a");
+        assert_eq!(page.items[0].tool_name.as_deref(), Some("exec"));
+
+        connection
+            .execute_batch(
+                "INSERT INTO events(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,kind,role,body,native
+                 ) VALUES(
+                    'assistant-owner','activity-child-scope','activity-child-scope',
+                    'selected-turn','2026-07-01T00:00:02.000000000Z',6,
+                    'assistant','assistant','Scoped response',1
+                 );
+                 INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,model,
+                    input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,
+                    total_tokens,native
+                 ) VALUES
+                    ('tool-usage','activity-child-scope','activity-child-scope','selected-turn',
+                     '2026-07-01T00:00:02.100000000Z',6,'gpt-5.5',8,0,3,0,11,1),
+                    ('assistant-usage','activity-child-scope','activity-child-scope','selected-turn',
+                     '2026-07-01T00:00:02.200000000Z',7,'gpt-5.5',17,0,5,0,22,1);",
+            )
+            .unwrap();
+
+        let canonical_tool =
+            query_activity_detail_page_on(&connection, "activity-child-scope", "tool-a", 1, 25)
+                .unwrap()
+                .unwrap();
+        assert_eq!(canonical_tool.usage.unwrap().total_tokens, 11);
+
+        let duplicate_tool =
+            query_activity_detail_page_on(&connection, "activity-child-scope", "tool-b", 1, 25)
+                .unwrap()
+                .unwrap();
+        assert!(duplicate_tool.usage.is_none());
+
+        let assistant = query_activity_detail_page_on(
+            &connection,
+            "activity-child-scope",
+            "assistant-owner",
+            1,
+            25,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(assistant.usage.unwrap().total_tokens, 22);
+    }
+
+    #[test]
+    fn activity_usage_ownership_is_independent_of_child_pagination() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('paged-usage-owner','Paged usage owner',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('paged-usage-owner','paged-usage-owner',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z',0);
+                 INSERT INTO turns(id,thread_id,rollout_id,started_at,status)
+                 VALUES('paged-owner-turn','paged-usage-owner','paged-usage-owner',
+                        '2026-07-01T00:00:00.000000000Z','completed');
+                 INSERT INTO events(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,kind,role,body,native
+                 ) VALUES
+                    ('user-owner','paged-usage-owner','paged-usage-owner','paged-owner-turn',
+                     '2026-07-01T00:00:01.000000000Z',1,'user','user','Question',1),
+                    ('owner-a','paged-usage-owner','paged-usage-owner','paged-owner-turn',
+                     '2026-07-01T00:00:10.000000000Z',10,'assistant','assistant','A',1),
+                    ('owner-b','paged-usage-owner','paged-usage-owner','paged-owner-turn',
+                     '2026-07-01T00:00:11.000000000Z',11,'assistant','assistant','B',1);
+                 INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,model,
+                    input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens,native
+                 ) VALUES
+                    ('usage-after-user','paged-usage-owner','paged-usage-owner','paged-owner-turn',
+                     '2026-07-01T00:00:02.000000000Z',2,'gpt-5.5',0,0,7,0,7,1),
+                    ('usage-a','paged-usage-owner','paged-usage-owner','paged-owner-turn',
+                     '2026-07-01T00:00:11.100000000Z',11,'gpt-5.5',0,0,11,0,11,1),
+                    ('usage-b','paged-usage-owner','paged-usage-owner','paged-owner-turn',
+                     '2026-07-01T00:00:12.000000000Z',12,'gpt-5.5',0,0,22,0,22,1);",
+            )
+            .unwrap();
+
+        let all = query_activity_child_previews_page(
+            &connection,
+            "paged-usage-owner",
+            "paged-owner-turn",
+            1,
+            100,
+        )
+        .unwrap()
+        .items;
+        let usage = |id: &str| {
+            all.iter()
+                .find(|item| item.id == id)
+                .and_then(|item| item.usage.as_ref())
+                .map(|usage| usage.total_tokens)
+                .unwrap()
+        };
+        assert!(
+            all.iter()
+                .find(|item| item.id == "user-owner")
+                .unwrap()
+                .usage
+                .is_none(),
+            "user messages must not own adjacent model usage"
+        );
+        assert_eq!(usage("owner-a"), 11);
+        assert_eq!(usage("owner-b"), 22);
+
+        let page_one = query_activity_child_previews_page(
+            &connection,
+            "paged-usage-owner",
+            "paged-owner-turn",
+            1,
+            1,
+        )
+        .unwrap();
+        let page_two = query_activity_child_previews_page(
+            &connection,
+            "paged-usage-owner",
+            "paged-owner-turn",
+            2,
+            1,
+        )
+        .unwrap();
+        assert_eq!(page_one.items[0].id, "owner-b");
+        assert_eq!(page_one.items[0].usage.as_ref().unwrap().total_tokens, 22);
+        assert_eq!(page_two.items[0].id, "owner-a");
+        assert_eq!(page_two.items[0].usage.as_ref().unwrap().total_tokens, 11);
+
+        let direct = query_activity_detail_on(&connection, "paged-usage-owner", "owner-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(direct.usage.unwrap().total_tokens, 11);
+        let direct_user = query_activity_detail_on(&connection, "paged-usage-owner", "user-owner")
+            .unwrap()
+            .unwrap();
+        assert!(direct_user.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn activity_detail_rejects_malformed_and_wrong_scope_cursors() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('cursor-thread','Cursor thread',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('cursor-thread','cursor-thread',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z',0);
+                 INSERT INTO turns(id,thread_id,rollout_id,started_at,status) VALUES
+                    ('cursor-turn-a','cursor-thread','cursor-thread',
+                     '2026-07-01T00:00:00.000000000Z','completed'),
+                    ('cursor-turn-b','cursor-thread','cursor-thread',
+                     '2026-07-01T00:01:00.000000000Z','completed');
+                 INSERT INTO events(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,
+                    kind,role,body,native
+                 ) VALUES
+                    ('cursor-event-a','cursor-thread','cursor-thread','cursor-turn-a',
+                     '2026-07-01T00:00:01.000000000Z',1,
+                     'assistant','assistant','First',1),
+                    ('cursor-event-b','cursor-thread','cursor-thread','cursor-turn-a',
+                     '2026-07-01T00:00:02.000000000Z',2,
+                     'assistant','assistant','Second',1);",
+            )
+            .unwrap();
+        let first_page = super::query_activity_child_previews_cursor_page(
+            &connection,
+            "cursor-thread",
+            "cursor-turn-a",
+            1,
+            1,
+            None,
+        )
+        .unwrap();
+        let cursor = first_page
+            .next_cursor
+            .expect("a two-row first page must expose a continuation cursor");
+        drop(connection);
+
+        let state = ApiState::with_executor(
+            db,
+            IngestRoots {
+                active: None,
+                archive: None,
+            },
+            temp.path().join("frontend"),
+            PricingConfig {
+                url: "http://127.0.0.1:9/prices.json".into(),
+                refresh_interval_hours: 24,
+                timeout_seconds: 1,
+            },
+            DbExecutor::default(),
+        );
+        let malformed = super::session_activity_detail(
+            State(state.clone()),
+            AxumPath(("cursor-thread".into(), "cursor-turn-a".into())),
+            Query(super::ActivityDetailQuery {
+                child_page: Some(2),
+                child_page_size: Some(1),
+                child_cursor: Some("not a cursor".into()),
+            }),
+        )
+        .await;
+        let Err(malformed) = malformed else {
+            panic!("malformed Activity cursor was accepted");
+        };
+        assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
+
+        let wrong_scope = super::session_activity_detail(
+            State(state),
+            AxumPath(("cursor-thread".into(), "cursor-turn-b".into())),
+            Query(super::ActivityDetailQuery {
+                child_page: Some(2),
+                child_page_size: Some(1),
+                child_cursor: Some(cursor),
+            }),
+        )
+        .await;
+        let Err(wrong_scope) = wrong_scope else {
+            panic!("Activity cursor from another turn was accepted");
+        };
+        assert_eq!(wrong_scope.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn activity_usage_cost_converts_fixed_point_only_after_attribution() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO model_prices(
+                    model_id,effective_from,input_microusd_per_million,
+                    cached_input_microusd_per_million,output_microusd_per_million,
+                    currency,source
+                 ) VALUES(
+                    'decimal-attribution','1970-01-01T00:00:00.000000000Z',
+                    1000000000,1000000000,1000000000,'USD','manual'
+                 );
+                 INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('exact-activity','Exact activity',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('exact-activity','exact-activity',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z',0);
+                 INSERT INTO agent_runs(
+                    id,thread_id,rollout_id,nickname,started_at,status
+                 ) VALUES(
+                    'exact-agent','exact-activity','exact-activity','Exact agent',
+                    '2026-07-01T00:00:00.000000000Z','completed'
+                 );
+                 INSERT INTO turns(
+                    id,thread_id,rollout_id,agent_run_id,started_at,status
+                 ) VALUES(
+                    'exact-turn','exact-activity','exact-activity','exact-agent',
+                    '2026-07-01T00:00:00.000000000Z','completed'
+                 );
+                 INSERT INTO events(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,kind,role,body,native
+                 ) VALUES(
+                    'exact-owner','exact-activity','exact-activity','exact-turn',
+                    '2026-07-01T00:00:10.000000000Z',10,
+                    'assistant','assistant','Exact response',1
+                 );
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL SELECT value+1 FROM sequence WHERE value<9
+                 )
+                 INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,turn_id,agent_run_id,timestamp,source_line,model,
+                    input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens,native
+                 )
+                 SELECT printf('exact-usage-%02d',value),'exact-activity','exact-activity',
+                        'exact-turn','exact-agent','2026-07-01T00:00:11.000000000Z',11,
+                        'decimal-attribution',100,0,0,0,100,1
+                 FROM sequence;",
+            )
+            .unwrap();
+
+        let list_item =
+            query_activity_child_previews_page(&connection, "exact-activity", "exact-turn", 1, 25)
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|item| item.id == "exact-owner")
+                .unwrap();
+        let list_usage = list_item.usage.unwrap();
+        assert_eq!(list_usage.total_tokens, 1_000);
+        assert_eq!(list_usage.cost_usd.unwrap().decimal_string(), "1.00");
+
+        let detail_usage = query_activity_detail_on(&connection, "exact-activity", "exact-owner")
+            .unwrap()
+            .unwrap()
+            .usage
+            .unwrap();
+        assert_eq!(detail_usage.total_tokens, 1_000);
+        assert_eq!(detail_usage.cost_usd.unwrap().decimal_string(), "1.00");
+
+        let totals =
+            super::query_totals_on(&connection, None, None, Some("exact-activity")).unwrap();
+        assert_eq!(totals.known_cost_numerator, 1_000_000_000_000);
+        let model = super::query_model_usage_on(&connection, "exact-activity").unwrap();
+        assert_eq!(model[0].cost_usd.unwrap().decimal_string(), "1.00");
+        let agent_summary = super::query_agent_summary_on(&connection, "exact-activity").unwrap();
+        assert_eq!(agent_summary[0].cost_usd.unwrap().decimal_string(), "1.00");
+    }
+
+    #[test]
     #[ignore = "performance benchmark; run explicitly with --ignored --nocapture"]
     fn activity_large_session_query_and_assembly_stays_within_regression_budget() {
-        const TOOL_CALLS: u64 = 500_000;
+        const TOOL_EVENTS: u64 = 500_000;
         const SAMPLES: usize = 3;
         const REGRESSION_BUDGET: StdDuration = StdDuration::from_millis(2_500);
 
@@ -7405,41 +9758,243 @@ mod tests {
                         ELSE 'browser'
                     END,
                     'completed',1
+                 FROM sequence;
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0
+                    UNION ALL
+                    SELECT value + 1 FROM sequence WHERE value + 1 < 500000
+                 )
+                 INSERT INTO events(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,
+                    kind,call_id,native
+                 )
+                 SELECT
+                    printf('activity-scale-event-%06d',value),
+                    'activity-scale','activity-scale','activity-scale-turn',
+                    '2026-07-01T00:00:01.000000000Z',value + 2,
+                    'tool_call',printf('activity-scale-call-%06d',value),1
                  FROM sequence;",
             )
             .unwrap();
         drop(connection);
 
-        let mut samples = Vec::with_capacity(SAMPLES);
+        let mut list_samples = Vec::with_capacity(SAMPLES);
+        let mut detail_samples = Vec::with_capacity(SAMPLES);
+        let mut numeric_deep_samples = Vec::with_capacity(SAMPLES);
+        let mut cursor_deep_samples = Vec::with_capacity(SAMPLES);
         for sample in 1..=SAMPLES {
             // A new connection exercises per-request statement preparation and temporary
             // Activity tables while leaving fixture creation outside the measurement.
             let connection = db.connect().unwrap();
             let started = Instant::now();
-            let response = query_activity_on(&connection, "activity-scale", 1, 25).unwrap();
+            let response = query_activity_on(&connection, "activity-scale", 1, 1).unwrap();
             let encoded = serde_json::to_vec(&response).unwrap();
-            let elapsed = started.elapsed();
+            let list_elapsed = started.elapsed();
 
             assert!(!encoded.is_empty());
             assert_eq!(response.items.len(), 1);
             assert_eq!(
                 response.items[0].counts.as_ref().unwrap().tool_calls,
-                TOOL_CALLS
+                TOOL_EVENTS
             );
-            eprintln!("Activity 500k sample {sample}: {elapsed:?}");
-            samples.push(elapsed);
+            eprintln!("Activity 500k combined list sample {sample}: {list_elapsed:?}");
+            list_samples.push(list_elapsed);
+
+            let started = Instant::now();
+            let detail = query_activity_detail_page_on(
+                &connection,
+                "activity-scale",
+                "activity-scale-turn",
+                1,
+                1,
+            )
+            .unwrap()
+            .unwrap();
+            let encoded = serde_json::to_vec(&detail).unwrap();
+            let detail_elapsed = started.elapsed();
+            assert!(!encoded.is_empty());
+            assert_eq!(detail.child_total, Some(TOOL_EVENTS + 1));
+            assert_eq!(detail.children.len(), 1);
+            assert_eq!(
+                detail.children[0].id, "activity-scale-event-499999",
+                "the first detail page must use canonical descending index order"
+            );
+            assert!(detail.child_next_cursor.is_some());
+            eprintln!("Activity 500k combined detail sample {sample}: {detail_elapsed:?}");
+            detail_samples.push(detail_elapsed);
+
+            let started = Instant::now();
+            let numeric_deep = query_activity_detail_page_on(
+                &connection,
+                "activity-scale",
+                "activity-scale-turn",
+                TOOL_EVENTS,
+                1,
+            )
+            .unwrap()
+            .unwrap();
+            let encoded = serde_json::to_vec(&numeric_deep).unwrap();
+            let numeric_deep_elapsed = started.elapsed();
+            assert!(!encoded.is_empty());
+            assert_eq!(numeric_deep.child_page, Some(TOOL_EVENTS));
+            assert_eq!(numeric_deep.child_total, Some(TOOL_EVENTS + 1));
+            assert_eq!(numeric_deep.children.len(), 1);
+            assert_eq!(
+                numeric_deep.children[0].id, "activity-scale-event-000000",
+                "the compatibility OFFSET path must still reach the deep canonical row"
+            );
+            let deep_cursor = numeric_deep
+                .child_next_cursor
+                .clone()
+                .expect("the penultimate detail row must expose a cursor");
+            eprintln!("Activity 500k deep numeric sample {sample}: {numeric_deep_elapsed:?}");
+            numeric_deep_samples.push(numeric_deep_elapsed);
+
+            let started = Instant::now();
+            let cursor_deep = super::query_activity_detail_cursor_page_on(
+                &connection,
+                "activity-scale",
+                "activity-scale-turn",
+                TOOL_EVENTS + 1,
+                1,
+                Some(&deep_cursor),
+            )
+            .unwrap()
+            .unwrap();
+            let encoded = serde_json::to_vec(&cursor_deep).unwrap();
+            let cursor_deep_elapsed = started.elapsed();
+            assert!(!encoded.is_empty());
+            assert_eq!(cursor_deep.child_page, Some(TOOL_EVENTS + 1));
+            assert_eq!(cursor_deep.child_total, Some(TOOL_EVENTS + 1));
+            assert_eq!(cursor_deep.children.len(), 1);
+            assert_eq!(
+                cursor_deep.children[0].id, "activity-scale-user",
+                "the deep keyset seek must continue exactly after its scoped cursor"
+            );
+            assert_eq!(cursor_deep.child_has_more, Some(false));
+            assert!(cursor_deep.child_next_cursor.is_none());
+            eprintln!("Activity 500k deep cursor sample {sample}: {cursor_deep_elapsed:?}");
+            cursor_deep_samples.push(cursor_deep_elapsed);
         }
 
-        samples.sort_unstable();
-        let median = samples[SAMPLES / 2];
-        let slowest = samples[SAMPLES - 1];
+        list_samples.sort_unstable();
+        detail_samples.sort_unstable();
+        numeric_deep_samples.sort_unstable();
+        cursor_deep_samples.sort_unstable();
+        let list_median = list_samples[SAMPLES / 2];
+        let list_slowest = list_samples[SAMPLES - 1];
+        let detail_median = detail_samples[SAMPLES / 2];
+        let detail_slowest = detail_samples[SAMPLES - 1];
+        let numeric_deep_median = numeric_deep_samples[SAMPLES / 2];
+        let numeric_deep_slowest = numeric_deep_samples[SAMPLES - 1];
+        let cursor_deep_median = cursor_deep_samples[SAMPLES / 2];
+        let cursor_deep_slowest = cursor_deep_samples[SAMPLES - 1];
         eprintln!(
-            "Activity 500k query/assembly: median={median:?}, slowest={slowest:?}, budget={REGRESSION_BUDGET:?}"
+            "Activity 500k combined: list median={list_median:?}, slowest={list_slowest:?}; \
+             first detail median={detail_median:?}, slowest={detail_slowest:?}; \
+             deep numeric median={numeric_deep_median:?}, slowest={numeric_deep_slowest:?}; \
+             deep cursor median={cursor_deep_median:?}, slowest={cursor_deep_slowest:?}; \
+             budget={REGRESSION_BUDGET:?}"
         );
         assert!(
-            slowest <= REGRESSION_BUDGET,
-            "500k-event Activity query/assembly regressed: median={median:?}, slowest={slowest:?}, budget={REGRESSION_BUDGET:?}"
+            list_slowest <= REGRESSION_BUDGET,
+            "500k combined Activity list regressed: median={list_median:?}, \
+             slowest={list_slowest:?}, budget={REGRESSION_BUDGET:?}"
         );
+        assert!(
+            detail_slowest <= REGRESSION_BUDGET,
+            "500k combined Activity detail regressed: median={detail_median:?}, \
+             slowest={detail_slowest:?}, budget={REGRESSION_BUDGET:?}"
+        );
+        assert!(
+            numeric_deep_slowest <= REGRESSION_BUDGET,
+            "500k combined Activity deep numeric fallback regressed: \
+             median={numeric_deep_median:?}, slowest={numeric_deep_slowest:?}, \
+             budget={REGRESSION_BUDGET:?}"
+        );
+        assert!(
+            cursor_deep_slowest <= REGRESSION_BUDGET,
+            "500k combined Activity deep cursor seek regressed: \
+             median={cursor_deep_median:?}, slowest={cursor_deep_slowest:?}, \
+             budget={REGRESSION_BUDGET:?}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-mode performance gate; run with cargo test --release -- --ignored"
+    )]
+    fn activity_usage_heavy_queries_stay_under_one_second() {
+        const USAGE_FACTS: u64 = 500_000;
+        const BUDGET: StdDuration = StdDuration::from_secs(1);
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('activity-usage-scale','Activity usage scale',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:10:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('activity-usage-scale','activity-usage-scale',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:10:00.000000000Z',0);
+                 INSERT INTO turns(id,thread_id,rollout_id,started_at,status)
+                 VALUES('activity-usage-turn','activity-usage-scale','activity-usage-scale',
+                        '2026-07-01T00:00:00.000000000Z','completed');
+                 INSERT INTO events(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,kind,role,body,native
+                 ) VALUES('activity-usage-owner','activity-usage-scale','activity-usage-scale',
+                          'activity-usage-turn','2026-07-01T00:00:01.000000000Z',1,
+                          'assistant','assistant','Done',1);
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL
+                    SELECT value+1 FROM sequence WHERE value+1<500000
+                 )
+                 INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,model,
+                    input_tokens,cached_input_tokens,output_tokens,
+                    reasoning_tokens,total_tokens,native
+                 )
+                 SELECT printf('activity-usage-%06d',value),
+                        'activity-usage-scale','activity-usage-scale','activity-usage-turn',
+                        '2026-07-01T00:00:02.000000000Z',value+2,'gpt-5.5',
+                        1,0,1,0,2,1
+                 FROM sequence;",
+            )
+            .unwrap();
+        drop(connection);
+
+        for sample in 1..=3 {
+            let connection = db.connect().unwrap();
+            let started = Instant::now();
+            let list = query_activity_on(&connection, "activity-usage-scale", 1, 1).unwrap();
+            let list_elapsed = started.elapsed();
+            assert_eq!(
+                list.items[0].usage.as_ref().unwrap().total_tokens,
+                USAGE_FACTS * 2
+            );
+
+            let started = Instant::now();
+            let detail = query_activity_detail_page_on(
+                &connection,
+                "activity-usage-scale",
+                "activity-usage-turn",
+                1,
+                1,
+            )
+            .unwrap()
+            .unwrap();
+            let detail_elapsed = started.elapsed();
+            assert_eq!(detail.usage.as_ref().unwrap().total_tokens, USAGE_FACTS * 2);
+            assert!(
+                list_elapsed < BUDGET && detail_elapsed < BUDGET,
+                "usage-heavy Activity sample {sample} exceeded {BUDGET:?}: \
+                 list={list_elapsed:?}, detail={detail_elapsed:?}"
+            );
+        }
     }
 
     #[test]

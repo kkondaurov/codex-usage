@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
-import { shiftAnchor } from '../calendar'
 
 const FOCUSABLE_SELECTOR = [
   'button:not([disabled]):not([tabindex="-1"])',
@@ -13,6 +12,14 @@ const FOCUSABLE_SELECTOR = [
 
 function isoDate(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+function shiftCalendarMonth(date: Date, amount: number) {
+  const day = date.getDate()
+  const targetYear = date.getFullYear()
+  const targetMonth = date.getMonth() + amount
+  const lastDay = new Date(targetYear, targetMonth + 1, 0, 12).getDate()
+  return new Date(targetYear, targetMonth, Math.min(day, lastDay), 12)
 }
 
 function normalizeBoundary(value: string | null, isEnd: boolean) {
@@ -61,8 +68,8 @@ function CalendarMonth({
     else if (event.key === 'ArrowDown') next.setDate(next.getDate() + 7)
     else if (event.key === 'Home') next.setDate(next.getDate() - ((next.getDay() + 6) % 7))
     else if (event.key === 'End') next.setDate(next.getDate() + (6 - ((next.getDay() + 6) % 7)))
-    else if (event.key === 'PageUp') onMoveFocus(new Date(`${shiftAnchor(isoDate(next), 'month', -1)}T12:00:00`))
-    else if (event.key === 'PageDown') onMoveFocus(new Date(`${shiftAnchor(isoDate(next), 'month', 1)}T12:00:00`))
+    else if (event.key === 'PageUp') onMoveFocus(shiftCalendarMonth(next, -1))
+    else if (event.key === 'PageDown') onMoveFocus(shiftCalendarMonth(next, 1))
     else return
     event.preventDefault()
     if (event.key !== 'PageUp' && event.key !== 'PageDown') onMoveFocus(next)
@@ -82,12 +89,14 @@ function CalendarMonth({
               <button
                 type="button"
                 data-calendar-date={iso}
+                disabled={outside}
+                aria-hidden={outside || undefined}
                 tabIndex={!outside && iso === focusedDate ? 0 : -1}
                 aria-label={new Intl.DateTimeFormat('en-US', { dateStyle: 'long' }).format(date)}
                 className={`${outside ? 'outside' : ''} ${inRange ? 'in-range' : ''} ${iso === start ? 'range-start' : ''} ${iso === end ? 'range-end' : ''}`}
                 onFocus={() => { if (!outside) onMoveFocus(date) }}
-                onKeyDown={event => moveFrom(date, event)}
-                onClick={() => onSelect(iso)}
+                onKeyDown={event => { if (!outside) moveFrom(date, event) }}
+                onClick={() => { if (!outside) onSelect(iso) }}
               >{String(date.getDate()).padStart(2, '0')}</button>
             </span>
           )

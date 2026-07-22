@@ -1,25 +1,22 @@
+import type { DecimalString } from './decimal'
+import { formatUsd } from './decimal'
+
 const compactNumber = new Intl.NumberFormat('en-US', {
   notation: 'compact',
   maximumFractionDigits: 1,
 })
-const moneyFormatters = new Map<number, Intl.NumberFormat>()
 
-export function money(value: number | null, digits = 2) {
-  if (value === null) return '—'
-  let formatter = moneyFormatters.get(digits)
-  if (!formatter) {
-    formatter = new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-      minimumFractionDigits: digits,
-      maximumFractionDigits: digits,
-    })
-    moneyFormatters.set(digits, formatter)
-  }
-  return formatter.format(value)
+function parsedDate(value: string) {
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? date : null
 }
 
-export function estimatedMoney(value: number | null, unpricedTokens = 0, digits = 2) {
+export function money(value: DecimalString | null, digits = 2) {
+  if (value === null) return '—'
+  return formatUsd(value, digits)
+}
+
+export function estimatedMoney(value: DecimalString | null, unpricedTokens = 0, digits = 2) {
   return money(unpricedTokens > 0 ? null : value, digits)
 }
 
@@ -40,29 +37,36 @@ export function bytes(value: number) {
 }
 
 export function shortDate(value: string) {
-  return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(new Date(value))
+  const date = parsedDate(value)
+  return date ? new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(date) : '—'
 }
 
 export function shortDateTime(value: string) {
+  const date = parsedDate(value)
+  if (!date) return '—'
   return new Intl.DateTimeFormat('en-US', {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
-  }).format(new Date(value)).replace(',', ' ·')
+  }).format(date).replace(',', ' ·')
 }
 
 export function time(value: string) {
+  const date = parsedDate(value)
+  if (!date) return '—'
   return new Intl.DateTimeFormat('en-US', {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
-  }).format(new Date(value))
+  }).format(date)
 }
 
 export function relativeTime(value: string) {
-  const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000))
+  const date = parsedDate(value)
+  if (!date) return 'at an unknown time'
+  const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000))
   if (seconds < 60) return `${seconds}s ago`
   const minutes = Math.round(seconds / 60)
   if (minutes < 60) return `${minutes}m ago`

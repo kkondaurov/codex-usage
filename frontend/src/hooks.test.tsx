@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { invalidateAsyncCache, useAsync, useCachedAsync } from './hooks'
+import { clearAsyncCache, invalidateAsyncCache, useAsync, useCachedAsync } from './hooks'
 
 const STALE_MS = 30_000
 
@@ -27,6 +27,17 @@ function CacheProbe({ cacheKey, loader }: { cacheKey: string; loader: (signal: A
   return <span>{loading && !data ? 'loading' : data}</span>
 }
 
+function CachedRetryProbe({ loader }: { loader: (signal: AbortSignal) => Promise<string> }) {
+  const { data, error, loading, refresh } = useCachedAsync('retry-probe', loader, ['retry-probe'], STALE_MS)
+  return <>
+    <output aria-label="Cached data">{data ?? 'empty'}</output>
+    <output aria-label="Cached state">{loading ? 'loading' : 'idle'}</output>
+    {error && <span>{error.message}</span>}
+    <button type="button" onClick={() => void refresh(true)}>QUIET REFRESH</button>
+    <button type="button" onClick={() => void refresh()}>RETRY</button>
+  </>
+}
+
 function AsyncProbe({ requestKey, loader }: { requestKey: string; loader: (signal: AbortSignal) => Promise<string> }) {
   const { data, error, loading } = useAsync(loader, [requestKey])
   if (error && !data) return <span>{error.message}</span>
@@ -39,12 +50,24 @@ function AsyncHealthProbe({ loader }: { loader: (signal: AbortSignal) => Promise
   return <><span>{data ?? 'loading'}</span><output aria-label="Last success">{lastSuccessfulAt ?? 'none'}</output>{error && <span>{error.message}</span>}<button type="button" onClick={() => void refresh(true)}>REFRESH</button></>
 }
 
+function AsyncRetryProbe({ loader }: { loader: (signal: AbortSignal) => Promise<string> }) {
+  const { data, error, loading, refresh } = useAsync(loader, ['retry-probe'])
+  return <>
+    <output aria-label="Async data">{data ?? 'empty'}</output>
+    <output aria-label="Async state">{loading ? 'loading' : 'idle'}</output>
+    {error && <span>{error.message}</span>}
+    <button type="button" onClick={() => void refresh(true)}>QUIET REFRESH</button>
+    <button type="button" onClick={() => void refresh()}>RETRY</button>
+  </>
+}
+
 beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(new Date('2026-07-17T12:00:00+02:00'))
 })
 
 afterEach(() => {
+  clearAsyncCache()
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
@@ -104,6 +127,34 @@ describe('useCachedAsync', () => {
 
     expect(screen.getByText('last good overview')).toBeInTheDocument()
     expect(loader).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears a stale background error when an explicit retry starts', async () => {
+    const retry = deferred<string>()
+    const loader = vi.fn()
+      .mockResolvedValueOnce('last good overview')
+      .mockRejectedValueOnce(new Error('background refresh failed'))
+      .mockReturnValueOnce(retry.promise)
+    render(<CachedRetryProbe loader={loader} />)
+    await flush()
+
+    fireEvent.click(screen.getByRole('button', { name: 'QUIET REFRESH' }))
+    await flush()
+    expect(screen.getByText('background refresh failed')).toBeInTheDocument()
+    expect(screen.getByLabelText('Cached data')).toHaveTextContent('last good overview')
+
+    fireEvent.click(screen.getByRole('button', { name: 'RETRY' }))
+    expect(screen.getByLabelText('Cached state')).toHaveTextContent('loading')
+    expect(screen.queryByText('background refresh failed')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Cached data')).toHaveTextContent('last good overview')
+
+    await act(async () => {
+      retry.resolve('recovered overview')
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(screen.getByLabelText('Cached state')).toHaveTextContent('idle')
+    expect(screen.getByLabelText('Cached data')).toHaveTextContent('recovered overview')
   })
 
   it('deduplicates an in-flight request across unmount and remount', async () => {
@@ -197,6 +248,36 @@ describe('useCachedAsync', () => {
     expect(currentYear).toHaveBeenCalledTimes(1)
     expect(previousYear).toHaveBeenCalledTimes(1)
   })
+
+  it('evicts the least recently used idle result when the bounded cache is full', async () => {
+    const firstLoader = vi.fn().mockResolvedValue('value 0')
+    const secondLoader = vi.fn().mockResolvedValue('value 1')
+    const view = render(<CacheProbe cacheKey="cache-key-0" loader={firstLoader} />)
+    await flush()
+
+    for (let index = 1; index < 64; index += 1) {
+      vi.advanceTimersByTime(1)
+      const loader = index === 1 ? secondLoader : vi.fn().mockResolvedValue(`value ${index}`)
+      view.rerender(<CacheProbe cacheKey={`cache-key-${index}`} loader={loader} />)
+      await flush()
+    }
+
+    // Touch the oldest entry so key 1, not key 0, becomes the LRU victim.
+    vi.advanceTimersByTime(1)
+    view.rerender(<CacheProbe cacheKey="cache-key-0" loader={firstLoader} />)
+    await flush()
+    expect(firstLoader).toHaveBeenCalledTimes(1)
+
+    vi.advanceTimersByTime(1)
+    view.rerender(<CacheProbe cacheKey="cache-key-64" loader={() => Promise.resolve('value 64')} />)
+    await flush()
+
+    view.rerender(<CacheProbe cacheKey="cache-key-1" loader={secondLoader} />)
+    await flush()
+
+    expect(secondLoader).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('value 1')).toBeInTheDocument()
+  })
 })
 
 describe('useAsync', () => {
@@ -240,6 +321,34 @@ describe('useAsync', () => {
     expect(screen.getByText('last good data')).toBeInTheDocument()
     expect(screen.getByText('background refresh failed')).toBeInTheDocument()
     expect(screen.getByLabelText('Last success')).toHaveTextContent(String(successfulAt))
+  })
+
+  it('clears a stale background error when an explicit retry starts', async () => {
+    const retry = deferred<string>()
+    const loader = vi.fn()
+      .mockResolvedValueOnce('last good data')
+      .mockRejectedValueOnce(new Error('background refresh failed'))
+      .mockReturnValueOnce(retry.promise)
+    render(<AsyncRetryProbe loader={loader} />)
+    await flush()
+
+    fireEvent.click(screen.getByRole('button', { name: 'QUIET REFRESH' }))
+    await flush()
+    expect(screen.getByText('background refresh failed')).toBeInTheDocument()
+    expect(screen.getByLabelText('Async data')).toHaveTextContent('last good data')
+
+    fireEvent.click(screen.getByRole('button', { name: 'RETRY' }))
+    expect(screen.getByLabelText('Async state')).toHaveTextContent('loading')
+    expect(screen.queryByText('background refresh failed')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Async data')).toHaveTextContent('last good data')
+
+    await act(async () => {
+      retry.resolve('recovered data')
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(screen.getByLabelText('Async state')).toHaveTextContent('idle')
+    expect(screen.getByLabelText('Async data')).toHaveTextContent('recovered data')
   })
 
   it('never exposes one request identity under another and surfaces the replacement error', async () => {

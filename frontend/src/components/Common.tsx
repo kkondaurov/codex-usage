@@ -10,7 +10,7 @@ export function PageTitle({ children }: { children: ReactNode }) {
 
 export function LoadingLedger({ rows = 8 }: { rows?: number }) {
   return (
-    <div className="loading-ledger" aria-label="Loading">
+    <div className="loading-ledger" aria-label="Loading" aria-busy="true">
       {Array.from({ length: rows }).map((_, index) => <div key={index} />)}
     </div>
   )
@@ -66,27 +66,31 @@ export function Pagination({
   total,
   pageSize,
   onPage,
+  busy = false,
 }: {
   page: number
   totalPages: number
   total: number
   pageSize: number
   onPage: (page: number) => void
+  busy?: boolean
 }) {
   const first = total === 0 ? 0 : (page - 1) * pageSize + 1
   const last = Math.min(page * pageSize, total)
+  const previousAtBoundary = page <= 1
+  const nextAtBoundary = page >= totalPages
   return (
-    <nav className="pagination" aria-label="Pagination">
+    <nav className="pagination" aria-label="Pagination" aria-busy={busy || undefined}>
       <span>{first}–{last} / {total.toLocaleString()} · {pageSize} PER PAGE</span>
       <div className="pagination-controls">
-        <button type="button" disabled={page <= 1} onClick={() => onPage(page - 1)}>
+        <button type="button" disabled={previousAtBoundary} aria-disabled={busy && !previousAtBoundary ? true : undefined} onClick={() => { if (!busy && !previousAtBoundary) onPage(page - 1) }}>
           PREVIOUS
         </button>
         {pageNumbers(page, totalPages).map((value, index) => value === 'ellipsis'
           ? <span key={`e-${index}`}>…</span>
-          : <button key={value} type="button" aria-current={value === page ? 'page' : undefined} className={value === page ? 'active' : ''} onClick={() => onPage(value)}>{String(value).padStart(2, '0')}</button>
+          : <button key={value} type="button" aria-disabled={busy || undefined} aria-current={value === page ? 'page' : undefined} className={value === page ? 'active' : ''} onClick={() => { if (!busy) onPage(value) }}>{String(value).padStart(2, '0')}</button>
         )}
-        <button type="button" disabled={page >= totalPages} onClick={() => onPage(page + 1)}>
+        <button type="button" disabled={nextAtBoundary} aria-disabled={busy && !nextAtBoundary ? true : undefined} onClick={() => { if (!busy && !nextAtBoundary) onPage(page + 1) }}>
           NEXT
         </button>
       </div>
