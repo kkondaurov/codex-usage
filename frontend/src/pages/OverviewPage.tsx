@@ -52,7 +52,7 @@ export function placeHeatmapCard(
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
-export function buildAnnualHeatmapLayout(year: number, days: HeatmapDay[], now = new Date()) {
+export function buildAnnualHeatmapLayout(year: number, days: HeatmapDay[], now = new Date(), includeCells = true) {
   const first = new Date(year, 0, 1)
   const mondayOffset = (first.getDay() + 6) % 7
   const gridStart = new Date(year, 0, 1 - mondayOffset)
@@ -60,22 +60,24 @@ export function buildAnnualHeatmapLayout(year: number, days: HeatmapDay[], now =
   const last = new Date(year, 11, 31)
   const weekCount = Math.floor((calendarDay(last) - calendarDay(gridStart)) / 7) + 1
   const cells: Array<{ day: HeatmapDay; week: number; row: number }> = []
-  for (let week = 0; week < weekCount; week += 1) {
-    for (let row = 0; row < 7; row += 1) {
-      const value = new Date(gridStart)
-      value.setDate(gridStart.getDate() + week * 7 + row)
-      if (value.getFullYear() !== year) continue
-      const iso = dateOnly(value)
-      const source = byDate.get(iso)
-      const entry = {
-        date: iso,
-        costUsd: source ? source.costUsd : '0',
-        sessionCount: source?.sessionCount ?? 0,
-        messageCount: source?.messageCount ?? 0,
-        totalTokens: source?.totalTokens ?? 0,
-        future: source?.future ?? calendarDay(value) > calendarDay(now),
+  if (includeCells) {
+    for (let week = 0; week < weekCount; week += 1) {
+      for (let row = 0; row < 7; row += 1) {
+        const value = new Date(gridStart)
+        value.setDate(gridStart.getDate() + week * 7 + row)
+        if (value.getFullYear() !== year) continue
+        const iso = dateOnly(value)
+        const source = byDate.get(iso)
+        const entry = {
+          date: iso,
+          costUsd: source ? source.costUsd : '0',
+          sessionCount: source?.sessionCount ?? 0,
+          messageCount: source?.messageCount ?? 0,
+          totalTokens: source?.totalTokens ?? 0,
+          future: source?.future ?? calendarDay(value) > calendarDay(now),
+        }
+        cells.push({ day: entry, week, row })
       }
-      cells.push({ day: entry, week, row })
     }
   }
   const months = MONTH_NAMES.map((name, month) => {
@@ -194,7 +196,7 @@ function AnnualHeatmap({
   onPrevious: () => void
   onNext: () => void
 }) {
-  const layout = useMemo(() => buildAnnualHeatmapLayout(year, days ?? []), [days, year])
+  const layout = useMemo(() => buildAnnualHeatmapLayout(year, days ?? [], new Date(), !error), [days, error, year])
   const maxCost = (days ?? []).reduce(
     (maximum, day) => day.costUsd != null && compareDecimal(day.costUsd, maximum) > 0 ? day.costUsd : maximum,
     '1',
@@ -241,9 +243,17 @@ function AnnualHeatmap({
     focusCardAction.current = focusAction
     setCard({ day, anchor, pinned: true })
   }
-  const moveRovingFocus = (date: string, offset: number) => {
-    const currentIndex = layout.cells.findIndex(cell => cell.day.date === date)
-    const next = layout.cells[currentIndex + offset]
+  const moveRovingFocus = (date: string, key: string) => {
+    const current = layout.cells.find(cell => cell.day.date === date)
+    if (!current) return
+    const target = key === 'ArrowLeft'
+      ? { week: current.week - 1, row: current.row }
+      : key === 'ArrowRight'
+        ? { week: current.week + 1, row: current.row }
+        : key === 'ArrowUp'
+          ? { week: current.week, row: current.row - 1 }
+          : { week: current.week, row: current.row + 1 }
+    const next = layout.cells.find(cell => cell.week === target.week && cell.row === target.row)
     if (!next || next.day.future || loading || error) return
     setFocusDate(next.day.date)
     const nextTile = gridRef.current
@@ -295,10 +305,9 @@ function AnnualHeatmap({
       pinCard(day, tile, true)
       return
     }
-    const offset = event.key === 'ArrowLeft' ? -7 : event.key === 'ArrowRight' ? 7 : event.key === 'ArrowUp' ? -1 : event.key === 'ArrowDown' ? 1 : null
-    if (offset === null) return
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return
     event.preventDefault()
-    moveRovingFocus(day.date, offset)
+    moveRovingFocus(day.date, event.key)
   }
   const clickedTile = (event: ReactMouseEvent<HTMLDivElement>) => {
     const tile = tileFromTarget(event.target)
@@ -366,7 +375,7 @@ function AnnualHeatmap({
   return (
     <section className="annual-section" role="region" aria-label={`${year} yearly usage ledger`} tabIndex={0}>
       <div className="heatmap-header" style={{ '--heatmap-weeks': layout.weekCount } as CSSProperties}>
-        <div className="year-control"><button type="button" aria-label="Previous year" disabled={year <= MIN_PUBLIC_YEAR} onClick={() => { setCard(null); setCardPosition(null); onPrevious() }}><CaretLeft weight="bold" /></button><strong>{year}</strong><button type="button" aria-label="Next year" disabled={year >= new Date().getFullYear()} onClick={() => { setCard(null); setCardPosition(null); onNext() }}><CaretRight weight="bold" /></button></div>
+        <div className="year-control"><button type="button" aria-label="Previous year" aria-disabled={year <= MIN_PUBLIC_YEAR || undefined} onClick={() => { if (year <= MIN_PUBLIC_YEAR) return; setCard(null); setCardPosition(null); onPrevious() }}><CaretLeft weight="bold" /></button><strong>{year}</strong><button type="button" aria-label="Next year" aria-disabled={year >= new Date().getFullYear() || undefined} onClick={() => { if (year >= new Date().getFullYear()) return; setCard(null); setCardPosition(null); onNext() }}><CaretRight weight="bold" /></button></div>
         {layout.months.map(month => <span key={month.name} style={{ gridColumn: month.week + 2 }}>{month.name}</span>)}
       </div>
       <div className="heatmap-layout">
@@ -385,7 +394,7 @@ function AnnualHeatmap({
           onKeyDown={pressedTileKey}
           onClick={clickedTile}
         >
-          {!loading && layout.cells.map(({ day, week, row }) => {
+          {!loading && !error && layout.cells.map(({ day, week, row }) => {
             const intensity = day.costUsd === null
               ? 'unknown'
               : decimalSign(day.costUsd) === 0

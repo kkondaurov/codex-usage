@@ -1,15 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 
-const FOCUSABLE_SELECTOR = [
-  'button:not([disabled]):not([tabindex="-1"])',
-  'a[href]',
-  'input:not([disabled])',
-  'select:not([disabled])',
-  'textarea:not([disabled])',
-  '[tabindex]:not([tabindex="-1"])',
-].join(',')
-
 function isoDate(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
@@ -138,39 +129,13 @@ export function RangeCalendar({
   useEffect(() => {
     const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null
     const dialog = dialogRef.current
-    const focusableElements = () => Array.from(dialog?.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR) ?? [])
-
-    const [first] = focusableElements()
     const selectedDay = dialog?.querySelector<HTMLElement>('[data-calendar-date][tabindex="0"]')
-    ;(selectedDay ?? first ?? dialog)?.focus()
+    ;(selectedDay ?? dialog)?.focus()
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        onCancelRef.current()
-        return
-      }
-      if (event.key !== 'Tab') return
-
-      const focusable = focusableElements()
-      if (focusable.length === 0) {
-        event.preventDefault()
-        dialog?.focus()
-        return
-      }
-
-      const firstElement = focusable[0]
-      const lastElement = focusable[focusable.length - 1]
-      if (event.shiftKey && document.activeElement === firstElement) {
-        event.preventDefault()
-        lastElement.focus()
-      } else if (!event.shiftKey && document.activeElement === lastElement) {
-        event.preventDefault()
-        firstElement.focus()
-      } else if (dialog && !dialog.contains(document.activeElement)) {
-        event.preventDefault()
-        firstElement.focus()
-      }
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      onCancelRef.current()
     }
     document.addEventListener('keydown', handleKeyDown)
     return () => {
@@ -219,7 +184,7 @@ export function RangeCalendar({
   }
 
   return (
-    <div ref={dialogRef} id={id} className="range-calendar" role="dialog" aria-modal="true" aria-label="Choose date range" tabIndex={-1}>
+    <div ref={dialogRef} id={id} className="range-calendar" role="dialog" aria-modal="false" aria-label="Choose date range" tabIndex={-1}>
       <div className="calendar-nav">
         <button type="button" onClick={() => showMonth(-1)}>PREVIOUS</button>
         <button type="button" onClick={() => showMonth(1)}>NEXT</button>

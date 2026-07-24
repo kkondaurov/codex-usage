@@ -175,6 +175,37 @@ describe('SessionDetailPage activity', () => {
     expect(screen.queryByText('Russell')).not.toBeInTheDocument()
   })
 
+  it('offers summary disclosure only when the text is actually truncated', async () => {
+    const shortPrompt = 'Please keep this short summary visible as-is.'
+    const longResult = `Long result ${'with enough detail to require disclosure. '.repeat(10)}`
+    vi.spyOn(api, 'sessionSummary').mockResolvedValue({
+      ...summary,
+      session: {
+        ...summary.session,
+        firstPrompt: shortPrompt,
+        latestResult: longResult,
+      },
+    })
+
+    render(
+      <MemoryRouter initialEntries={['/sessions/session-1']}>
+        <Routes>
+          <Route path="/sessions/:sessionId" element={<SessionDetailPage />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByText(shortPrompt)).toBeVisible()
+    const expand = screen.getByRole('button', { name: 'EXPAND' })
+    expect(screen.getAllByRole('button', { name: 'EXPAND' })).toHaveLength(1)
+    expect(screen.queryByText(longResult)).not.toBeInTheDocument()
+
+    fireEvent.click(expand)
+    const latestResultCard = screen.getByText('LATEST ASSISTANT RESULT').closest('article')
+    expect(latestResultCard?.querySelector('p')).toHaveTextContent(longResult.trim())
+    expect(screen.getByRole('button', { name: 'COLLAPSE' })).toHaveAttribute('aria-expanded', 'true')
+  })
+
   it('keeps useful model usage in Summary and removes the raw Usage tab', async () => {
     vi.spyOn(api, 'sessionSummary').mockResolvedValue({
       ...summary,
@@ -370,10 +401,10 @@ describe('SessionDetailPage activity', () => {
     expect(screen.getByText('Thread rolled back')).toBeVisible()
     expect(screen.getByText('1 turn removed from active history')).toBeVisible()
     const july16Divider = screen.getByText('JUL 16')
-    expect(july16Divider).toHaveClass('activity-child-date')
-    expect(july16Divider).toHaveAttribute('role', 'presentation')
-    expect(july16Divider).toHaveAttribute('aria-hidden', 'true')
-    expect(screen.getAllByText('JUL 15').some(element => element.classList.contains('activity-child-date'))).toBe(true)
+    expect(july16Divider.closest('.activity-child-date')).toHaveAttribute('role', 'listitem')
+    expect(july16Divider.closest('.activity-child-date')).not.toHaveAttribute('aria-hidden')
+    expect(july16Divider).toHaveAttribute('datetime', '2026-07-16')
+    expect(screen.getAllByText('JUL 15').some(element => element.closest('.activity-child-date') !== null)).toBe(true)
     const immediateRows = exchangeRow.parentElement!.querySelectorAll(':scope > .activity-detail-row > .activity-detail-cell > .activity-event-details > .activity-child-list > .activity-event-wrap > .activity-event')
     expect(immediateRows[0]).toHaveTextContent('Thread rolled back')
     expect(immediateRows[immediateRows.length - 1]).toHaveTextContent('Could you make the Activity timeline easier to scan?')
@@ -498,7 +529,7 @@ describe('SessionDetailPage activity', () => {
     const detail = vi.spyOn(api, 'sessionActivityDetail').mockImplementation((_sessionId, _eventId, _signal, page) => Promise.resolve(page === 1
       ? {
           ...root,
-          children: [{ ...child, id: 'page-1', body: 'First bounded child' }, lazyAgents],
+          children: [{ ...child, id: 'a-page-1', body: 'First bounded child' }, lazyAgents],
           childPage: 1,
           childPageSize: 2,
           childTotal: 2,
@@ -507,7 +538,7 @@ describe('SessionDetailPage activity', () => {
         }
       : {
           ...root,
-          children: [{ ...child, id: 'page-2', body: 'Second bounded child' }, lazyAgents],
+          children: [{ ...child, id: 'z-page-2', body: 'Second bounded child' }, lazyAgents],
           childPage: 2,
           childPageSize: 2,
           childTotal: 2,
@@ -538,6 +569,10 @@ describe('SessionDetailPage activity', () => {
     ))
     expect(await screen.findByText('Second bounded child')).toBeVisible()
     expect(screen.getByText('First bounded child')).toBeVisible()
+    expect(screen.getAllByText(/bounded child$/).map(node => node.textContent)).toEqual([
+      'First bounded child',
+      'Second bounded child',
+    ])
     expect(screen.getAllByText('Agents · 1')).toHaveLength(1)
     expect(screen.queryByRole('button', { name: /LOAD MORE ·/ })).not.toBeInTheDocument()
   })
@@ -754,6 +789,9 @@ describe('SessionDetailPage activity', () => {
     expect(await screen.findByText('Only next-day child')).toBeVisible()
     const divider = container.querySelector('.activity-child-date')
     expect(divider).toHaveTextContent('JUL 16')
+    expect(divider).toHaveAttribute('role', 'listitem')
+    expect(divider).not.toHaveAttribute('aria-hidden')
+    expect(divider?.querySelector('time')).toHaveAttribute('datetime', '2026-07-16')
   })
 
   it('clears a detail error after a successful retry', async () => {

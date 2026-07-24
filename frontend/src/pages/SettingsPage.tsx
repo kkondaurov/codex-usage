@@ -253,13 +253,20 @@ function PriceData() {
   const rawPage = Number(params.get('page') ?? 1)
   const page = Number.isSafeInteger(rawPage) && rawPage > 0 ? rawPage : 1
   const query = params.get('q') ?? ''
+  const rawAliasQuery = params.get('aliasQ') ?? ''
+  const aliasQuery = rawAliasQuery.trim()
+  const rawAliasPage = params.get('aliasPage')
+  const parsedAliasPage = Number(rawAliasPage ?? 1)
+  const aliasPage = Number.isSafeInteger(parsedAliasPage) && parsedAliasPage > 0 ? parsedAliasPage : 1
   const [search, setSearch] = useState(query)
+  const [aliasSearch, setAliasSearch] = useState(aliasQuery)
   const [refreshing, setRefreshing] = useState(false)
   const [mutationError, setMutationError] = useState<string | null>(null)
   const [editor, setEditor] = useState<Editor | null>(null)
   const settings = useAsync(signal => api.settings(signal), [])
   const metadata = useAsync(signal => api.priceMetadata(signal), [])
   const { data, error, loading, lastSuccessfulAt, refresh, refreshOrThrow } = useAsync(signal => api.prices({ q: query || undefined, page }, signal), [query, page])
+  const aliases = useAsync(signal => api.aliases({ q: aliasQuery || undefined, page: aliasPage }, signal), [aliasQuery, aliasPage])
   const models = useMemo(() => [...new Set(data?.items.map(item => item.modelId) ?? [])].sort(), [data?.items])
   const commitSearch = useCallback((value: string) => {
     const next = new URLSearchParams(params)
@@ -268,10 +275,21 @@ function PriceData() {
     next.delete('page')
     setParams(next, { replace: true })
   }, [params, setParams])
+  const commitAliasSearch = useCallback((value: string) => {
+    const next = new URLSearchParams(params)
+    next.set('tab', 'price-data')
+    if (value.trim()) next.set('aliasQ', value.trim()); else next.delete('aliasQ')
+    next.delete('aliasPage')
+    setParams(next, { replace: true })
+  }, [params, setParams])
 
   useEffect(() => {
     setSearch(current => current === query ? current : query)
   }, [query])
+
+  useEffect(() => {
+    setAliasSearch(current => current === aliasQuery ? current : aliasQuery)
+  }, [aliasQuery])
 
   useEffect(() => {
     const normalized = search.trim()
@@ -279,6 +297,24 @@ function PriceData() {
     const timer = window.setTimeout(() => commitSearch(normalized), 220)
     return () => window.clearTimeout(timer)
   }, [commitSearch, query, search])
+
+  useEffect(() => {
+    const normalized = aliasSearch.trim()
+    if (normalized === aliasQuery) return
+    const timer = window.setTimeout(() => commitAliasSearch(normalized), 220)
+    return () => window.clearTimeout(timer)
+  }, [aliasQuery, aliasSearch, commitAliasSearch])
+
+  useEffect(() => {
+    const canonicalAliasPage = aliasPage > 1 ? String(aliasPage) : null
+    const canonicalAliasQuery = aliasQuery || null
+    if (rawAliasPage === canonicalAliasPage && (params.get('aliasQ') || null) === canonicalAliasQuery) return
+    const next = new URLSearchParams(params)
+    next.set('tab', 'price-data')
+    if (canonicalAliasPage) next.set('aliasPage', canonicalAliasPage); else next.delete('aliasPage')
+    if (canonicalAliasQuery) next.set('aliasQ', canonicalAliasQuery); else next.delete('aliasQ')
+    setParams(next, { replace: true })
+  }, [aliasPage, aliasQuery, params, rawAliasPage, setParams])
 
   useEffect(() => {
     if (!data) return
@@ -290,15 +326,33 @@ function PriceData() {
     setParams(next, { replace: true })
   }, [data, page, params, setParams])
 
+  useEffect(() => {
+    if (!aliases.data) return
+    const lastPage = Math.max(1, aliases.data.totalPages)
+    if (aliasPage <= lastPage) return
+    const next = new URLSearchParams(params)
+    next.set('tab', 'price-data')
+    if (lastPage > 1) next.set('aliasPage', String(lastPage)); else next.delete('aliasPage')
+    setParams(next, { replace: true })
+  }, [aliasPage, aliases.data, params, setParams])
+
   async function refreshAfterMutation(successMessage: string) {
     setMutationError(null)
     invalidateAsyncCache('overview', 'stats:')
-    try {
-      await Promise.all([refreshOrThrow(), metadata.refreshOrThrow()])
-    } catch (nextError) {
-      const detail = nextError instanceof Error ? nextError.message : 'Reload failed'
-      setMutationError(`${successMessage}, but the price list could not be reloaded: ${detail}`)
-    }
+    const results = await Promise.allSettled([
+      refreshOrThrow(),
+      metadata.refreshOrThrow(),
+      aliases.refreshOrThrow(),
+    ])
+    const labels = ['price list', 'unknown-model data', 'alias list']
+    const failures = results.flatMap((result, index) => result.status === 'rejected'
+      ? [{ label: labels[index], detail: result.reason instanceof Error ? result.reason.message : 'Reload failed' }]
+      : [])
+    if (failures.length === 0) return
+    const failedSurfaces = failures.length === 1
+      ? `the ${failures[0].label}`
+      : failures.map(failure => failure.label).join(', ')
+    setMutationError(`${successMessage}, but ${failedSurfaces} could not be reloaded: ${failures.map(failure => failure.detail).join('; ')}`)
   }
 
   async function refreshPrices() {
@@ -340,6 +394,11 @@ function PriceData() {
     commitSearch(search)
   }
 
+  function submitAliasSearch(event: React.FormEvent) {
+    event.preventDefault()
+    commitAliasSearch(aliasSearch)
+  }
+
   const pageOutOfRange = Boolean(data && page > Math.max(1, data.totalPages))
   const visibleData = pageOutOfRange ? null : data
   const resultsLoading = loading || pageOutOfRange
@@ -356,6 +415,22 @@ function PriceData() {
     pageSize: visibleData.pageSize,
   } : paginationRef.current
   const paginationUnavailable = resultsLoading || (!visibleData && Boolean(error))
+  const aliasPageOutOfRange = Boolean(aliases.data && aliasPage > Math.max(1, aliases.data.totalPages))
+  const visibleAliases = aliasPageOutOfRange ? null : aliases.data
+  const aliasesLoading = aliases.loading || aliasPageOutOfRange
+  const aliasPaginationRef = useRef<{ page: number; totalPages: number; total: number; pageSize: number } | null>(null)
+  if (visibleAliases) {
+    aliasPaginationRef.current = visibleAliases.total > 0
+      ? { page: visibleAliases.page, totalPages: Math.max(1, visibleAliases.totalPages), total: visibleAliases.total, pageSize: visibleAliases.pageSize }
+      : null
+  }
+  const aliasPagination = visibleAliases?.total ? {
+    page: visibleAliases.page,
+    totalPages: Math.max(1, visibleAliases.totalPages),
+    total: visibleAliases.total,
+    pageSize: visibleAliases.pageSize,
+  } : aliasPaginationRef.current
+  const aliasPaginationUnavailable = aliasesLoading || (!visibleAliases && Boolean(aliases.error))
   return (
     <div className="price-settings">
       <span className="sr-only" aria-live="polite">{resultsLoading ? 'Loading model prices' : visibleData ? `${visibleData.total} model prices loaded` : ''}</span>
@@ -368,31 +443,36 @@ function PriceData() {
       {settings.error && <div className="settings-metadata-warning pricing-refresh-warning" role="alert"><span><strong>LOCAL DATABASE DETAILS UNAVAILABLE</strong><small>{settings.error.message}</small></span><button type="button" onClick={() => void settings.refresh()}>TRY AGAIN</button></div>}
       {visibleData?.refreshError && <div className="pricing-refresh-warning" role="alert"><span><strong>PRICE REFRESH FAILED{visibleData.refreshErrorKind ? ` · ${visibleData.refreshErrorKind.toUpperCase()}` : ''}</strong>{visibleData.lastRefreshErrorAt ? <> · {shortDateTime(visibleData.lastRefreshErrorAt).toUpperCase()}</> : null}<small>{visibleData.refreshError}</small></span><button type="button" disabled={refreshing} onClick={() => void refreshPrices()}>TRY AGAIN</button></div>}
       {mutationError && <div className="inline-error" role="alert">{mutationError}</div>}
-      {metadata.error && <div className="settings-metadata-warning pricing-refresh-warning" role="alert"><span><strong>MODEL MAPPINGS UNAVAILABLE</strong><small>{metadata.error.message}</small></span><button type="button" onClick={() => void metadata.refresh()}>TRY AGAIN</button></div>}
+      {metadata.error && <div className="settings-metadata-warning pricing-refresh-warning" role="alert"><span><strong>UNKNOWN MODEL DATA UNAVAILABLE</strong><small>{metadata.error.message}</small></span><button type="button" onClick={() => void metadata.refresh()}>TRY AGAIN</button></div>}
       {metadata.data && metadata.data.observedUnknown.length > 0 && (
         <div className="missing-price-banner expanded-warning"><span><strong>MISSING PRICE DATA</strong><small>{metadata.data.observedUnknown.map(item => unknownId(item)).join(', ')}</small></span><div>{metadata.data.observedUnknown.slice(0, 3).map(item => <button key={unknownId(item)} type="button" onClick={() => setEditor({ kind: 'alias', observed: unknownId(item) })}>MAP {unknownId(item)}</button>)}</div><b>{metadata.data.observedUnknownTotal} MODEL {metadata.data.observedUnknownTotal === 1 ? 'ID' : 'IDS'}</b></div>
       )}
       <form className="price-search" onSubmit={submitSearch}><label className="search-field"><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Search model IDs" aria-label="Search model prices" /></label></form>
       <div className="ledger-scroll price-scroll" role="region" aria-label="Scrollable model price ledger" aria-busy={resultsLoading || undefined} tabIndex={0}>
-        <section className="price-ledger" role="table" aria-label="Model prices" aria-rowcount={visibleData ? visibleData.total + 1 : undefined}>
-          <div className="price-head" role="row"><span role="columnheader">MODEL</span><span role="columnheader">SOURCE</span><span role="columnheader">INPUT / 1M</span><span role="columnheader">CACHED / 1M</span><span role="columnheader">OUTPUT / 1M</span><span role="columnheader" aria-label="Actions" /></div>
-          {visibleData?.items.map(price => {
+        <section className="price-ledger" role="table" aria-label="Model prices" aria-rowcount={visibleData && visibleData.total > 0 ? visibleData.total + 1 : undefined}>
+          <div className="price-head" role="row" aria-rowindex={visibleData && visibleData.total > 0 ? 1 : undefined}><span role="columnheader">MODEL</span><span role="columnheader">SOURCE</span><span role="columnheader">INPUT / 1M</span><span role="columnheader">CACHED / 1M</span><span role="columnheader">OUTPUT / 1M</span><span role="columnheader" aria-label="Actions" /></div>
+          {visibleData?.items.map((price, index) => {
             const manual = price.source === 'manual'
             const editLabel = manual ? `Edit ${price.modelId}` : `Override ${price.modelId} price`
-            return <div className="price-row" role="row" key={`${price.modelId}-${price.effectiveFrom}-${price.source}`}><span role="cell">{price.modelId}</span><span role="cell" className="price-source" title={price.source}>{priceSourceLabel(price.source)}</span><b role="cell">{priceMoney(price.inputPerMillion)}</b><b role="cell">{price.cachedInputPerMillion === null ? '—' : priceMoney(price.cachedInputPerMillion)}</b><b role="cell">{priceMoney(price.outputPerMillion)}</b><span role="cell" className="row-actions"><button type="button" aria-label={editLabel} title={manual ? 'Edit manual price' : 'Create a manual override'} onClick={() => setEditor({ kind: 'price', initial: price })}><PencilSimple /></button>{manual && <button type="button" aria-label={`Delete ${price.modelId}`} title="Delete manual price" onClick={() => void removePrice(price)}><Trash /></button>}</span></div>
+            return <div className="price-row" role="row" aria-rowindex={(visibleData.page - 1) * visibleData.pageSize + index + 2} key={`${price.modelId}-${price.effectiveFrom}-${price.source}`}><span role="cell">{price.modelId}</span><span role="cell" className="price-source" title={price.source}>{priceSourceLabel(price.source)}</span><b role="cell">{priceMoney(price.inputPerMillion)}</b><b role="cell">{price.cachedInputPerMillion === null ? '—' : priceMoney(price.cachedInputPerMillion)}</b><b role="cell">{priceMoney(price.outputPerMillion)}</b><span role="cell" className="row-actions"><button type="button" aria-label={editLabel} title={manual ? 'Edit manual price' : 'Create a manual override'} onClick={() => setEditor({ kind: 'price', initial: price })}><PencilSimple /></button>{manual && <button type="button" aria-label={`Delete ${price.modelId}`} title="Delete manual price" onClick={() => void removePrice(price)}><Trash /></button>}</span></div>
           })}
           {!visibleData && resultsLoading ? <div className="table-state-row" role="row"><div role="cell" aria-colspan={6}><LoadingLedger rows={8} /></div></div> : null}
           {error && !visibleData && !resultsLoading ? <div className="table-state-row" role="row"><div role="cell" aria-colspan={6}><ErrorState error={error} onRetry={() => void refresh()} /></div></div> : null}
           {visibleData?.items.length === 0 && <div className="table-state-row" role="row"><div className="usage-empty" role="cell" aria-colspan={6}>No prices match this search.</div></div>}
         </section>
-        {pagination && <Pagination {...pagination} busy={paginationUnavailable} onPage={value => { const next = new URLSearchParams(params); next.set('tab', 'price-data'); next.set('page', String(value)); setParams(next) }} />}
+        {pagination && <Pagination {...pagination} ariaLabel="Model price pagination" busy={paginationUnavailable} onPage={value => { const next = new URLSearchParams(params); next.set('tab', 'price-data'); next.set('page', String(value)); setParams(next) }} />}
       </div>
-      <div className="ledger-scroll alias-scroll" role="region" aria-label="Scrollable model alias ledger" tabIndex={0}>
+      <div className="ledger-scroll alias-scroll" role="region" aria-label="Scrollable model alias ledger" aria-busy={aliasesLoading || undefined} tabIndex={0}>
         <section className="alias-ledger">
           <h2>MODEL ALIASES</h2>
-          {metadata.data && metadata.data.aliasesTotal > metadata.data.aliases.length && <div className="usage-empty">Showing the first {metadata.data.aliases.length.toLocaleString()} of {metadata.data.aliasesTotal.toLocaleString()} model aliases.</div>}
-          {metadata.data ? metadata.data.aliases.length === 0 ? <div className="usage-empty">No model aliases configured.</div> : metadata.data.aliases.map(alias => <div className="alias-row" key={alias.observedModelId}><span>{alias.observedModelId}</span><b>USES</b><strong>{alias.canonicalModelId}</strong><span className="row-actions"><button type="button" aria-label={`Edit alias ${alias.observedModelId}`} onClick={() => setEditor({ kind: 'alias', initial: alias })}><PencilSimple /></button><button type="button" aria-label={`Delete alias ${alias.observedModelId}`} onClick={() => void removeAlias(alias)}><Trash /></button></span></div>) : <div className="usage-empty">Model aliases are loading.</div>}
+          <form className="alias-search" onSubmit={submitAliasSearch}><label className="search-field"><input value={aliasSearch} onChange={event => setAliasSearch(event.target.value)} placeholder="Search observed or canonical model IDs" aria-label="Search model aliases" /></label></form>
+          {aliases.error && visibleAliases && <DegradedDataNotice error={aliases.error} lastSuccessfulAt={aliases.lastSuccessfulAt} onRetry={() => void aliases.refresh()} />}
+          {!visibleAliases && aliasesLoading && <LoadingLedger rows={4} />}
+          {aliases.error && !visibleAliases && !aliasesLoading && <ErrorState error={aliases.error} onRetry={() => void aliases.refresh()} />}
+          {visibleAliases?.items.length === 0 && <div className="usage-empty">{aliasQuery ? 'No model aliases match this search.' : 'No model aliases configured.'}</div>}
+          {visibleAliases?.items.map(alias => <div className="alias-row" key={alias.observedModelId}><span>{alias.observedModelId}</span><b>USES</b><strong>{alias.canonicalModelId}</strong><span className="row-actions"><button type="button" aria-label={`Edit alias ${alias.observedModelId}`} onClick={() => setEditor({ kind: 'alias', initial: alias })}><PencilSimple /></button><button type="button" aria-label={`Delete alias ${alias.observedModelId}`} onClick={() => void removeAlias(alias)}><Trash /></button></span></div>)}
         </section>
+        {aliasPagination && <Pagination {...aliasPagination} ariaLabel="Model alias pagination" busy={aliasPaginationUnavailable} onPage={value => { const next = new URLSearchParams(params); next.set('tab', 'price-data'); if (value > 1) next.set('aliasPage', String(value)); else next.delete('aliasPage'); setParams(next) }} />}
       </div>
       {editor?.kind === 'price' && <PriceEditor initial={editor.initial} onClose={() => setEditor(current => current === editor ? null : current)} onSaved={refreshAfterMutation} />}
       {editor?.kind === 'alias' && <AliasEditor initial={editor.initial} observedModelId={editor.observed} models={models} onClose={() => setEditor(current => current === editor ? null : current)} onSaved={refreshAfterMutation} />}

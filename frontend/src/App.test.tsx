@@ -18,6 +18,11 @@ vi.mock('./pages/OverviewPage', () => ({
   },
 }))
 
+vi.mock('./pages/SessionsPage', () => ({ SessionsPage: () => <h1>Sessions</h1> }))
+vi.mock('./pages/SessionDetailPage', () => ({ SessionDetailPage: () => <h1>Session detail</h1> }))
+vi.mock('./pages/StatsPage', () => ({ StatsPage: () => <h1>Stats</h1> }))
+vi.mock('./pages/SettingsPage', () => ({ SettingsPage: () => <h1>Settings</h1> }))
+
 afterEach(() => {
   headerState.throws = false
   vi.restoreAllMocks()
@@ -49,5 +54,16 @@ describe('application shell recovery', () => {
     const main = screen.getByRole('main')
     expect(main).toHaveAttribute('id', 'main-content')
     expect(main).toHaveAttribute('tabindex', '-1')
+  })
+
+  it.each([
+    ['/', 'Overview · Codex usage'],
+    ['/sessions', 'Sessions · Codex usage'],
+    ['/sessions/019f6768-ef84-74d3-ab05-e4b5fb717fa8', 'Session 019f6768 · Codex usage'],
+    ['/stats', 'Stats · Codex usage'],
+    ['/settings', 'Settings · Codex usage'],
+  ])('sets a route-specific document title for %s', (entry, title) => {
+    render(<MemoryRouter initialEntries={[entry]}><App /></MemoryRouter>)
+    expect(document.title).toBe(title)
   })
 })

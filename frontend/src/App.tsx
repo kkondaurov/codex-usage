@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { AppErrorBoundary } from './components/AppErrorBoundary'
 import { AppHeader } from './components/AppHeader'
@@ -10,6 +11,20 @@ import { StatsPage } from './pages/StatsPage'
 export default function App() {
   const location = useLocation()
   const resetKey = `${location.pathname}${location.search}`
+  useEffect(() => {
+    const routeTitle = location.pathname === '/'
+      ? 'Overview'
+      : location.pathname === '/sessions'
+        ? 'Sessions'
+        : location.pathname.startsWith('/sessions/')
+          ? `Session ${location.pathname.slice('/sessions/'.length).slice(0, 8)}`
+          : location.pathname === '/stats'
+            ? 'Stats'
+            : location.pathname === '/settings'
+              ? 'Settings'
+              : 'Overview'
+    document.title = `${routeTitle} · Codex usage`
+  }, [location.pathname])
   return (
     <AppErrorBoundary resetKey={`shell:${resetKey}`}>
       <div className="app-shell">

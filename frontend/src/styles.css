@@ -124,7 +124,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .year-control { width: 76px; display: flex; align-items: center; justify-content: space-between; grid-column: 1; }
 .year-control strong { font-size: 14px; }
 .year-control button { border: 0; background: none; padding: 0; display: grid; place-items: center; cursor: pointer; }
-.year-control button:disabled { opacity: .25; }
+.year-control button:disabled, .year-control button[aria-disabled="true"] { opacity: .25; cursor: default; }
 .year-control svg { width: 12px; }
 .heatmap-layout { display: grid; grid-template-columns: 84px 1fr; }
 .weekday-labels { width: 76px; background: var(--blue); color: var(--text); display: grid; grid-template-rows: repeat(7, 29px); align-items: stretch; justify-items: stretch; }
@@ -469,7 +469,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .stats-navigator { grid-template-columns: 1fr 2fr 1fr; align-items: center; }
 .stats-navigator button { border: 0; background: transparent; color: var(--accent-text); font-size: 11px; font-weight: 600; display: flex; align-items: center; gap: 5px; cursor: pointer; }
 .stats-navigator button:last-child { justify-content: flex-end; }
-.stats-navigator button:disabled { color: var(--muted); }
+.stats-navigator button:disabled, .stats-navigator button[aria-disabled="true"] { color: var(--muted); cursor: default; }
 .stats-navigator strong { text-align: center; font-size: 16px; }
 .stats-ledger { margin: 0 32px 40px; }
 .stats-ledger .loading-ledger { margin: 0; }
@@ -528,9 +528,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .alias-scroll { margin-top: 36px; }
 .alias-ledger { min-width: 700px; border: 1px solid var(--text); background: var(--sheet); }
 .alias-ledger h2 { height: 40px; margin: 0; padding: 0 16px; display: flex; align-items: center; background: var(--wash); font-size: 12px; }
+.alias-search { padding: 12px 16px 16px; border-bottom: 1px solid var(--subtle); }
 .alias-row { min-height: 42px; display: grid; grid-template-columns: minmax(260px, 1fr) 70px minmax(260px, 1fr) 84px; align-items: center; padding: 0 16px; border-bottom: 1px solid var(--subtle); font-size: 12px; }
 .alias-row:last-child { border-bottom: 0; }
 .alias-row > b { color: var(--accent-text); font-size: 10px; text-align: center; }
+.alias-scroll > .pagination { margin-left: 0; margin-right: 0; }
 
 /* Price and alias editors */
 .editor-scrim { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 32px; overflow-y: auto; background: rgba(25,26,24,.37); }

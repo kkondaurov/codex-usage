@@ -24,10 +24,12 @@ function Metric({ label, children, accent = false }: { label: string; children: 
 
 function LongTextCard({ label, text, date, tone }: { label: string; text: string; date: string; tone: 'yellow' | 'blue' }) {
   const [expanded, setExpanded] = useState(false)
+  const collapsedText = ellipsis(text, 270)
+  const truncated = collapsedText !== text.replace(/\s+/g, ' ').trim()
   return (
-    <article className={`long-text-card ${tone} ${expanded ? 'expanded' : ''}`}>
-      <header><strong>{label}</strong><button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? 'COLLAPSE' : 'EXPAND'}</button></header>
-      <p>{expanded ? text : ellipsis(text, 270)}</p>
+    <article className={`long-text-card ${tone} ${truncated && expanded ? 'expanded' : ''}`}>
+      <header><strong>{label}</strong>{truncated && <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? 'COLLAPSE' : 'EXPAND'}</button>}</header>
+      <p>{truncated && expanded ? text : collapsedText}</p>
       <time>{shortDate(date).toUpperCase()} · {time(date)}</time>
     </article>
   )
@@ -236,10 +238,10 @@ function workUsage(items: ActivityItem[]) {
 }
 
 function newestFirst(children: ActivityItem[]) {
-  return [...children].sort((left, right) => {
-    const timestampOrder = Date.parse(right.timestamp) - Date.parse(left.timestamp)
-    return timestampOrder || right.id.localeCompare(left.id)
-  })
+  // Array sorting is stable. For equal timestamps, retain the backend's
+  // source-line-aware page order instead of inventing a lexical ID order that
+  // can reshuffle children when cursor pages are merged.
+  return [...children].sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp))
 }
 
 function mergeActivityDetail(current: ActivityItem, next: ActivityItem) {
@@ -522,7 +524,7 @@ function EventRow({
             {children.length > 0 && <div className="activity-child-list" role="list" aria-label={`${eventLabel(item)} events`}>{children.map((child, index) => {
               const day = activityDay(child.timestamp)
               const previousDay = index > 0 ? activityDay(children[index - 1].timestamp) : parentDay
-              return <Fragment key={child.id}>{showChildDates && day !== previousDay && <div className="activity-child-date" role="presentation" aria-hidden="true">{shortDate(child.timestamp).toUpperCase()}</div>}<EventRow sessionId={sessionId} item={child} depth={depth + 1} refreshRevision={refreshRevision} /></Fragment>
+              return <Fragment key={child.id}>{showChildDates && day !== previousDay && <div className="activity-child-date" role="listitem"><time dateTime={day}>{shortDate(child.timestamp).toUpperCase()}</time></div>}<EventRow sessionId={sessionId} item={child} depth={depth + 1} refreshRevision={refreshRevision} /></Fragment>
             })}</div>}
             {canLoadMore && <div className="activity-detail-pagination" role="status" aria-live="polite"><button type="button" disabled={detailLoading} onClick={() => void loadDetail({
               page: (detail.childPage ?? 1) + 1,
@@ -606,6 +608,9 @@ export function SessionDetailPage() {
   const { data, error, loading, lastSuccessfulAt, refresh } = useAsync(signal => api.sessionSummary(sessionId, signal), [sessionId], 30_000)
   const session = data?.session
   const totals = data?.totals
+  useEffect(() => {
+    if (session) document.title = `${session.title || 'Untitled session'} · Codex usage`
+  }, [session])
 
   if (error && !data) return <ErrorState error={error} onRetry={() => void refresh()} />
   if (loading && !data) return <LoadingLedger rows={12} />

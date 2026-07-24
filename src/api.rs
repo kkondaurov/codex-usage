@@ -36,6 +36,7 @@ use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    future::IntoFuture,
     net::IpAddr,
     path::PathBuf,
     str::FromStr,
@@ -44,6 +45,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -58,6 +60,7 @@ pub struct ApiState {
     pub pricing: PricingConfig,
     pub executor: DbExecutor,
     pub pricing_sync: pricing::PricingSync,
+    manual_pricing_mutations: Arc<AsyncMutex<()>>,
 }
 
 impl ApiState {
@@ -80,6 +83,7 @@ impl ApiState {
             pricing,
             executor,
             pricing_sync,
+            manual_pricing_mutations: Arc::new(AsyncMutex::new(())),
         }
     }
 }
@@ -104,6 +108,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/prices/metadata", get(price_metadata))
         .route("/prices/refresh", post(refresh_prices))
         .route("/prices/{model_id}", put(put_price).delete(delete_price))
+        .route("/aliases", get(aliases))
         .route(
             "/aliases/{observed_model_id}",
             put(put_alias).delete(delete_alias),
@@ -165,13 +170,12 @@ async fn browser_boundary(request: Request<AxumBody>, next: Next) -> Response {
         Some(host) if is_loopback_authority(host) => host.to_owned(),
         _ => return boundary_rejection("request host must be localhost or a loopback address"),
     };
+    let fetch_site = request
+        .headers()
+        .get(HeaderName::from_static("sec-fetch-site"))
+        .and_then(|value| value.to_str().ok());
     if is_mutating_method(request.method()) {
-        if request
-            .headers()
-            .get(HeaderName::from_static("sec-fetch-site"))
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|site| !matches!(site, "same-origin" | "none"))
-        {
+        if fetch_site.is_some_and(|site| !matches!(site, "same-origin" | "none")) {
             return boundary_rejection("cross-origin mutations are not allowed");
         }
         if let Some(origin) = request.headers().get(ORIGIN) {
@@ -190,6 +194,10 @@ async fn browser_boundary(request: Request<AxumBody>, next: Next) -> Response {
                 return boundary_rejection("mutation origin does not match the local application");
             }
         }
+    } else if is_api_path(request.uri().path())
+        && fetch_site.is_some_and(|site| !matches!(site, "same-origin" | "none"))
+    {
+        return boundary_rejection("cross-origin API requests are not allowed");
     }
 
     let mut response = next.run(request).await;
@@ -227,6 +235,10 @@ fn is_mutating_method(method: &Method) -> bool {
     )
 }
 
+fn is_api_path(path: &str) -> bool {
+    path == "/api/v1" || path.starts_with("/api/v1/")
+}
+
 fn boundary_rejection(message: &'static str) -> Response {
     ApiError {
         status: StatusCode::FORBIDDEN,
@@ -236,17 +248,69 @@ fn boundary_rejection(message: &'static str) -> Response {
 }
 
 pub async fn serve(state: ApiState, listener: tokio::net::TcpListener) -> Result<()> {
+    const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
     let app = router(state);
     let address = listener
         .local_addr()
         .context("failed to inspect bound listener")?;
     tracing::info!(%address, "Codex Usage is ready");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+    let (begin_shutdown, shutdown_requested) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_requested.await;
         })
-        .await?;
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = shutdown_signal() => {
+            // Stop accepting immediately, then give well-behaved in-flight
+            // requests a short window to finish. An idle keep-alive socket or
+            // an incomplete HTTP header must not hold the local process open
+            // forever during shutdown.
+            let _ = begin_shutdown.send(());
+            match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut server).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = GRACEFUL_SHUTDOWN_TIMEOUT.as_millis(),
+                        "forcing server shutdown after graceful drain deadline"
+                    );
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+pub fn prewarm_current_year_analytics(db: &Db) -> Result<()> {
+    let today = Local::now().date_naive();
+    // Startup has no requests to protect from synchronous SQLite work yet.
+    // Running this directly also avoids depending on Tokio's blocking pool
+    // before the long-lived server tasks have started.
+    let connection = db.connect()?;
+    let transaction = Transaction::new_unchecked(&connection, TransactionBehavior::Deferred)?;
+    prewarm_current_year_analytics_on(&transaction, today)
+        .context("failed to prewarm current-year analytics")?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler must install");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn frontend_missing() -> impl IntoResponse {
@@ -325,7 +389,12 @@ struct QueryCancellation {
 }
 
 impl QueryCancellation {
-    fn install(&self, connection: &Connection) -> Result<()> {
+    fn install(self: &Arc<Self>, connection: &Connection) -> Result<()> {
+        let cancellation = self.clone();
+        connection.progress_handler(
+            4_096,
+            Some(move || cancellation.cancelled.load(Ordering::Acquire)),
+        );
         let mut interrupt = self
             .interrupt
             .lock()
@@ -410,7 +479,7 @@ struct StatusResponse {
 async fn status(State(state): State<ApiState>) -> ApiResult<Json<StatusResponse>> {
     let db = state.db.clone();
     Ok(Json(
-        run_work(&state, WorkClass::Light, move || query_status(&db)).await?,
+        run_work(&state, WorkClass::Control, move || query_status(&db)).await?,
     ))
 }
 
@@ -774,6 +843,10 @@ enum UsageRollupScope<'a> {
     Turn(&'a str),
     Agent(&'a str),
     Effort(Option<&'a str>),
+    ActivitySelection {
+        root_turn_id: &'a str,
+        usage_kind: i64,
+    },
 }
 
 struct UsageRollupExceptionalQuery<'a> {
@@ -1062,6 +1135,18 @@ struct ActivityDetailQuery {
     child_cursor: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActivityCollectionCursor {
+    version: u8,
+    thread_id: String,
+    item_id: String,
+    timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_line: Option<i64>,
+    sort_id: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ActivityResponse {
@@ -1111,7 +1196,7 @@ async fn session_activity_detail(
         .unwrap_or(DEFAULT_ACTIVITY_CHILD_PAGE_SIZE)
         .clamp(1, MAX_ACTIVITY_CHILD_PAGE_SIZE);
     if let Some(cursor) = query.child_cursor.as_deref() {
-        activity_index::validate_cursor_for(cursor, &id, &event_id)
+        validate_activity_detail_cursor(cursor, &id, &event_id)
             .map_err(|_| ApiError::bad_request("invalid Activity cursor"))?;
     }
     let child_cursor = query.child_cursor;
@@ -1301,7 +1386,7 @@ async fn settings(State(state): State<ApiState>) -> ApiResult<Json<SettingsRespo
         .as_ref()
         .map(|path| path.display().to_string());
     let timezone = Local::now().format("%Z").to_string();
-    let database_file = db.path().to_path_buf();
+    let database_bytes = db.storage_bytes();
     Ok(Json(
         run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
             query_settings_on(
@@ -1310,9 +1395,7 @@ async fn settings(State(state): State<ApiState>) -> ApiResult<Json<SettingsRespo
                 active_root,
                 archive_root,
                 timezone,
-                std::fs::metadata(database_file)
-                    .map(|value| value.len())
-                    .unwrap_or(0),
+                database_bytes,
             )
         })
         .await?,
@@ -1410,11 +1493,27 @@ struct PricesResponse {
     source: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AliasesQuery {
+    q: Option<String>,
+    page: Option<u64>,
+    page_size: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AliasesResponse {
+    items: Vec<AliasRow>,
+    page: u64,
+    page_size: u64,
+    total: u64,
+    total_pages: u64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PriceMetadataResponse {
-    aliases: Vec<AliasRow>,
-    aliases_total: u64,
     observed_unknown: Vec<UnknownModelRow>,
     observed_unknown_total: u64,
 }
@@ -1437,7 +1536,6 @@ struct PriceModelIdsResponse {
 }
 
 const MAX_PRICE_MODEL_ID_RESULTS: u64 = 100;
-const MAX_ALIAS_RESULTS: u64 = 100;
 const MAX_UNKNOWN_MODEL_RESULTS: u64 = 100;
 
 async fn prices(
@@ -1448,10 +1546,10 @@ async fn prices(
     let page_size = query.page_size.unwrap_or(25).clamp(1, 100);
     let db = state.db.clone();
     let search = query.q;
-    if search
-        .as_deref()
-        .is_some_and(|value| value.chars().count() > MAX_SESSION_SEARCH_CHARS)
-    {
+    if search.as_deref().is_some_and(|value| {
+        value.chars().count() > MAX_SESSION_SEARCH_CHARS
+            || normalize_search_text(value).chars().count() > MAX_SESSION_SEARCH_CHARS
+    }) {
         return Err(ApiError::bad_request(format!(
             "price search must be at most {MAX_SESSION_SEARCH_CHARS} characters"
         )));
@@ -1459,6 +1557,33 @@ async fn prices(
     Ok(Json(
         run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
             query_prices_on(connection, search.as_deref(), page, page_size)
+        })
+        .await?,
+    ))
+}
+
+async fn aliases(
+    State(state): State<ApiState>,
+    Query(query): Query<AliasesQuery>,
+) -> ApiResult<Json<AliasesResponse>> {
+    let page = validated_page(query.page)?;
+    let page_size = query.page_size.unwrap_or(25).clamp(1, 100);
+    let search = query
+        .q
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if search
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > MAX_SESSION_SEARCH_CHARS)
+    {
+        return Err(ApiError::bad_request(format!(
+            "alias search must be at most {MAX_SESSION_SEARCH_CHARS} characters"
+        )));
+    }
+    let db = state.db.clone();
+    Ok(Json(
+        run_snapshot_work(&state, WorkClass::Light, db, move |connection| {
+            query_aliases_on(connection, search.as_deref(), page, page_size)
         })
         .await?,
     ))
@@ -1636,9 +1761,19 @@ async fn run_manual_mutation<F>(state: &ApiState, mutation: F) -> ApiResult<()>
 where
     F: FnOnce() -> std::result::Result<(), MutationError> + Send + 'static,
 {
+    // Queue mutations asynchronously before they take a blocking-worker
+    // permit. File locking is necessarily synchronous, but one contended
+    // pricing writer must not multiply into a pool-wide outage.
+    let mutation_guard = state.manual_pricing_mutations.clone().lock_owned().await;
     state
         .executor
-        .run(WorkClass::Light, move || Ok(mutation()))
+        .run(WorkClass::Light, move || {
+            // The request may disappear while `spawn_blocking` continues.
+            // Keep serialization owned by the synchronous operation itself so
+            // canceled writers cannot accumulate behind the file mutex.
+            let _mutation_guard = mutation_guard;
+            Ok(mutation())
+        })
         .await
         .map_err(ApiError::internal)?
         .map_err(manual_mutation_error)
@@ -3673,6 +3808,15 @@ fn usage_rollup_exceptional_cost_on(
              WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<?4
                AND effort IS ?5"
         }
+        UsageRollupScope::ActivitySelection { .. } => {
+            "SELECT u.timestamp,u.input_tokens,u.cached_input_tokens,
+                    u.output_tokens,u.total_tokens
+             FROM usage_facts u INDEXED BY idx_usage_thread_model_time
+             JOIN selected_activity_turns selected ON selected.turn_id=u.turn_id
+             WHERE u.thread_id=?1 AND u.model=?2
+               AND u.timestamp>=?3 AND u.timestamp<?4
+               AND selected.root_turn_id=?5 AND selected.usage_kind=?6"
+        }
     };
     let mut statement = connection.prepare(sql)?;
     let mut rows = match query.scope {
@@ -3703,6 +3847,17 @@ fn usage_rollup_exceptional_cost_on(
             query.start,
             query.end,
             effort
+        ])?,
+        UsageRollupScope::ActivitySelection {
+            root_turn_id,
+            usage_kind,
+        } => statement.query(params![
+            query.thread_id,
+            query.model,
+            query.start,
+            query.end,
+            root_turn_id,
+            usage_kind
         ])?,
     };
     let mut cost_numerator = 0i128;
@@ -3767,6 +3922,15 @@ fn usage_rollup_local_day_splits_on(
              WHERE thread_id=?1 AND model=?2 AND timestamp>=?3 AND timestamp<?4
                AND effort IS ?5"
         }
+        UsageRollupScope::ActivitySelection { .. } => {
+            "SELECT u.timestamp,u.input_tokens,u.cached_input_tokens,u.output_tokens,
+                    u.reasoning_tokens,u.total_tokens
+             FROM usage_facts u INDEXED BY idx_usage_thread_model_time
+             JOIN selected_activity_turns selected ON selected.turn_id=u.turn_id
+             WHERE u.thread_id=?1 AND u.model=?2
+               AND u.timestamp>=?3 AND u.timestamp<?4
+               AND selected.root_turn_id=?5 AND selected.usage_kind=?6"
+        }
     };
     let mut statement = connection.prepare(sql)?;
     let mut rows = match query.scope {
@@ -3797,6 +3961,17 @@ fn usage_rollup_local_day_splits_on(
             query.start,
             query.end,
             effort
+        ])?,
+        UsageRollupScope::ActivitySelection {
+            root_turn_id,
+            usage_kind,
+        } => statement.query(params![
+            query.thread_id,
+            query.model,
+            query.start,
+            query.end,
+            root_turn_id,
+            usage_kind
         ])?,
     };
     let mut totals = HashMap::<NaiveDate, FixedPointUsageTotals>::new();
@@ -4331,6 +4506,18 @@ fn query_overview_year_on(
     })
 }
 
+fn prewarm_current_year_analytics_on(connection: &Connection, today: NaiveDate) -> Result<()> {
+    let year = today.year();
+    let anchor = NaiveDate::from_ymd_opt(year, 1, 1).context("current year is invalid")?;
+    let start = sql_timestamp(local_midnight(anchor));
+    let next_year =
+        NaiveDate::from_ymd_opt(year + 1, 1, 1).context("next year is outside the date domain")?;
+    let end = sql_timestamp(local_midnight(next_year));
+    let _ = query_overview_year_on(connection, year, &start, &end)?;
+    let _ = query_stats_on(connection, "year", anchor)?;
+    Ok(())
+}
+
 #[cfg(test)]
 fn query_heatmap_on(connection: &Connection, year: i32) -> Result<Vec<HeatmapDay>> {
     let buckets = overview_year_buckets(year)?;
@@ -4620,23 +4807,13 @@ fn display_tool_name(namespace: Option<&str>, name: &str) -> String {
 }
 
 const ACTIVITY_PREVIEW_CHARS: i64 = 240;
+const ACTIVITY_AGENT_LABEL_PREVIEW_LIMIT: i64 = 8;
+// Legacy messages are preview-only in Activity. Keep enough bytes from both
+// ends to preserve wrapper metadata and the final `My request` section without
+// ever materializing an entire JSONL payload.
+const ACTIVITY_MESSAGE_PARSE_BYTES: i64 = 16 * 1024;
+const ACTIVITY_MESSAGE_PARSE_EDGE_BYTES: i64 = ACTIVITY_MESSAGE_PARSE_BYTES / 2;
 const LEGACY_ACTIVITY_PREFIX: &str = "legacy:";
-
-#[derive(Clone, Debug)]
-struct ActivityTurnSummary {
-    id: String,
-    rollout_id: String,
-    agent_run_id: Option<String>,
-    agent_key: String,
-    agent_label: Option<String>,
-    started_at: String,
-    status: String,
-    model: Option<String>,
-    effort: Option<String>,
-    body: Option<String>,
-    duration_ms: Option<i64>,
-    review: bool,
-}
 
 #[derive(Clone, Debug)]
 struct ActivityRootScope {
@@ -4646,23 +4823,125 @@ struct ActivityRootScope {
     open_left: bool,
 }
 
-#[derive(Debug)]
-struct ActivityAgentLinkInterval {
-    agent_key: String,
-    linked_at: Option<String>,
-    next_linked_at: Option<String>,
+#[derive(Clone, Default)]
+struct ActivityDescendantGroup {
+    turn_count: u64,
+    timestamp: String,
+    status: String,
+    duration_ms: Option<i64>,
+    labels: Vec<String>,
+    label_count: u64,
+    usage: FixedPointUsageTotals,
+}
+
+fn activity_agent_labels_preview(labels: &[String], label_count: u64) -> Option<String> {
+    if labels.is_empty() {
+        return None;
+    }
+    let mut preview = labels.join(" · ");
+    let omitted = label_count.saturating_sub(labels.len() as u64);
+    if omitted > 0 {
+        preview.push_str(&format!(" · +{omitted} more"));
+    }
+    Some(preview)
+}
+
+#[derive(Clone, Default)]
+struct ActivityRootAggregate {
+    counts: ActivityCounts,
+    usage: FixedPointUsageTotals,
+    agents: Option<ActivityDescendantGroup>,
+    reviews: Option<ActivityDescendantGroup>,
+}
+
+impl ActivityRootAggregate {
+    fn group_mut(&mut self, reviews: bool) -> &mut ActivityDescendantGroup {
+        if reviews {
+            self.reviews
+                .get_or_insert_with(ActivityDescendantGroup::default)
+        } else {
+            self.agents
+                .get_or_insert_with(ActivityDescendantGroup::default)
+        }
+    }
+}
+
+#[derive(Default)]
+struct ActivityDurationAccumulator {
+    current: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    total_ms: i64,
+}
+
+impl ActivityDurationAccumulator {
+    fn add(&mut self, started_at: &str, duration_ms: i64) {
+        let Ok(started_at) = DateTime::parse_from_rfc3339(started_at) else {
+            return;
+        };
+        let started_at = started_at.with_timezone(&Utc);
+        let Some(duration) = Duration::try_milliseconds(duration_ms.max(0)) else {
+            return;
+        };
+        let Some(ended_at) = started_at.checked_add_signed(duration) else {
+            return;
+        };
+        if let Some((current_start, current_end)) = &mut self.current {
+            if started_at <= *current_end {
+                *current_end = (*current_end).max(ended_at);
+                return;
+            }
+            self.total_ms = self
+                .total_ms
+                .saturating_add((*current_end - *current_start).num_milliseconds());
+        }
+        self.current = Some((started_at, ended_at));
+    }
+
+    fn finish(self) -> Option<i64> {
+        let (started_at, ended_at) = self.current?;
+        Some(
+            self.total_ms
+                .saturating_add((ended_at - started_at).num_milliseconds()),
+        )
+    }
+}
+
+fn load_activity_descendant_durations(
+    connection: &Connection,
+    roots: &mut HashMap<String, ActivityRootAggregate>,
+) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT root_turn_id,review,started_at,duration_ms
+         FROM selected_activity_descendants
+         WHERE duration_ms IS NOT NULL
+         ORDER BY root_turn_id,review,started_at,turn_id",
+    )?;
+    let mut accumulators = HashMap::<(String, bool), ActivityDurationAccumulator>::new();
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)? != 0,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })? {
+        let (root_turn_id, reviews, started_at, duration_ms) = row?;
+        accumulators
+            .entry((root_turn_id, reviews))
+            .or_default()
+            .add(&started_at, duration_ms);
+    }
+    for ((root_turn_id, reviews), accumulator) in accumulators {
+        if let Some(root) = roots.get_mut(&root_turn_id) {
+            root.group_mut(reviews).duration_ms = accumulator.finish();
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
 struct ActivityBatch {
     user_messages: HashMap<String, Vec<String>>,
-    model_calls: HashMap<String, u64>,
-    explicit_agent_intervals_by_turn: HashMap<String, Vec<ActivityAgentLinkInterval>>,
-    explicit_agents_anywhere: HashSet<String>,
-    descendant_turns: Vec<ActivityTurnSummary>,
-    tool_calls_by_turn: HashMap<String, u64>,
-    orphan_tool_calls_by_root: HashMap<String, u64>,
-    totals_by_turn: HashMap<String, FixedPointUsageTotals>,
+    roots: HashMap<String, ActivityRootAggregate>,
 }
 
 impl ActivityBatch {
@@ -4684,8 +4963,24 @@ impl ActivityBatch {
                  open_left INTEGER NOT NULL
              ) WITHOUT ROWID;
              CREATE TEMP TABLE IF NOT EXISTS selected_activity_turns(
-                 turn_id TEXT PRIMARY KEY
+                 turn_id TEXT PRIMARY KEY,
+                 root_turn_id TEXT NOT NULL,
+                 usage_kind INTEGER NOT NULL
              ) WITHOUT ROWID;
+             CREATE TEMP TABLE IF NOT EXISTS selected_activity_descendants(
+                 turn_id TEXT PRIMARY KEY,
+                 root_turn_id TEXT NOT NULL,
+                 agent_key TEXT NOT NULL,
+                 review INTEGER NOT NULL,
+                 started_at TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 duration_ms INTEGER,
+                 agent_label TEXT
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS idx_selected_activity_descendants_root
+                 ON selected_activity_descendants(
+                     root_turn_id,review,started_at DESC,turn_id DESC
+                 );
              CREATE TEMP TABLE IF NOT EXISTS activity_explicit_agents(
                  agent_key TEXT PRIMARY KEY
              ) WITHOUT ROWID;
@@ -4698,6 +4993,7 @@ impl ActivityBatch {
              );
              DELETE FROM selected_activity_roots;
              DELETE FROM selected_activity_turns;
+             DELETE FROM selected_activity_descendants;
              DELETE FROM activity_explicit_agents;
              DELETE FROM selected_activity_agent_intervals;",
         )?;
@@ -4707,8 +5003,10 @@ impl ActivityBatch {
                      turn_id,started_at,next_started_at,open_left
                  ) VALUES(?1,?2,?3,?4)",
             )?;
-            let mut insert_turn =
-                connection.prepare("INSERT INTO selected_activity_turns(turn_id) VALUES(?1)")?;
+            let mut insert_turn = connection.prepare(
+                "INSERT INTO selected_activity_turns(turn_id,root_turn_id,usage_kind)
+                 VALUES(?1,?1,0)",
+            )?;
             for root in roots {
                 insert_root.execute(params![
                     root.id,
@@ -4717,26 +5015,48 @@ impl ActivityBatch {
                     root.open_left
                 ])?;
                 insert_turn.execute([&root.id])?;
+                batch.roots.entry(root.id.clone()).or_default();
             }
         }
 
         let mut statement = connection.prepare(
-            "SELECT e.turn_id,COALESCE(NULLIF(e.body,''),NULLIF(m.content,''))
-             FROM events e
-             JOIN selected_activity_roots selected ON selected.turn_id=e.turn_id
-             LEFT JOIN messages m
-               ON m.id=COALESCE(e.call_id,e.id) AND m.thread_id=e.thread_id
-             WHERE e.thread_id=?1 AND e.turn_id IS NOT NULL
-               AND (e.kind='user' OR e.role='user')
-             ORDER BY e.timestamp,e.source_line,e.id",
+            "WITH user_events AS (
+                 SELECT e.turn_id,e.timestamp,e.source_line,e.id,
+                        CAST(COALESCE(NULLIF(e.body,''),NULLIF(m.content,'')) AS BLOB) content
+                 FROM events e
+                 JOIN selected_activity_roots selected ON selected.turn_id=e.turn_id
+                 LEFT JOIN messages m
+                   ON m.id=COALESCE(e.call_id,e.id) AND m.thread_id=e.thread_id
+                 WHERE e.thread_id=?1 AND e.turn_id IS NOT NULL
+                   AND (e.kind='user' OR e.role='user')
+             )
+             SELECT turn_id,
+                    CASE WHEN length(content)<=?2 THEN content
+                         ELSE substr(content,1,?3) END,
+                    CASE WHEN length(content)<=?2 THEN NULL
+                         ELSE substr(content,-?3) END
+             FROM user_events WHERE content IS NOT NULL
+             ORDER BY timestamp,source_line,id",
         )?;
-        let rows = statement.query_map([thread_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?;
+        let rows = statement.query_map(
+            params![
+                thread_id,
+                ACTIVITY_MESSAGE_PARSE_BYTES,
+                ACTIVITY_MESSAGE_PARSE_EDGE_BYTES
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )?;
         let mut seen_messages = HashMap::<String, HashSet<String>>::new();
         for row in rows {
-            let (turn_id, content) = row?;
-            if let Some(message) = content.and_then(|value| first_prompt_for_display(&value))
+            let (turn_id, head, tail) = row?;
+            let content = activity_content_from_edges(head, tail);
+            if let Some(message) = first_prompt_for_display(&content)
                 && seen_messages
                     .entry(turn_id.clone())
                     .or_default()
@@ -4770,7 +5090,7 @@ impl ActivityBatch {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })? {
             let (turn_id, count) = row?;
-            batch.model_calls.insert(turn_id, count.max(0) as u64);
+            batch.roots.entry(turn_id).or_default().counts.model_calls = count.max(0) as u64;
         }
 
         let explicit_agent_count = connection.execute(
@@ -4828,185 +5148,222 @@ impl ActivityBatch {
                 params![thread_id, root_rollout_id],
             )?;
         }
-        let mut statement = connection.prepare(
-            "SELECT agent_key,NULL,NULL,NULL FROM activity_explicit_agents
-             UNION ALL
-             SELECT agent_key,root_turn_id,linked_at,next_linked_at
-             FROM selected_activity_agent_intervals",
+        // Attribution can cover hundreds of thousands of child turns. Keep
+        // the complete mapping in SQLite and retain only one aggregate per
+        // selected root in Rust.
+        let descendant_count = connection.execute(
+            "INSERT OR IGNORE INTO selected_activity_descendants(
+                 turn_id,root_turn_id,agent_key,review,started_at,status,
+                 duration_ms,agent_label
+             )
+             SELECT mapped.turn_id,mapped.root_turn_id,mapped.agent_key,
+                    mapped.review,mapped.started_at,mapped.status,
+                    mapped.duration_ms,COALESCE(a.nickname,a.agent_path)
+             FROM (
+                 SELECT t.id turn_id,explicit.root_turn_id,
+                        COALESCE(t.agent_run_id,t.rollout_id) agent_key,
+                        COALESCE(t.model='codex-auto-review',0) review,
+                        t.started_at,t.status,t.duration_ms,t.agent_run_id,t.thread_id
+                 FROM turns t
+                 JOIN selected_activity_agent_intervals explicit
+                   ON explicit.agent_key=COALESCE(t.agent_run_id,t.rollout_id)
+                  AND (explicit.linked_at IS NULL OR t.started_at>=explicit.linked_at)
+                  AND (explicit.next_linked_at IS NULL
+                       OR t.started_at<explicit.next_linked_at)
+                 WHERE t.thread_id=?1 AND t.rollout_id<>?2
+                 UNION ALL
+                 SELECT t.id,selected.turn_id,
+                        COALESCE(t.agent_run_id,t.rollout_id),
+                        COALESCE(t.model='codex-auto-review',0),
+                        t.started_at,t.status,t.duration_ms,t.agent_run_id,t.thread_id
+                 FROM turns t
+                 JOIN selected_activity_roots selected
+                   ON t.started_at>=selected.started_at
+                  AND (selected.next_started_at IS NULL
+                       OR t.started_at<selected.next_started_at)
+                 WHERE t.thread_id=?1 AND t.rollout_id<>?2
+                   AND NOT EXISTS(
+                       SELECT 1 FROM activity_explicit_agents explicit
+                       WHERE explicit.agent_key=COALESCE(t.agent_run_id,t.rollout_id)
+                   )
+             ) mapped
+             LEFT JOIN agent_runs a
+               ON a.id=mapped.agent_run_id AND a.thread_id=mapped.thread_id",
+            params![thread_id, root_rollout_id],
         )?;
-        for row in statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })? {
-            let (agent_key, turn_id, linked_at, next_linked_at) = row?;
-            batch.explicit_agents_anywhere.insert(agent_key.clone());
-            if let Some(turn_id) = turn_id {
-                batch
-                    .explicit_agent_intervals_by_turn
-                    .entry(turn_id)
+        connection.execute(
+            "INSERT OR IGNORE INTO selected_activity_turns(
+                 turn_id,root_turn_id,usage_kind
+             )
+             SELECT turn_id,root_turn_id,CASE WHEN review=1 THEN 2 ELSE 1 END
+             FROM selected_activity_descendants",
+            [],
+        )?;
+
+        if descendant_count > 0 {
+            let mut statement = connection.prepare(
+                "SELECT root_turn_id,
+                    COUNT(DISTINCT CASE WHEN review=0 THEN agent_key END),
+                    COALESCE(SUM(review=1),0)
+             FROM selected_activity_descendants
+             GROUP BY root_turn_id",
+            )?;
+            for row in statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })? {
+                let (root_turn_id, agents, reviews) = row?;
+                let counts = &mut batch.roots.entry(root_turn_id).or_default().counts;
+                counts.agent_runs = agents.max(0) as u64;
+                counts.reviews = reviews.max(0) as u64;
+            }
+
+            let mut statement = connection.prepare(
+                "SELECT root_turn_id,review,COUNT(*),MAX(started_at),
+                    COALESCE(MAX(status='running'),0),
+                    COALESCE(MAX(status NOT IN ('completed','success','allowed')),0)
+             FROM selected_activity_descendants
+             GROUP BY root_turn_id,review",
+            )?;
+            for row in statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)? != 0,
+                ))
+            })? {
+                let (root_turn_id, reviews, turn_count, timestamp, running, attention) = row?;
+                let group = batch
+                    .roots
+                    .entry(root_turn_id)
                     .or_default()
-                    .push(ActivityAgentLinkInterval {
-                        agent_key,
-                        linked_at,
-                        next_linked_at,
-                    });
+                    .group_mut(reviews);
+                group.turn_count = turn_count;
+                group.timestamp = timestamp;
+                group.status = if running {
+                    "running"
+                } else if attention {
+                    "attention"
+                } else {
+                    "completed"
+                }
+                .into();
             }
+
+            let mut statement = connection.prepare(
+                "WITH latest_labels AS (
+                     SELECT root_turn_id,agent_label,started_at,turn_id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY root_turn_id,agent_label
+                                ORDER BY started_at DESC,turn_id DESC
+                            ) label_rank
+                     FROM selected_activity_descendants
+                     WHERE review=0 AND agent_label IS NOT NULL
+                 ), ranked_labels AS (
+                     SELECT root_turn_id,agent_label,started_at,turn_id,
+                            COUNT(*) OVER (PARTITION BY root_turn_id) label_count,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY root_turn_id
+                                ORDER BY started_at DESC,turn_id DESC
+                            ) preview_rank
+                     FROM latest_labels WHERE label_rank=1
+                 )
+                 SELECT root_turn_id,agent_label,label_count
+                 FROM ranked_labels WHERE preview_rank<=?1
+                 ORDER BY root_turn_id,preview_rank",
+            )?;
+            for row in statement.query_map([ACTIVITY_AGENT_LABEL_PREVIEW_LIMIT], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                ))
+            })? {
+                let (root_turn_id, label, label_count) = row?;
+                let group = batch
+                    .roots
+                    .entry(root_turn_id)
+                    .or_default()
+                    .group_mut(false);
+                group.labels.push(label);
+                group.label_count = label_count;
+            }
+            load_activity_descendant_durations(connection, &mut batch.roots)?;
         }
 
         let mut statement = connection.prepare(
-            "SELECT t.id,t.rollout_id,t.agent_run_id,COALESCE(t.agent_run_id,t.rollout_id),
-                    t.started_at,t.status,t.model,t.effort,
-                    NULLIF(substr(t.last_agent_message,1,?3),''),t.duration_ms,
-                    a.nickname,a.agent_path
-             FROM turns t LEFT JOIN agent_runs a
-               ON a.id=t.agent_run_id AND a.thread_id=t.thread_id
-             WHERE t.thread_id=?1 AND t.rollout_id<>?2
-               AND (
-                    EXISTS(
-                        SELECT 1 FROM selected_activity_agent_intervals explicit
-                        WHERE explicit.agent_key=COALESCE(t.agent_run_id,t.rollout_id)
-                          AND (explicit.linked_at IS NULL
-                               OR t.started_at>=explicit.linked_at)
-                          AND (explicit.next_linked_at IS NULL
-                               OR t.started_at<explicit.next_linked_at)
-                    )
-                    OR (
-                        NOT EXISTS(
-                            SELECT 1 FROM activity_explicit_agents explicit
-                            WHERE explicit.agent_key=COALESCE(t.agent_run_id,t.rollout_id)
-                        )
-                        AND EXISTS(
-                            SELECT 1 FROM selected_activity_roots selected
-                            WHERE t.started_at>=selected.started_at
-                              AND (selected.next_started_at IS NULL
-                                   OR t.started_at<selected.next_started_at)
-                        )
-                    )
-               )
-             ORDER BY t.started_at DESC,t.id DESC",
-        )?;
-        batch.descendant_turns = statement
-            .query_map(
-                params![thread_id, root_rollout_id, ACTIVITY_PREVIEW_CHARS],
-                |row| {
-                    let model = row.get::<_, Option<String>>(6)?;
-                    Ok(ActivityTurnSummary {
-                        id: row.get(0)?,
-                        rollout_id: row.get(1)?,
-                        agent_run_id: row.get(2)?,
-                        agent_key: row.get(3)?,
-                        started_at: row.get(4)?,
-                        status: row.get(5)?,
-                        review: model.as_deref() == Some("codex-auto-review"),
-                        model,
-                        effort: row.get(7)?,
-                        body: row.get(8)?,
-                        duration_ms: row.get(9)?,
-                        agent_label: row
-                            .get::<_, Option<String>>(10)?
-                            .or(row.get::<_, Option<String>>(11)?),
-                    })
-                },
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        {
-            let mut insert_turn = connection
-                .prepare("INSERT OR IGNORE INTO selected_activity_turns(turn_id) VALUES(?1)")?;
-            for turn in &batch.descendant_turns {
-                insert_turn.execute([&turn.id])?;
-            }
-        }
-
-        let mut statement = connection.prepare(
-            "SELECT 0,tc.turn_id,COUNT(*)
-             FROM tool_calls tc
-             JOIN selected_activity_turns selected ON selected.turn_id=tc.turn_id
-             WHERE tc.thread_id=?1
-             GROUP BY tc.turn_id
-             UNION ALL
-             SELECT 1,selected.turn_id,COUNT(*)
-             FROM selected_activity_roots selected
-             JOIN tool_calls tc
-               ON tc.thread_id=?1
-              AND (selected.open_left=1 OR tc.started_at>=selected.started_at)
-              AND (selected.next_started_at IS NULL
-                   OR tc.started_at<selected.next_started_at)
-             LEFT JOIN turns linked
-               ON linked.id=tc.turn_id AND linked.thread_id=tc.thread_id
-             WHERE linked.id IS NULL
-             GROUP BY selected.turn_id",
+            "SELECT root_turn_id,SUM(tool_calls) FROM (
+                 SELECT selected.root_turn_id,COUNT(*) tool_calls
+                 FROM selected_activity_turns selected
+                 JOIN tool_calls tc ON tc.turn_id=selected.turn_id
+                 WHERE tc.thread_id=?1
+                 GROUP BY selected.root_turn_id
+                 UNION ALL
+                 SELECT selected.turn_id,COUNT(*)
+                 FROM selected_activity_roots selected
+                 JOIN tool_calls tc
+                   ON tc.thread_id=?1
+                  AND (selected.open_left=1 OR tc.started_at>=selected.started_at)
+                  AND (selected.next_started_at IS NULL
+                       OR tc.started_at<selected.next_started_at)
+                 LEFT JOIN turns linked
+                   ON linked.id=tc.turn_id AND linked.thread_id=tc.thread_id
+                 WHERE linked.id IS NULL
+                 GROUP BY selected.turn_id
+             ) GROUP BY root_turn_id",
         )?;
         for row in statement.query_map([thread_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })? {
-            let (orphaned, turn_id, count) = row?;
-            if orphaned == 0 {
-                batch
-                    .tool_calls_by_turn
-                    .insert(turn_id, count.max(0) as u64);
-            } else {
-                // A few legacy tool calls have no valid turn link. Attribute those by the
-                // stable root-exchange interval, just as the row-by-row fallback did.
-                batch
-                    .orphan_tool_calls_by_root
-                    .insert(turn_id, count.max(0) as u64);
-            }
+            let (root_turn_id, count) = row?;
+            batch
+                .roots
+                .entry(root_turn_id)
+                .or_default()
+                .counts
+                .tool_calls = count.max(0) as u64;
         }
 
         let (aliases, prices) = overview_prices_on(connection)?;
-        let mut usage_by_turn = HashMap::<String, FixedPointUsageTotals>::new();
-        let rollup_groups = {
-            let mut statement = connection.prepare(
-                "SELECT r.turn_key,r.activity_hour,r.model,
-                        COALESCE(SUM(r.input_tokens),0),
-                        COALESCE(SUM(r.cached_input_tokens),0),
-                        COALESCE(SUM(r.output_tokens),0),
-                        COALESCE(SUM(r.reasoning_tokens),0),
-                        COALESCE(SUM(r.total_tokens),0)
-                 FROM usage_activity_rollups r
-                 JOIN selected_activity_turns selected ON selected.turn_id=r.turn_key
-                 WHERE r.thread_id=?1
-                 GROUP BY r.turn_key,r.activity_hour,r.model",
-            )?;
-            statement
-                .query_map([thread_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?.max(0),
-                        row.get::<_, i64>(4)?.max(0),
-                        row.get::<_, i64>(5)?.max(0),
-                        row.get::<_, i64>(6)?.max(0),
-                        row.get::<_, i64>(7)?.max(0) as u64,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        for (
-            turn_id,
-            activity_hour,
-            model,
-            input_tokens,
-            cached_input_tokens,
-            output_tokens,
-            reasoning_tokens,
-            total_tokens,
-        ) in rollup_groups
-        {
+        let mut statement = connection.prepare(
+            "SELECT selected.root_turn_id,selected.usage_kind,
+                    r.activity_hour,r.model,
+                    COALESCE(SUM(r.input_tokens),0),
+                    COALESCE(SUM(r.cached_input_tokens),0),
+                    COALESCE(SUM(r.output_tokens),0),
+                    COALESCE(SUM(r.reasoning_tokens),0),
+                    COALESCE(SUM(r.total_tokens),0)
+             FROM selected_activity_turns selected
+             JOIN usage_activity_rollups r
+               ON r.thread_id=?1 AND r.turn_key=selected.turn_id
+             GROUP BY selected.root_turn_id,selected.usage_kind,
+                      r.activity_hour,r.model",
+        )?;
+        let mut rows = statement.query([thread_id])?;
+        while let Some(row) = rows.next()? {
+            let root_turn_id = row.get::<_, String>(0)?;
+            let usage_kind = row.get::<_, i64>(1)?;
+            let activity_hour = row.get::<_, String>(2)?;
+            let model = row.get::<_, String>(3)?;
+            let input_tokens = row.get::<_, i64>(4)?.max(0);
+            let cached_input_tokens = row.get::<_, i64>(5)?.max(0);
+            let output_tokens = row.get::<_, i64>(6)?.max(0);
+            let reasoning_tokens = row.get::<_, i64>(7)?.max(0);
+            let total_tokens = row.get::<_, i64>(8)?.max(0) as u64;
             let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
                 connection,
                 &aliases,
                 &prices,
-                UsageRollupScope::Turn(&turn_id),
+                UsageRollupScope::ActivitySelection {
+                    root_turn_id: &root_turn_id,
+                    usage_kind,
+                },
                 thread_id,
                 &activity_hour,
                 &model,
@@ -5015,7 +5372,8 @@ impl ActivityBatch {
                 output_tokens,
                 total_tokens,
             )?;
-            usage_by_turn.entry(turn_id).or_default().add_group(
+            let root = batch.roots.entry(root_turn_id).or_default();
+            root.usage.add_group(
                 input_tokens as u64,
                 cached_input_tokens as u64,
                 output_tokens as u64,
@@ -5024,6 +5382,17 @@ impl ActivityBatch {
                 known_cost_numerator,
                 unpriced_tokens,
             );
+            if usage_kind != 0 {
+                root.group_mut(usage_kind == 2).usage.add_group(
+                    input_tokens as u64,
+                    cached_input_tokens as u64,
+                    output_tokens as u64,
+                    reasoning_tokens as u64,
+                    total_tokens,
+                    known_cost_numerator,
+                    unpriced_tokens,
+                );
+            }
         }
 
         // A usage fact can survive without a turn link. These rows cannot be
@@ -5077,7 +5446,7 @@ impl ActivityBatch {
                     0,
                 )
             });
-            usage_by_turn.entry(turn_id).or_default().add_group(
+            batch.roots.entry(turn_id).or_default().usage.add_group(
                 input_tokens as u64,
                 cached_input_tokens as u64,
                 output_tokens as u64,
@@ -5087,164 +5456,37 @@ impl ActivityBatch {
                 unpriced_tokens,
             );
         }
-        batch.totals_by_turn = usage_by_turn;
         Ok(batch)
     }
 
-    fn descendants(
-        &self,
-        root_turn_id: &str,
-        start: &str,
-        end: Option<&str>,
-    ) -> Vec<AttributedDescendant> {
-        let explicit_here = self.explicit_agent_intervals_by_turn.get(root_turn_id);
-        self.descendant_turns
-            .iter()
-            .filter(|turn| {
-                if self.explicit_agents_anywhere.contains(&turn.agent_key) {
-                    explicit_here.is_some_and(|intervals| {
-                        intervals.iter().any(|interval| {
-                            interval.agent_key == turn.agent_key
-                                && interval
-                                    .linked_at
-                                    .as_deref()
-                                    .is_none_or(|start| turn.started_at.as_str() >= start)
-                                && interval
-                                    .next_linked_at
-                                    .as_deref()
-                                    .is_none_or(|end| turn.started_at.as_str() < end)
-                        })
-                    })
-                } else {
-                    timestamp_in_exchange(&turn.started_at, start, end)
-                }
-            })
-            .map(|turn| AttributedDescendant {
-                id: turn.id.clone(),
-                agent_key: turn.agent_key.clone(),
-                review: turn.review,
-            })
-            .collect()
+    fn counts(&self, root_turn_id: &str) -> ActivityCounts {
+        let mut counts = self
+            .roots
+            .get(root_turn_id)
+            .map(|root| root.counts.clone())
+            .unwrap_or_default();
+        counts.follow_ups = self
+            .user_messages
+            .get(root_turn_id)
+            .map_or(0, |messages| messages.len().saturating_sub(1) as u64);
+        counts
     }
 
-    fn counts(&self, root_turn_id: &str, descendants: &[AttributedDescendant]) -> ActivityCounts {
-        let tool_calls = descendants.iter().fold(
-            self.tool_calls_by_turn
-                .get(root_turn_id)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(
-                    self.orphan_tool_calls_by_root
-                        .get(root_turn_id)
-                        .copied()
-                        .unwrap_or(0),
-                ),
-            |total, turn| {
-                total.saturating_add(self.tool_calls_by_turn.get(&turn.id).copied().unwrap_or(0))
-            },
-        );
-        ActivityCounts {
-            model_calls: self.model_calls.get(root_turn_id).copied().unwrap_or(0),
-            tool_calls,
-            agent_runs: descendants
-                .iter()
-                .filter(|turn| !turn.review)
-                .map(|turn| turn.agent_key.as_str())
-                .collect::<HashSet<_>>()
-                .len() as u64,
-            reviews: descendants.iter().filter(|turn| turn.review).count() as u64,
-            follow_ups: self
-                .user_messages
-                .get(root_turn_id)
-                .map_or(0, |messages| messages.len().saturating_sub(1) as u64),
-        }
+    fn exchange_totals(&self, root_turn_id: &str) -> Totals {
+        self.roots
+            .get(root_turn_id)
+            .map(|root| root.usage.clone())
+            .unwrap_or_default()
+            .finish()
     }
 
-    fn exchange_totals(&self, root_turn_id: &str, descendants: &[AttributedDescendant]) -> Totals {
-        let mut totals = FixedPointUsageTotals::default();
-        if let Some(root) = self.totals_by_turn.get(root_turn_id) {
-            totals.merge(root.clone());
+    fn group(&self, root_turn_id: &str, reviews: bool) -> Option<&ActivityDescendantGroup> {
+        let root = self.roots.get(root_turn_id)?;
+        if reviews {
+            root.reviews.as_ref()
+        } else {
+            root.agents.as_ref()
         }
-        for descendant in descendants {
-            if let Some(usage) = self.totals_by_turn.get(&descendant.id) {
-                totals.merge(usage.clone());
-            }
-        }
-        totals.finish()
-    }
-
-    fn descendant_totals(&self, descendants: &[AttributedDescendant], reviews: bool) -> Totals {
-        let mut totals = FixedPointUsageTotals::default();
-        for descendant in descendants
-            .iter()
-            .filter(|descendant| descendant.review == reviews)
-        {
-            if let Some(usage) = self.totals_by_turn.get(&descendant.id) {
-                totals.merge(usage.clone());
-            }
-        }
-        totals.finish()
-    }
-
-    fn turn_summaries(
-        &self,
-        descendants: &[AttributedDescendant],
-        reviews: bool,
-    ) -> Vec<ActivityItem> {
-        let attributed = descendants
-            .iter()
-            .filter(|turn| turn.review == reviews)
-            .map(|turn| turn.id.as_str())
-            .collect::<HashSet<_>>();
-        self.descendant_turns
-            .iter()
-            .filter(|turn| attributed.contains(turn.id.as_str()))
-            .map(|turn| {
-                let label = turn.agent_label.clone().unwrap_or_else(|| {
-                    if reviews {
-                        "Automated review".into()
-                    } else {
-                        "Agent response".into()
-                    }
-                });
-                ActivityItem {
-                    usage: Some(
-                        self.totals_by_turn
-                            .get(&turn.id)
-                            .cloned()
-                            .unwrap_or_default()
-                            .finish(),
-                    ),
-                    id: turn.id.clone(),
-                    turn_id: Some(turn.id.clone()),
-                    rollout_id: turn.rollout_id.clone(),
-                    agent_run_id: turn.agent_run_id.clone(),
-                    agent_label: turn.agent_label.clone(),
-                    timestamp: turn.started_at.clone(),
-                    kind: if reviews {
-                        "review".into()
-                    } else {
-                        "subagent".into()
-                    },
-                    role: None,
-                    label: Some(label),
-                    body: bounded_preview(turn.body.clone()),
-                    status: Some(turn.status.clone()),
-                    tool_name: None,
-                    duration_ms: turn.duration_ms,
-                    model: turn.model.clone(),
-                    effort: turn.effort.clone(),
-                    has_details: true,
-                    children: Vec::new(),
-                    child_page: None,
-                    child_page_size: None,
-                    child_total: None,
-                    child_has_more: None,
-                    child_next_cursor: None,
-                    counts: None,
-                }
-            })
-            .collect()
     }
 }
 
@@ -5262,7 +5504,7 @@ fn query_activity_on(
     )?;
     let days = query_activity_day_summaries_batched(connection, thread_id)?;
     if total == 0 {
-        let item = query_legacy_activity_item(connection, thread_id, &root_rollout_id, false)?;
+        let item = query_legacy_activity_item(connection, thread_id, &root_rollout_id)?;
         let legacy_total = u64::from(item.is_some());
         let total_pages = legacy_total.div_ceil(page_size);
         let page = if total_pages == 0 {
@@ -5360,7 +5602,7 @@ fn query_activity_on(
         agent_nickname,
         agent_path,
         has_details,
-        next_started_at,
+        _next_started_at,
         _open_left,
     ) in turn_rows
     {
@@ -5369,9 +5611,8 @@ fn query_activity_on(
             .get(&turn_id)
             .cloned()
             .unwrap_or_default();
-        let descendants = batch.descendants(&turn_id, &started_at, next_started_at.as_deref());
-        let counts = batch.counts(&turn_id, &descendants);
-        let totals = batch.exchange_totals(&turn_id, &descendants);
+        let counts = batch.counts(&turn_id);
+        let totals = batch.exchange_totals(&turn_id);
         let label = bounded_preview(messages.first().cloned()).unwrap_or_else(|| {
             if model.as_deref() == Some("codex-auto-review") {
                 "Automated review".to_owned()
@@ -5437,11 +5678,60 @@ fn legacy_activity_id(thread_id: &str) -> String {
     format!("{LEGACY_ACTIVITY_PREFIX}{thread_id}")
 }
 
+fn validate_activity_detail_cursor(value: &str, thread_id: &str, item_id: &str) -> Result<()> {
+    if item_id == legacy_activity_id(thread_id) || parse_activity_group_id(item_id).is_some() {
+        decode_activity_collection_cursor_for(value, thread_id, item_id).map(|_| ())
+    } else {
+        activity_index::validate_cursor_for(value, thread_id, item_id)
+    }
+}
+
+fn encode_activity_collection_cursor(
+    thread_id: &str,
+    item_id: &str,
+    timestamp: &str,
+    source_line: Option<i64>,
+    sort_id: &str,
+) -> Result<String> {
+    serde_json::to_string(&ActivityCollectionCursor {
+        version: 1,
+        thread_id: thread_id.to_owned(),
+        item_id: item_id.to_owned(),
+        timestamp: timestamp.to_owned(),
+        source_line,
+        sort_id: sort_id.to_owned(),
+    })
+    .context("failed to encode Activity collection cursor")
+}
+
+fn decode_activity_collection_cursor_for(
+    value: &str,
+    thread_id: &str,
+    item_id: &str,
+) -> Result<ActivityCollectionCursor> {
+    if value.len() > 4_096 {
+        return Err(anyhow!("Activity cursor is too long"));
+    }
+    let cursor: ActivityCollectionCursor =
+        serde_json::from_str(value).context("invalid Activity collection cursor")?;
+    if cursor.version != 1
+        || cursor.thread_id != thread_id
+        || cursor.item_id != item_id
+        || cursor.timestamp.is_empty()
+        || cursor
+            .source_line
+            .is_some_and(|source_line| source_line < 0)
+        || cursor.sort_id.is_empty()
+    {
+        return Err(anyhow!("Activity cursor belongs to a different collection"));
+    }
+    Ok(cursor)
+}
+
 fn query_legacy_activity_item(
     connection: &Connection,
     thread_id: &str,
     root_rollout_id: &str,
-    include_children: bool,
 ) -> Result<Option<ActivityItem>> {
     let exists: i64 = connection.query_row(
         "SELECT
@@ -5456,104 +5746,61 @@ fn query_legacy_activity_item(
         return Ok(None);
     }
 
+    let has_messages = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id=?1)",
+        [thread_id],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
     let mut first_user = None;
-    let mut latest_assistant = None;
-    let mut message_children = Vec::new();
-    let mut has_messages = false;
     let mut statement = connection.prepare(
-        "SELECT id,rollout_id,turn_id,timestamp,role,content
-         FROM messages WHERE thread_id=?1
+        "SELECT CASE WHEN length(CAST(content AS BLOB))<=?2
+                     THEN CAST(content AS BLOB)
+                     ELSE substr(CAST(content AS BLOB),1,?3) END,
+                CASE WHEN length(CAST(content AS BLOB))<=?2 THEN NULL
+                     ELSE substr(CAST(content AS BLOB),-?3) END
+         FROM messages
+         WHERE thread_id=?1 AND role='user'
          ORDER BY timestamp,source_line,id",
     )?;
-    for row in statement.query_map([thread_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-        ))
-    })? {
-        let (id, rollout_id, turn_id, timestamp, role, content) = row?;
-        has_messages = true;
-        let display = if role == "user" {
-            first_prompt_for_display(&content)
-        } else {
-            Some(redact_data_urls(&content))
-        };
-        if role == "user" && first_user.is_none() {
-            first_user = display.clone();
-        }
-        if role == "assistant" {
-            latest_assistant = display.clone();
-        }
-        if include_children {
-            message_children.push(ActivityItem {
-                id: format!("legacy-message:{id}"),
-                turn_id,
-                rollout_id,
-                agent_run_id: None,
-                agent_label: None,
-                timestamp,
-                kind: if role == "user" { "user" } else { "final" }.into(),
-                role: Some(role),
-                label: None,
-                body: display,
-                status: None,
-                tool_name: None,
-                duration_ms: None,
-                model: None,
-                effort: None,
-                has_details: false,
-                children: Vec::new(),
-                child_page: None,
-                child_page_size: None,
-                child_total: None,
-                child_has_more: None,
-                child_next_cursor: None,
-                usage: None,
-                counts: None,
-            });
+    let mut rows = statement.query(params![
+        thread_id,
+        ACTIVITY_MESSAGE_PARSE_BYTES,
+        ACTIVITY_MESSAGE_PARSE_EDGE_BYTES
+    ])?;
+    while let Some(row) = rows.next()? {
+        let content = activity_content_from_edges(
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Option<Vec<u8>>>(1)?,
+        );
+        if let Some(display) = first_prompt_for_display(&content) {
+            first_user = Some(display);
+            break;
         }
     }
-    let mut children = if include_children {
-        query_activity_child_previews(connection, thread_id, None)?
-    } else {
-        Vec::new()
-    };
-    if include_children {
-        // Legacy projections can contain both canonical events and their mirrored message row.
-        // Prefer the richer event representation, but retain messages that have no event at all.
-        let event_signatures = children
-            .iter()
-            .filter_map(|item| {
-                item.body
-                    .as_ref()
-                    .map(|body| (item.timestamp.clone(), body.clone()))
-            })
-            .collect::<HashSet<_>>();
-        let event_ids = children
-            .iter()
-            .map(|item| item.id.clone())
-            .collect::<HashSet<_>>();
-        children.extend(message_children.into_iter().filter(|message| {
-            let stored_id = message
-                .id
-                .strip_prefix("legacy-message:")
-                .unwrap_or(&message.id);
-            !event_ids.contains(stored_id)
-                && message.body.as_ref().is_none_or(|body| {
-                    !event_signatures.contains(&(message.timestamp.clone(), body.clone()))
-                })
-        }));
-        children.sort_by(|left, right| {
-            right
-                .timestamp
-                .cmp(&left.timestamp)
-                .then_with(|| right.id.cmp(&left.id))
-        });
-    }
+    let latest_assistant = connection
+        .query_row(
+            "SELECT CASE WHEN length(CAST(content AS BLOB))<=?2
+                         THEN CAST(content AS BLOB)
+                         ELSE substr(CAST(content AS BLOB),1,?3) END,
+                    CASE WHEN length(CAST(content AS BLOB))<=?2 THEN NULL
+                         ELSE substr(CAST(content AS BLOB),-?3) END
+             FROM messages
+             WHERE thread_id=?1 AND role='assistant'
+             ORDER BY timestamp DESC,source_line DESC,id DESC LIMIT 1",
+            params![
+                thread_id,
+                ACTIVITY_MESSAGE_PARSE_BYTES,
+                ACTIVITY_MESSAGE_PARSE_EDGE_BYTES
+            ],
+            |row| {
+                Ok(activity_content_from_edges(
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|content| redact_data_urls(&content));
 
     let timestamp = connection.query_row(
         "SELECT COALESCE(
@@ -5609,7 +5856,7 @@ fn query_legacy_activity_item(
                 [thread_id],
                 |row| row.get::<_, i64>(0),
             )? != 0,
-        children,
+        children: Vec::new(),
         child_page: None,
         child_page_size: None,
         child_total: None,
@@ -5620,15 +5867,313 @@ fn query_legacy_activity_item(
     }))
 }
 
+const LEGACY_ACTIVITY_CHILDREN_CTE: &str = "WITH canonical_event_ids(event_id) AS MATERIALIZED (
+         SELECT substr(MIN(printf('%020d%s',source_line,event_id)),21)
+         FROM activity_event_index
+         WHERE thread_id=?1
+         GROUP BY canonical_key
+     ),
+     canonical_events AS MATERIALIZED (
+         SELECT projected.event_id,projected.timestamp,projected.source_line
+         FROM canonical_event_ids canonical
+         JOIN activity_event_index projected ON projected.event_id=canonical.event_id
+     ),
+     visible_messages AS MATERIALIZED (
+         SELECT m.id,m.timestamp,m.source_line
+         FROM messages m
+         WHERE m.thread_id=?1
+           AND NOT EXISTS(
+               SELECT 1
+               FROM canonical_events projected
+               JOIN events e ON e.id=projected.event_id AND e.thread_id=?1
+               LEFT JOIN messages event_message
+                 ON event_message.id=COALESCE(e.call_id,e.id)
+                AND event_message.thread_id=e.thread_id
+               WHERE e.id=m.id
+                  OR (
+                       projected.timestamp=m.timestamp
+                       AND e.kind<>'tool_call'
+                       AND length(trim(COALESCE(
+                           NULLIF(e.body,''),NULLIF(event_message.content,'')
+                       )))<=?2
+                       AND trim(COALESCE(
+                           NULLIF(e.body,''),NULLIF(event_message.content,'')
+                       ))=trim(m.content)
+                  )
+           )
+     ) ";
+
 #[derive(Debug)]
-struct AttributedDescendant {
+struct LegacyActivityChildRef {
+    message: bool,
     id: String,
-    agent_key: String,
-    review: bool,
+    source_line: i64,
+    timestamp: String,
+    sort_id: String,
 }
 
-fn timestamp_in_exchange(timestamp: &str, start: &str, end: Option<&str>) -> bool {
-    timestamp >= start && end.is_none_or(|end| timestamp < end)
+fn query_legacy_activity_children_page(
+    connection: &Connection,
+    thread_id: &str,
+    requested_page: u64,
+    page_size: u64,
+    child_cursor: Option<&str>,
+) -> Result<ActivityChildrenPage> {
+    let item_id = legacy_activity_id(thread_id);
+    let cursor = child_cursor
+        .map(|value| decode_activity_collection_cursor_for(value, thread_id, &item_id))
+        .transpose()?;
+    let total_sql = format!(
+        "{LEGACY_ACTIVITY_CHILDREN_CTE}
+         SELECT (SELECT COUNT(*) FROM canonical_events)
+              + (SELECT COUNT(*) FROM visible_messages)"
+    );
+    let total = connection
+        .query_row(
+            &total_sql,
+            params![thread_id, ACTIVITY_PREVIEW_CHARS],
+            |row| row.get::<_, i64>(0),
+        )?
+        .max(0) as u64;
+    let total_pages = total.div_ceil(page_size).max(1);
+    let page = if cursor.is_some() {
+        requested_page.max(1)
+    } else {
+        requested_page.max(1).min(total_pages)
+    };
+    let offset = page
+        .saturating_sub(1)
+        .saturating_mul(page_size)
+        .min(i64::MAX as u64) as i64;
+    let fetch_limit = page_size.saturating_add(1).min(i64::MAX as u64) as i64;
+    let collection_sql = "SELECT child_kind,child_id,source_line,timestamp,sort_id FROM (
+             SELECT 0 child_kind,event_id child_id,timestamp,source_line,event_id sort_id
+             FROM canonical_events
+             UNION ALL
+             SELECT 1 child_kind,id child_id,timestamp,source_line,
+                    'legacy-message:' || id sort_id
+             FROM visible_messages
+         )";
+    let row_from_sql = |row: &Row<'_>| {
+        Ok(LegacyActivityChildRef {
+            message: row.get::<_, i64>(0)? != 0,
+            id: row.get(1)?,
+            source_line: row.get(2)?,
+            timestamp: row.get(3)?,
+            sort_id: row.get(4)?,
+        })
+    };
+    // Continue pre-source-line cursors with their original ordering. Switching
+    // ordering halfway through a collection can skip equal-timestamp records.
+    let legacy_cursor_order = cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.source_line.is_none());
+    let mut selected = if let Some(cursor) = cursor.as_ref() {
+        if let Some(source_line) = cursor.source_line {
+            let page_sql = format!(
+                "{LEGACY_ACTIVITY_CHILDREN_CTE}
+                 {collection_sql}
+                 WHERE (timestamp,source_line,sort_id)<(?3,?4,?5)
+                 ORDER BY timestamp DESC,source_line DESC,sort_id DESC
+                 LIMIT ?6"
+            );
+            connection
+                .prepare(&page_sql)?
+                .query_map(
+                    params![
+                        thread_id,
+                        ACTIVITY_PREVIEW_CHARS,
+                        cursor.timestamp,
+                        source_line,
+                        cursor.sort_id,
+                        fetch_limit
+                    ],
+                    row_from_sql,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let page_sql = format!(
+                "{LEGACY_ACTIVITY_CHILDREN_CTE}
+                 {collection_sql}
+                 WHERE (timestamp,sort_id)<(?3,?4)
+                 ORDER BY timestamp DESC,sort_id DESC
+                 LIMIT ?5"
+            );
+            connection
+                .prepare(&page_sql)?
+                .query_map(
+                    params![
+                        thread_id,
+                        ACTIVITY_PREVIEW_CHARS,
+                        cursor.timestamp,
+                        cursor.sort_id,
+                        fetch_limit
+                    ],
+                    row_from_sql,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        }
+    } else {
+        let page_sql = format!(
+            "{LEGACY_ACTIVITY_CHILDREN_CTE}
+             {collection_sql}
+             ORDER BY timestamp DESC,source_line DESC,sort_id DESC
+             LIMIT ?3 OFFSET ?4"
+        );
+        connection
+            .prepare(&page_sql)?
+            .query_map(
+                params![thread_id, ACTIVITY_PREVIEW_CHARS, fetch_limit, offset],
+                row_from_sql,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let has_more = selected.len() as u64 > page_size;
+    if has_more {
+        selected.truncate(page_size as usize);
+    }
+    let next_cursor = if has_more {
+        selected
+            .last()
+            .map(|child| {
+                encode_activity_collection_cursor(
+                    thread_id,
+                    &item_id,
+                    &child.timestamp,
+                    (!legacy_cursor_order).then_some(child.source_line),
+                    &child.sort_id,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
+    let indexed = selected
+        .iter()
+        .filter(|child| !child.message)
+        .map(|child| activity_index::IndexedActivityEvent {
+            event_id: child.id.clone(),
+            source_line: child.source_line,
+        })
+        .collect::<Vec<_>>();
+    let event_items = query_activity_child_preview_rows(connection, thread_id, None, &indexed)?
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect::<HashMap<_, _>>();
+    let message_ids = selected
+        .iter()
+        .filter(|child| child.message)
+        .map(|child| child.id.clone())
+        .collect::<Vec<_>>();
+    let message_items = query_legacy_message_child_rows(connection, thread_id, &message_ids)?;
+
+    let mut items = Vec::with_capacity(selected.len());
+    for child in selected {
+        let item = if child.message {
+            message_items.get(&child.id)
+        } else {
+            event_items.get(&child.id)
+        };
+        if let Some(item) = item {
+            items.push(item.clone());
+        }
+    }
+    Ok(ActivityChildrenPage {
+        items,
+        page,
+        page_size,
+        total,
+        has_more,
+        next_cursor,
+    })
+}
+
+fn query_legacy_message_child_rows(
+    connection: &Connection,
+    thread_id: &str,
+    message_ids: &[String],
+) -> Result<HashMap<String, ActivityItem>> {
+    if message_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let requested = serde_json::to_string(message_ids)?;
+    let mut statement = connection.prepare(
+        "SELECT m.id,m.rollout_id,m.turn_id,m.timestamp,m.role,
+                CASE WHEN length(CAST(m.content AS BLOB))<=?3
+                     THEN CAST(m.content AS BLOB)
+                     ELSE substr(CAST(m.content AS BLOB),1,?4) END,
+                CASE WHEN length(CAST(m.content AS BLOB))<=?3 THEN NULL
+                     ELSE substr(CAST(m.content AS BLOB),-?4) END
+         FROM json_each(?1) requested
+         JOIN messages m ON m.id=requested.value AND m.thread_id=?2",
+    )?;
+    let rows = statement.query_map(
+        params![
+            requested,
+            thread_id,
+            ACTIVITY_MESSAGE_PARSE_BYTES,
+            ACTIVITY_MESSAGE_PARSE_EDGE_BYTES
+        ],
+        |row| {
+            let id = row.get::<_, String>(0)?;
+            let role = row.get::<_, String>(4)?;
+            let head = row.get::<_, Vec<u8>>(5)?;
+            let tail = row.get::<_, Option<Vec<u8>>>(6)?;
+            let content = activity_content_from_edges(head, tail);
+            let body = if role == "user" {
+                bounded_preview(first_prompt_for_display(&content))
+            } else {
+                bounded_preview(Some(content))
+            };
+            Ok(ActivityItem {
+                id: format!("legacy-message:{id}"),
+                turn_id: row.get(2)?,
+                rollout_id: row.get(1)?,
+                agent_run_id: None,
+                agent_label: None,
+                timestamp: row.get(3)?,
+                kind: if role == "user" { "user" } else { "final" }.into(),
+                role: Some(role),
+                label: None,
+                body,
+                status: None,
+                tool_name: None,
+                duration_ms: None,
+                model: None,
+                effort: None,
+                has_details: false,
+                children: Vec::new(),
+                child_page: None,
+                child_page_size: None,
+                child_total: None,
+                child_has_more: None,
+                child_next_cursor: None,
+                usage: None,
+                counts: None,
+            })
+        },
+    )?;
+    let mut items = HashMap::with_capacity(message_ids.len());
+    for row in rows {
+        let item = row?;
+        let id = item
+            .id
+            .strip_prefix("legacy-message:")
+            .unwrap_or(&item.id)
+            .to_owned();
+        items.insert(id, item);
+    }
+    Ok(items)
+}
+
+fn activity_content_from_edges(head: Vec<u8>, tail: Option<Vec<u8>>) -> String {
+    let mut content = String::from_utf8_lossy(&head).into_owned();
+    if let Some(tail) = tail {
+        content.push_str("\n…\n");
+        content.push_str(&String::from_utf8_lossy(&tail));
+    }
+    content
 }
 
 fn query_next_root_turn_start(
@@ -5674,131 +6219,73 @@ fn query_exchange_groups(
     root_turn_id: &str,
     root_rollout_id: &str,
     counts: &ActivityCounts,
-    descendants: &[AttributedDescendant],
+    child_page_size: u64,
 ) -> Vec<ActivityItem> {
     let mut groups = Vec::new();
-    let agent_turns = batch.turn_summaries(descendants, false);
-    if !agent_turns.is_empty() {
-        let agent_usage = batch.descendant_totals(descendants, false);
-        let agent_duration = activity_items_union_duration(&agent_turns);
-        let mut labels = Vec::new();
-        let mut seen = HashSet::new();
-        for item in &agent_turns {
-            if let Some(label) = item
-                .agent_label
-                .as_ref()
-                .filter(|label| seen.insert((*label).clone()))
-            {
-                labels.push(label.clone());
-            }
-        }
+    if let Some(agent_group) = batch
+        .group(root_turn_id, false)
+        .filter(|group| group.turn_count > 0)
+    {
         groups.push(ActivityItem {
             id: format!("group:agents:{root_turn_id}"),
             turn_id: Some(root_turn_id.to_owned()),
             rollout_id: root_rollout_id.to_owned(),
             agent_run_id: None,
             agent_label: None,
-            timestamp: agent_turns[0].timestamp.clone(),
+            timestamp: agent_group.timestamp.clone(),
             kind: "agent_group".into(),
             role: None,
             label: Some(format!("Agents · {}", counts.agent_runs)),
-            body: (!labels.is_empty()).then(|| labels.join(" · ")),
-            status: Some(group_status(&agent_turns)),
+            body: activity_agent_labels_preview(&agent_group.labels, agent_group.label_count),
+            status: Some(agent_group.status.clone()),
             tool_name: None,
-            duration_ms: agent_duration,
+            duration_ms: agent_group.duration_ms,
             model: None,
             effort: None,
             has_details: true,
-            children: agent_turns,
-            child_page: None,
-            child_page_size: None,
-            child_total: None,
-            child_has_more: None,
+            children: Vec::new(),
+            child_page: Some(1),
+            child_page_size: Some(child_page_size),
+            child_total: Some(agent_group.turn_count),
+            child_has_more: Some(true),
             child_next_cursor: None,
-            usage: Some(agent_usage),
+            usage: Some(agent_group.usage.clone().finish()),
             counts: None,
         });
     }
 
-    let review_turns = batch.turn_summaries(descendants, true);
-    if !review_turns.is_empty() {
-        let review_usage = batch.descendant_totals(descendants, true);
-        let review_duration = activity_items_union_duration(&review_turns);
+    if let Some(review_group) = batch
+        .group(root_turn_id, true)
+        .filter(|group| group.turn_count > 0)
+    {
         groups.push(ActivityItem {
             id: format!("group:reviews:{root_turn_id}"),
             turn_id: Some(root_turn_id.to_owned()),
             rollout_id: root_rollout_id.to_owned(),
             agent_run_id: None,
             agent_label: None,
-            timestamp: review_turns[0].timestamp.clone(),
+            timestamp: review_group.timestamp.clone(),
             kind: "review_group".into(),
             role: None,
             label: Some(format!("Automated reviews · {}", counts.reviews)),
             body: None,
-            status: Some(group_status(&review_turns)),
+            status: Some(review_group.status.clone()),
             tool_name: None,
-            duration_ms: review_duration,
+            duration_ms: review_group.duration_ms,
             model: None,
             effort: None,
             has_details: true,
-            children: review_turns,
-            child_page: None,
-            child_page_size: None,
-            child_total: None,
-            child_has_more: None,
+            children: Vec::new(),
+            child_page: Some(1),
+            child_page_size: Some(child_page_size),
+            child_total: Some(review_group.turn_count),
+            child_has_more: Some(true),
             child_next_cursor: None,
-            usage: Some(review_usage),
+            usage: Some(review_group.usage.clone().finish()),
             counts: None,
         });
     }
     groups
-}
-
-fn group_status(items: &[ActivityItem]) -> String {
-    if items
-        .iter()
-        .any(|item| item.status.as_deref() == Some("running"))
-    {
-        "running".into()
-    } else if items.iter().any(|item| {
-        !matches!(
-            item.status.as_deref(),
-            Some("completed") | Some("success") | Some("allowed")
-        )
-    }) {
-        "attention".into()
-    } else {
-        "completed".into()
-    }
-}
-
-fn activity_items_union_duration(items: &[ActivityItem]) -> Option<i64> {
-    let mut intervals = items
-        .iter()
-        .filter_map(|item| {
-            let duration_ms = item.duration_ms?.max(0);
-            let start = DateTime::parse_from_rfc3339(&item.timestamp)
-                .ok()?
-                .with_timezone(&Utc);
-            let duration = Duration::try_milliseconds(duration_ms)?;
-            Some((start, start.checked_add_signed(duration)?))
-        })
-        .collect::<Vec<_>>();
-    if intervals.is_empty() {
-        return None;
-    }
-    intervals.sort_by_key(|(start, _)| *start);
-    let mut total_ms = 0_i64;
-    let mut current = intervals[0];
-    for (start, end) in intervals.into_iter().skip(1) {
-        if start <= current.1 {
-            current.1 = current.1.max(end);
-        } else {
-            total_ms = total_ms.saturating_add((current.1 - current.0).num_milliseconds());
-            current = (start, end);
-        }
-    }
-    Some(total_ms.saturating_add((current.1 - current.0).num_milliseconds()))
 }
 
 fn query_activity_day_summaries_batched(
@@ -6237,12 +6724,23 @@ fn query_activity_detail_cursor_page_on(
 ) -> Result<Option<ActivityItem>> {
     let root_rollout_id = query_root_rollout_id(connection, thread_id)?;
     if item_id == legacy_activity_id(thread_id) {
-        let Some(mut item) =
-            query_legacy_activity_item(connection, thread_id, &root_rollout_id, true)?
+        let Some(mut item) = query_legacy_activity_item(connection, thread_id, &root_rollout_id)?
         else {
             return Ok(None);
         };
-        page_existing_activity_children(&mut item, child_page, child_page_size);
+        let child_page = query_legacy_activity_children_page(
+            connection,
+            thread_id,
+            child_page,
+            child_page_size,
+            child_cursor,
+        )?;
+        item.children = child_page.items;
+        item.child_page = Some(child_page.page);
+        item.child_page_size = Some(child_page.page_size);
+        item.child_total = Some(child_page.total);
+        item.child_has_more = Some(child_page.has_more);
+        item.child_next_cursor = child_page.next_cursor;
         return Ok(Some(item));
     }
     if let Some((reviews, root_turn_id)) = parse_activity_group_id(item_id) {
@@ -6254,16 +6752,18 @@ fn query_activity_detail_cursor_page_on(
             reviews,
             child_page,
             child_page_size,
+            child_cursor,
         );
     }
     if let Some(mut turn) = connection
         .query_row(
             "SELECT t.id,t.rollout_id,t.agent_run_id,t.started_at,t.status,t.model,t.effort,
-                    t.last_agent_message,t.duration_ms,a.nickname,a.agent_path
+                    NULLIF(substr(t.last_agent_message,1,?3),'') last_agent_message,
+                    t.duration_ms,a.nickname,a.agent_path
              FROM turns t LEFT JOIN agent_runs a
                ON a.id=t.agent_run_id AND a.thread_id=t.thread_id
              WHERE t.thread_id=?1 AND t.id=?2",
-            params![thread_id, item_id],
+            params![thread_id, item_id, ACTIVITY_PREVIEW_CHARS + 1],
             |row| {
                 let agent_label = row
                     .get::<_, Option<String>>(9)?
@@ -6282,10 +6782,7 @@ fn query_activity_detail_cursor_page_on(
                             .map(|value| format!("{value} · Turn"))
                             .unwrap_or_else(|| "Turn".into()),
                     ),
-                    body: row
-                        .get::<_, Option<String>>(7)?
-                        .map(|value| redact_data_urls(&value))
-                        .filter(|value| !value.is_empty()),
+                    body: bounded_preview(row.get::<_, Option<String>>(7)?),
                     status: row.get(4)?,
                     tool_name: None,
                     duration_ms: row.get(8)?,
@@ -6336,16 +6833,14 @@ fn query_activity_detail_cursor_page_on(
                 .get(item_id)
                 .cloned()
                 .unwrap_or_default();
-            let descendants =
-                batch.descendants(item_id, &turn.timestamp, next_started_at.as_deref());
-            let counts = batch.counts(item_id, &descendants);
+            let counts = batch.counts(item_id);
             turn.kind = "exchange".into();
             turn.role = Some("user".into());
             turn.label = Some(
                 bounded_preview(messages.first().cloned()).unwrap_or_else(|| "Conversation".into()),
             );
             turn.counts = Some(counts.clone());
-            turn.usage = Some(batch.exchange_totals(item_id, &descendants));
+            turn.usage = Some(batch.exchange_totals(item_id));
             let child_page = query_activity_child_previews_cursor_page(
                 connection,
                 thread_id,
@@ -6355,16 +6850,8 @@ fn query_activity_detail_cursor_page_on(
                 child_cursor,
             )?;
             turn.children = child_page.items;
-            let mut groups =
-                query_exchange_groups(&batch, item_id, &root_rollout_id, &counts, &descendants);
-            for group in &mut groups {
-                let total = group.children.len() as u64;
-                group.children.clear();
-                group.child_page = Some(1);
-                group.child_page_size = Some(child_page_size);
-                group.child_total = Some(total);
-                group.child_has_more = Some(total > 0);
-            }
+            let groups =
+                query_exchange_groups(&batch, item_id, &root_rollout_id, &counts, child_page_size);
             turn.children.extend(groups);
             turn.child_page = Some(child_page.page);
             turn.child_page_size = Some(child_page.page_size);
@@ -6674,6 +7161,7 @@ fn query_activity_group_detail_on(
     reviews: bool,
     child_page: u64,
     child_page_size: u64,
+    child_cursor: Option<&str>,
 ) -> Result<Option<ActivityItem>> {
     let root = connection
         .query_row(
@@ -6705,45 +7193,561 @@ fn query_activity_group_detail_on(
             root_turn_id,
         )?,
     };
-    let batch = ActivityBatch::load(
+    prepare_activity_group_turns(connection, thread_id, root_rollout_id, &root_scope, reviews)?;
+    let child_total = connection
+        .query_row(
+            "SELECT COUNT(*) FROM selected_activity_group_turns",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+        .max(0) as u64;
+    if child_total == 0 {
+        return Ok(None);
+    }
+    let children = query_activity_group_child_page_on(
         connection,
         thread_id,
-        root_rollout_id,
-        std::slice::from_ref(&root_scope),
+        &format!(
+            "group:{}:{root_turn_id}",
+            if reviews { "reviews" } else { "agents" }
+        ),
+        child_page,
+        child_page_size,
+        child_total,
+        child_cursor,
     )?;
-    let descendants = batch.descendants(root_turn_id, &started_at, next_started_at.as_deref());
-    let counts = batch.counts(root_turn_id, &descendants);
-    let mut group =
-        query_exchange_groups(&batch, root_turn_id, root_rollout_id, &counts, &descendants)
-            .into_iter()
-            .find(|group| (group.kind == "review_group") == reviews);
-    if let Some(group) = group.as_mut() {
-        page_existing_activity_children(group, child_page, child_page_size);
-    }
-    Ok(group)
+    let timestamp = connection.query_row(
+        "SELECT t.started_at
+         FROM selected_activity_group_turns selected
+         JOIN turns t ON t.id=selected.turn_id
+         ORDER BY t.started_at DESC,t.id DESC LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    let status = query_activity_group_status_on(connection)?;
+    let duration_ms = query_activity_group_duration_on(connection)?;
+    let usage = query_activity_group_totals_on(connection, thread_id)?;
+    let (label, body) = if reviews {
+        (format!("Automated reviews · {child_total}"), None)
+    } else {
+        let agent_count = connection
+            .query_row(
+                "SELECT COUNT(DISTINCT agent_key)
+                 FROM selected_activity_group_turns",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?
+            .max(0) as u64;
+        (
+            format!("Agents · {agent_count}"),
+            query_activity_group_labels_on(connection)?,
+        )
+    };
+    Ok(Some(ActivityItem {
+        id: format!(
+            "group:{}:{root_turn_id}",
+            if reviews { "reviews" } else { "agents" }
+        ),
+        turn_id: Some(root_turn_id.to_owned()),
+        rollout_id: root_rollout_id.to_owned(),
+        agent_run_id: None,
+        agent_label: None,
+        timestamp,
+        kind: if reviews {
+            "review_group".into()
+        } else {
+            "agent_group".into()
+        },
+        role: None,
+        label: Some(label),
+        body,
+        status: Some(status),
+        tool_name: None,
+        duration_ms,
+        model: None,
+        effort: None,
+        has_details: true,
+        children: children.items,
+        child_page: Some(children.page),
+        child_page_size: Some(children.page_size),
+        child_total: Some(children.total),
+        child_has_more: Some(children.has_more),
+        child_next_cursor: children.next_cursor,
+        usage: Some(usage),
+        counts: None,
+    }))
 }
 
-fn page_existing_activity_children(item: &mut ActivityItem, page: u64, page_size: u64) {
-    let total = item.children.len() as u64;
+fn prepare_activity_group_turns(
+    connection: &Connection,
+    thread_id: &str,
+    root_rollout_id: &str,
+    root: &ActivityRootScope,
+    reviews: bool,
+) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS selected_activity_group_turns(
+             turn_id TEXT PRIMARY KEY,
+             agent_key TEXT NOT NULL,
+             started_at TEXT NOT NULL
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS idx_selected_activity_group_turns_time
+             ON selected_activity_group_turns(started_at DESC,turn_id DESC);
+         DELETE FROM selected_activity_group_turns;",
+    )?;
+    connection.execute(
+        "WITH links AS MATERIALIZED (
+             SELECT json_extract(event.payload_json,'$.agent_thread_id') agent_key,
+                    event.turn_id root_turn_id,event.timestamp,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY json_extract(event.payload_json,'$.agent_thread_id')
+                        ORDER BY event.timestamp,event.source_line,event.id
+                    ) link_rank,
+                    LEAD(event.timestamp) OVER (
+                        PARTITION BY json_extract(event.payload_json,'$.agent_thread_id')
+                        ORDER BY event.timestamp,event.source_line,event.id
+                    ) next_linked_at
+             FROM events event
+             JOIN turns root_turn
+               ON root_turn.id=event.turn_id AND root_turn.thread_id=event.thread_id
+             WHERE event.thread_id=?1 AND event.kind='subagent'
+               AND root_turn.rollout_id=?2
+               AND json_extract(event.payload_json,'$.agent_thread_id') IS NOT NULL
+               AND EXISTS(
+                    SELECT 1 FROM turns descendant
+                    WHERE descendant.thread_id=?1 AND descendant.rollout_id<>?2
+                    LIMIT 1
+               )
+         ),
+         explicit_agents AS MATERIALIZED (
+             SELECT DISTINCT agent_key FROM links
+         ),
+         selected_intervals AS MATERIALIZED (
+             SELECT agent_key,
+                    CASE WHEN link_rank=1 THEN NULL ELSE timestamp END linked_at,
+                    next_linked_at
+             FROM links WHERE root_turn_id=?3
+         )
+         INSERT INTO selected_activity_group_turns(turn_id,agent_key,started_at)
+         SELECT t.id,COALESCE(t.agent_run_id,t.rollout_id),t.started_at
+         FROM turns t
+         WHERE t.thread_id=?1 AND t.rollout_id<>?2
+           AND (COALESCE(t.model='codex-auto-review',0)=?6)
+           AND (
+                (
+                    EXISTS(
+                        SELECT 1 FROM explicit_agents explicit
+                        WHERE explicit.agent_key=COALESCE(t.agent_run_id,t.rollout_id)
+                    )
+                    AND EXISTS(
+                        SELECT 1 FROM selected_intervals selected
+                        WHERE selected.agent_key=COALESCE(t.agent_run_id,t.rollout_id)
+                          AND (selected.linked_at IS NULL OR t.started_at>=selected.linked_at)
+                          AND (selected.next_linked_at IS NULL
+                               OR t.started_at<selected.next_linked_at)
+                    )
+                )
+                OR (
+                    NOT EXISTS(
+                        SELECT 1 FROM explicit_agents explicit
+                        WHERE explicit.agent_key=COALESCE(t.agent_run_id,t.rollout_id)
+                    )
+                    AND t.started_at>=?4
+                    AND (?5 IS NULL OR t.started_at<?5)
+                )
+           )",
+        params![
+            thread_id,
+            root_rollout_id,
+            root.id,
+            root.started_at,
+            root.next_started_at,
+            i64::from(reviews)
+        ],
+    )?;
+    Ok(())
+}
+
+struct ActivityGroupChildRef {
+    id: String,
+    timestamp: String,
+}
+
+fn query_activity_group_child_page_on(
+    connection: &Connection,
+    thread_id: &str,
+    item_id: &str,
+    requested_page: u64,
+    page_size: u64,
+    total: u64,
+    child_cursor: Option<&str>,
+) -> Result<ActivityChildrenPage> {
+    let cursor = child_cursor
+        .map(|value| decode_activity_collection_cursor_for(value, thread_id, item_id))
+        .transpose()?;
     let total_pages = total.div_ceil(page_size).max(1);
-    let page = page.min(total_pages).max(1);
-    let start = page.saturating_sub(1).saturating_mul(page_size) as usize;
-    let end = start
-        .saturating_add(page_size as usize)
-        .min(item.children.len());
-    item.children = if start < item.children.len() {
-        item.children[start..end].to_vec()
+    let page = if cursor.is_some() {
+        requested_page.max(1)
     } else {
-        Vec::new()
+        requested_page.max(1).min(total_pages)
     };
-    item.child_page = Some(page);
-    item.child_page_size = Some(page_size);
-    item.child_total = Some(total);
-    item.child_has_more = Some(page < total_pages);
-    // Legacy and synthetic group children are already bounded in memory and
-    // retain numeric pagination. Never leak a stale cursor from an Activity
-    // item that was previously populated through the indexed turn path.
-    item.child_next_cursor = None;
+    let offset = page
+        .saturating_sub(1)
+        .saturating_mul(page_size)
+        .min(i64::MAX as u64) as i64;
+    let fetch_limit = page_size.saturating_add(1).min(i64::MAX as u64) as i64;
+    let mut selected = if let Some(cursor) = cursor.as_ref() {
+        let mut statement = connection.prepare(
+            "SELECT selected.turn_id,selected.started_at
+             FROM selected_activity_group_turns selected
+                  INDEXED BY idx_selected_activity_group_turns_time
+             WHERE (selected.started_at,selected.turn_id)<(?1,?2)
+             ORDER BY selected.started_at DESC,selected.turn_id DESC
+             LIMIT ?3",
+        )?;
+        statement
+            .query_map(
+                params![cursor.timestamp, cursor.sort_id, fetch_limit],
+                |row| {
+                    Ok(ActivityGroupChildRef {
+                        id: row.get(0)?,
+                        timestamp: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        let mut statement = connection.prepare(
+            "SELECT selected.turn_id,selected.started_at
+             FROM selected_activity_group_turns selected
+                  INDEXED BY idx_selected_activity_group_turns_time
+             ORDER BY selected.started_at DESC,selected.turn_id DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        statement
+            .query_map(params![fetch_limit, offset], |row| {
+                Ok(ActivityGroupChildRef {
+                    id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let has_more = selected.len() as u64 > page_size;
+    if has_more {
+        selected.truncate(page_size as usize);
+    }
+    let next_cursor = if has_more {
+        selected
+            .last()
+            .map(|child| {
+                encode_activity_collection_cursor(
+                    thread_id,
+                    item_id,
+                    &child.timestamp,
+                    None,
+                    &child.id,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let mut items = query_activity_group_child_rows(connection, thread_id, &selected)?;
+    query_activity_page_turn_totals_on(connection, thread_id, &mut items)?;
+    Ok(ActivityChildrenPage {
+        items,
+        page,
+        page_size,
+        total,
+        has_more,
+        next_cursor,
+    })
+}
+
+fn query_activity_group_child_rows(
+    connection: &Connection,
+    thread_id: &str,
+    selected: &[ActivityGroupChildRef],
+) -> Result<Vec<ActivityItem>> {
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let requested = serde_json::to_string(
+        &selected
+            .iter()
+            .map(|child| child.id.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT t.id,t.rollout_id,t.agent_run_id,t.started_at,t.status,t.model,t.effort,
+                NULLIF(substr(t.last_agent_message,1,?3),''),t.duration_ms,
+                a.nickname,a.agent_path
+         FROM json_each(?1) requested
+         JOIN turns t ON t.id=requested.value AND t.thread_id=?2
+         LEFT JOIN agent_runs a ON a.id=t.agent_run_id AND a.thread_id=t.thread_id
+         ORDER BY CAST(requested.key AS INTEGER)",
+    )?;
+    statement
+        .query_map(
+            params![requested, thread_id, ACTIVITY_PREVIEW_CHARS],
+            activity_group_child_from_row,
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn activity_group_child_from_row(row: &Row<'_>) -> rusqlite::Result<ActivityItem> {
+    let model = row.get::<_, Option<String>>(5)?;
+    let review = model.as_deref() == Some("codex-auto-review");
+    let agent_label = row
+        .get::<_, Option<String>>(9)?
+        .or(row.get::<_, Option<String>>(10)?);
+    Ok(ActivityItem {
+        id: row.get(0)?,
+        turn_id: row.get(0)?,
+        rollout_id: row.get(1)?,
+        agent_run_id: row.get(2)?,
+        agent_label: agent_label.clone(),
+        timestamp: row.get(3)?,
+        kind: if review { "review" } else { "subagent" }.into(),
+        role: None,
+        label: Some(agent_label.unwrap_or_else(|| {
+            if review {
+                "Automated review".into()
+            } else {
+                "Agent response".into()
+            }
+        })),
+        body: bounded_preview(row.get(7)?),
+        status: row.get(4)?,
+        tool_name: None,
+        duration_ms: row.get(8)?,
+        model,
+        effort: row.get(6)?,
+        has_details: true,
+        children: Vec::new(),
+        child_page: None,
+        child_page_size: None,
+        child_total: None,
+        child_has_more: None,
+        child_next_cursor: None,
+        usage: None,
+        counts: None,
+    })
+}
+
+fn query_activity_page_turn_totals_on(
+    connection: &Connection,
+    thread_id: &str,
+    items: &mut [ActivityItem],
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let requested = serde_json::to_string(
+        &items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let mut totals_by_turn = HashMap::<String, FixedPointUsageTotals>::new();
+    let mut statement = connection.prepare(
+        "SELECT r.turn_key,r.activity_hour,r.model,
+                COALESCE(SUM(r.input_tokens),0),
+                COALESCE(SUM(r.cached_input_tokens),0),
+                COALESCE(SUM(r.output_tokens),0),
+                COALESCE(SUM(r.reasoning_tokens),0),
+                COALESCE(SUM(r.total_tokens),0)
+         FROM json_each(?1) requested
+         JOIN usage_activity_rollups r
+           ON r.thread_id=?2 AND r.turn_key=requested.value
+         GROUP BY r.turn_key,r.activity_hour,r.model",
+    )?;
+    let mut rows = statement.query(params![requested, thread_id])?;
+    while let Some(row) = rows.next()? {
+        let turn_id = row.get::<_, String>(0)?;
+        let activity_hour = row.get::<_, String>(1)?;
+        let model = row.get::<_, String>(2)?;
+        let input_tokens = row.get::<_, i64>(3)?.max(0);
+        let cached_input_tokens = row.get::<_, i64>(4)?.max(0);
+        let output_tokens = row.get::<_, i64>(5)?.max(0);
+        let reasoning_tokens = row.get::<_, i64>(6)?.max(0);
+        let total_tokens = row.get::<_, i64>(7)?.max(0) as u64;
+        let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
+            connection,
+            &aliases,
+            &prices,
+            UsageRollupScope::Turn(&turn_id),
+            thread_id,
+            &activity_hour,
+            &model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            total_tokens,
+        )?;
+        totals_by_turn.entry(turn_id).or_default().add_group(
+            input_tokens as u64,
+            cached_input_tokens as u64,
+            output_tokens as u64,
+            reasoning_tokens as u64,
+            total_tokens,
+            known_cost_numerator,
+            unpriced_tokens,
+        );
+    }
+    for item in items {
+        item.usage = Some(totals_by_turn.remove(&item.id).unwrap_or_default().finish());
+    }
+    Ok(())
+}
+
+fn query_activity_group_totals_on(connection: &Connection, thread_id: &str) -> Result<Totals> {
+    let (aliases, prices) = overview_prices_on(connection)?;
+    let mut totals = FixedPointUsageTotals::default();
+    let mut statement = connection.prepare(
+        "SELECT r.turn_key,r.activity_hour,r.model,
+                COALESCE(SUM(r.input_tokens),0),
+                COALESCE(SUM(r.cached_input_tokens),0),
+                COALESCE(SUM(r.output_tokens),0),
+                COALESCE(SUM(r.reasoning_tokens),0),
+                COALESCE(SUM(r.total_tokens),0)
+         FROM selected_activity_group_turns selected
+         JOIN usage_activity_rollups r
+           ON r.thread_id=?1 AND r.turn_key=selected.turn_id
+         GROUP BY r.turn_key,r.activity_hour,r.model",
+    )?;
+    let mut rows = statement.query([thread_id])?;
+    while let Some(row) = rows.next()? {
+        let turn_id = row.get::<_, String>(0)?;
+        let activity_hour = row.get::<_, String>(1)?;
+        let model = row.get::<_, String>(2)?;
+        let input_tokens = row.get::<_, i64>(3)?.max(0);
+        let cached_input_tokens = row.get::<_, i64>(4)?.max(0);
+        let output_tokens = row.get::<_, i64>(5)?.max(0);
+        let reasoning_tokens = row.get::<_, i64>(6)?.max(0);
+        let total_tokens = row.get::<_, i64>(7)?.max(0) as u64;
+        let (known_cost_numerator, unpriced_tokens) = usage_rollup_cost_on(
+            connection,
+            &aliases,
+            &prices,
+            UsageRollupScope::Turn(&turn_id),
+            thread_id,
+            &activity_hour,
+            &model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            total_tokens,
+        )?;
+        totals.add_group(
+            input_tokens as u64,
+            cached_input_tokens as u64,
+            output_tokens as u64,
+            reasoning_tokens as u64,
+            total_tokens,
+            known_cost_numerator,
+            unpriced_tokens,
+        );
+    }
+    Ok(totals.finish())
+}
+
+fn query_activity_group_status_on(connection: &Connection) -> Result<String> {
+    let (running, attention) = connection.query_row(
+        "SELECT COALESCE(MAX(t.status='running'),0),
+                COALESCE(MAX(t.status NOT IN ('completed','success','allowed')),0)
+         FROM selected_activity_group_turns selected
+         JOIN turns t ON t.id=selected.turn_id",
+        [],
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+    )?;
+    Ok(if running {
+        "running"
+    } else if attention {
+        "attention"
+    } else {
+        "completed"
+    }
+    .into())
+}
+
+fn query_activity_group_labels_on(connection: &Connection) -> Result<Option<String>> {
+    let mut statement = connection.prepare(
+        "WITH latest_labels AS (
+             SELECT COALESCE(a.nickname,a.agent_path) label,t.started_at,t.id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(a.nickname,a.agent_path)
+                        ORDER BY t.started_at DESC,t.id DESC
+                    ) label_rank
+             FROM selected_activity_group_turns selected
+             JOIN turns t ON t.id=selected.turn_id
+             LEFT JOIN agent_runs a ON a.id=t.agent_run_id AND a.thread_id=t.thread_id
+         ), ranked_labels AS (
+             SELECT label,started_at,id,COUNT(*) OVER () label_count,
+                    ROW_NUMBER() OVER (ORDER BY started_at DESC,id DESC) preview_rank
+             FROM latest_labels WHERE label IS NOT NULL AND label_rank=1
+         )
+         SELECT label,label_count FROM ranked_labels
+         WHERE preview_rank<=?1 ORDER BY preview_rank",
+    )?;
+    let labels = statement
+        .query_map([ACTIVITY_AGENT_LABEL_PREVIEW_LIMIT], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let label_count = labels.first().map_or(0, |(_, count)| *count);
+    let labels = labels
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect::<Vec<_>>();
+    Ok(activity_agent_labels_preview(&labels, label_count))
+}
+
+fn query_activity_group_duration_on(connection: &Connection) -> Result<Option<i64>> {
+    let mut statement = connection.prepare(
+        "SELECT t.started_at,t.duration_ms
+         FROM selected_activity_group_turns selected
+         JOIN turns t ON t.id=selected.turn_id
+         WHERE t.duration_ms IS NOT NULL
+         ORDER BY t.started_at,t.id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut current = None::<(DateTime<Utc>, DateTime<Utc>)>;
+    let mut total_ms = 0_i64;
+    while let Some(row) = rows.next()? {
+        let started_at = row.get::<_, String>(0)?;
+        let duration_ms = row.get::<_, i64>(1)?.max(0);
+        let Some(start) = DateTime::parse_from_rfc3339(&started_at)
+            .ok()
+            .map(|value| value.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        let Some(duration) = Duration::try_milliseconds(duration_ms) else {
+            continue;
+        };
+        let Some(end) = start.checked_add_signed(duration) else {
+            continue;
+        };
+        match current {
+            Some((current_start, current_end)) if start <= current_end => {
+                current = Some((current_start, current_end.max(end)));
+            }
+            Some((current_start, current_end)) => {
+                total_ms =
+                    total_ms.saturating_add((current_end - current_start).num_milliseconds());
+                current = Some((start, end));
+            }
+            None => current = Some((start, end)),
+        }
+    }
+    Ok(current.map(|(start, end)| total_ms.saturating_add((end - start).num_milliseconds())))
 }
 
 fn query_activity_turn_totals_on(
@@ -6813,19 +7817,6 @@ fn query_activity_turn_totals_on(
         );
     }
     Ok(totals.finish())
-}
-
-fn query_activity_child_previews(
-    connection: &rusqlite::Connection,
-    thread_id: &str,
-    turn_id: Option<&str>,
-) -> Result<Vec<ActivityItem>> {
-    let indexed = if let Some(turn_id) = turn_id {
-        activity_index::query_all_in_turn(connection, thread_id, turn_id)?
-    } else {
-        activity_index::query_all(connection, thread_id)?
-    };
-    query_activity_child_preview_rows(connection, thread_id, turn_id, &indexed)
 }
 
 struct ActivityChildrenPage {
@@ -7495,28 +8486,90 @@ fn query_prices_on(
     })
 }
 
-fn query_price_metadata_on(
+fn query_aliases_on(
     connection: &Connection,
-    unknown_limit: u64,
-) -> Result<PriceMetadataResponse> {
+    q: Option<&str>,
+    page: u64,
+    page_size: u64,
+) -> Result<AliasesResponse> {
+    anyhow::ensure!((1..=100).contains(&page_size), "invalid alias page size");
     anyhow::ensure!(
-        (1..=MAX_UNKNOWN_MODEL_RESULTS).contains(&unknown_limit),
-        "invalid unknown model result limit"
+        page > 0 && page <= MAX_JS_SAFE_INTEGER,
+        "invalid alias page"
     );
-    let aliases_total: i64 =
-        connection.query_row("SELECT COUNT(*) FROM resolved_model_aliases", [], |row| {
-            row.get(0)
-        })?;
+    let q_filter = q.map(str::trim).filter(|value| !value.is_empty());
+    anyhow::ensure!(
+        q_filter.is_none_or(|value| value.chars().count() <= MAX_SESSION_SEARCH_CHARS),
+        "alias search exceeds the {MAX_SESSION_SEARCH_CHARS}-character limit"
+    );
+    anyhow::ensure!(
+        q_filter.is_none_or(|value| {
+            normalize_search_text(value).chars().count() <= MAX_SESSION_SEARCH_CHARS
+        }),
+        "normalized alias search exceeds the {MAX_SESSION_SEARCH_CHARS}-character limit"
+    );
+    connection.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS alias_search_matches(
+             observed_model_id TEXT PRIMARY KEY
+         ) WITHOUT ROWID;
+         DELETE FROM alias_search_matches;",
+    )?;
+    if let Some(query) = q_filter {
+        let needle = normalize_search_text(query);
+        let mut select = connection.prepare(
+            "SELECT observed_model_id,canonical_model_id
+             FROM resolved_model_aliases
+             WHERE length(observed_model_id) BETWEEN 1 AND ?1
+               AND length(canonical_model_id) BETWEEN 1 AND ?1",
+        )?;
+        let mut insert = connection
+            .prepare("INSERT OR IGNORE INTO alias_search_matches(observed_model_id) VALUES(?1)")?;
+        let mut rows = select.query([MAX_MODEL_ID_CHARS as i64])?;
+        while let Some(row) = rows.next()? {
+            let observed_model_id = row.get::<_, String>(0)?;
+            let canonical_model_id = row.get::<_, String>(1)?;
+            if normalize_search_text(&observed_model_id).contains(&needle)
+                || normalize_search_text(&canonical_model_id).contains(&needle)
+            {
+                insert.execute([&observed_model_id])?;
+            }
+        }
+    }
+    let total = connection.query_row(
+        "SELECT COUNT(*) FROM resolved_model_aliases
+         WHERE length(observed_model_id) BETWEEN 1 AND ?2
+           AND length(canonical_model_id) BETWEEN 1 AND ?2
+           AND (
+                ?1 IS NULL OR EXISTS(
+                    SELECT 1 FROM alias_search_matches search
+                    WHERE search.observed_model_id=resolved_model_aliases.observed_model_id
+                )
+           )",
+        params![q_filter, MAX_MODEL_ID_CHARS as i64],
+        |row| row.get::<_, i64>(0),
+    )?;
     let mut statement = connection.prepare(
         "SELECT observed_model_id,canonical_model_id
          FROM resolved_model_aliases
-         WHERE length(observed_model_id) BETWEEN 1 AND ?1
-           AND length(canonical_model_id) BETWEEN 1 AND ?1
-         ORDER BY observed_model_id LIMIT ?2",
+         WHERE length(observed_model_id) BETWEEN 1 AND ?2
+           AND length(canonical_model_id) BETWEEN 1 AND ?2
+           AND (
+                ?1 IS NULL OR EXISTS(
+                    SELECT 1 FROM alias_search_matches search
+                    WHERE search.observed_model_id=resolved_model_aliases.observed_model_id
+                )
+           )
+         ORDER BY observed_model_id
+         LIMIT ?3 OFFSET ?4",
     )?;
-    let aliases = statement
+    let items = statement
         .query_map(
-            params![MAX_MODEL_ID_CHARS as i64, MAX_ALIAS_RESULTS as i64],
+            params![
+                q_filter,
+                MAX_MODEL_ID_CHARS as i64,
+                page_size as i64,
+                price_page_offset(page, page_size),
+            ],
             |row| {
                 Ok(AliasRow {
                     observed_model_id: row.get(0)?,
@@ -7525,6 +8578,24 @@ fn query_price_metadata_on(
             },
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let total = total.max(0) as u64;
+    Ok(AliasesResponse {
+        items,
+        page,
+        page_size,
+        total,
+        total_pages: total.div_ceil(page_size),
+    })
+}
+
+fn query_price_metadata_on(
+    connection: &Connection,
+    unknown_limit: u64,
+) -> Result<PriceMetadataResponse> {
+    anyhow::ensure!(
+        (1..=MAX_UNKNOWN_MODEL_RESULTS).contains(&unknown_limit),
+        "invalid unknown model result limit"
+    );
     let observed_unknown_total: i64 = connection.query_row(
         "SELECT COUNT(*) FROM (
             SELECT model FROM priced_usage WHERE price_known=0 GROUP BY model
@@ -7551,8 +8622,6 @@ fn query_price_metadata_on(
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(PriceMetadataResponse {
-        aliases,
-        aliases_total: aliases_total.max(0) as u64,
         observed_unknown,
         observed_unknown_total: observed_unknown_total.max(0) as u64,
     })
@@ -7625,6 +8694,11 @@ fn query_bounds(
     start: Option<&str>,
     end: Option<&str>,
 ) -> ApiResult<(Option<String>, Option<String>)> {
+    if date.is_some() && (start.is_some() || end.is_some()) {
+        return Err(ApiError::bad_request(
+            "date cannot be combined with start or end",
+        ));
+    }
     if let Some(date) = date {
         let date = parse_date(date)?;
         return Ok((
@@ -7724,10 +8798,11 @@ mod tests {
         ApiState, BUCKET_AGGREGATES_SQL, OVERVIEW_YEAR_USAGE_SQL, PricesQuery,
         STATS_BUCKET_SESSIONS_SQL, STATS_BUCKET_USAGE_SQL, STATS_FEW_BUCKET_SESSIONS_SQL,
         SqlBucketBounds, StatsBucketAggregate, activity_day_window, display_tool_name,
-        first_prompt_for_display, price_page_offset, prices, query_activity_child_previews_page,
-        query_activity_day_summaries_batched, query_activity_detail_on,
-        query_activity_detail_page_on, query_activity_on, query_heatmap_on, query_overview_year_on,
-        query_stats_on, run_snapshot_work, settings, stats_totals_from_aggregates,
+        first_prompt_for_display, prewarm_current_year_analytics_on, price_page_offset, prices,
+        query_activity_child_previews_page, query_activity_day_summaries_batched,
+        query_activity_detail_on, query_activity_detail_page_on, query_activity_on, query_bounds,
+        query_heatmap_on, query_overview_year_on, query_stats_on, run_manual_mutation,
+        run_snapshot_work, settings, stats_totals_from_aggregates,
     };
     use crate::{
         config::PricingConfig,
@@ -7755,6 +8830,7 @@ mod tests {
     static TRACE_LOCK: Mutex<()> = Mutex::new(());
     static QUERY_COUNT: AtomicUsize = AtomicUsize::new(0);
     static OVERVIEW_USAGE_QUERY_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static STATS_USAGE_QUERY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     fn count_query(sql: &str) {
         let sql = sql.trim_start();
@@ -7764,6 +8840,9 @@ mod tests {
         if sql.contains("overview-year-usage") {
             OVERVIEW_USAGE_QUERY_COUNT.fetch_add(1, Ordering::SeqCst);
         }
+        if sql.contains("bucket_model_values AS MATERIALIZED") {
+            STATS_USAGE_QUERY_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[test]
@@ -7771,6 +8850,84 @@ mod tests {
         assert_eq!(price_page_offset(1, 25), 0);
         assert_eq!(price_page_offset(3, 25), 50);
         assert_eq!(price_page_offset(u64::MAX, 100), i64::MAX);
+    }
+
+    #[test]
+    fn aliases_are_filtered_and_paginated_before_serialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL SELECT value+1 FROM sequence WHERE value<51
+                 )
+                 INSERT INTO model_aliases(
+                    observed_model_id,canonical_model_id,created_at,source
+                 )
+                 SELECT printf('legacy-alias-%02d',value),
+                        printf('canonical-target-%02d',value),
+                        '2026-01-01T00:00:00.000000000Z','remote:test'
+                 FROM sequence;
+                 INSERT INTO model_aliases(
+                    observed_model_id,canonical_model_id,created_at,source
+                 ) VALUES(
+                    replace(hex(zeroblob(300)),'00','x'),'canonical-target-00',
+                    '2026-01-01T00:00:00.000000000Z','remote:test'
+                 );",
+            )
+            .unwrap();
+
+        let page = super::query_aliases_on(&connection, Some("LEGACY-ALIAS-"), 2, 10).unwrap();
+        assert_eq!(page.page, 2);
+        assert_eq!(page.page_size, 10);
+        assert_eq!(page.total, 52);
+        assert_eq!(page.total_pages, 6);
+        assert_eq!(page.items.len(), 10);
+        assert_eq!(page.items[0].observed_model_id, "legacy-alias-10");
+        assert!(page.items.iter().all(|alias| {
+            alias.observed_model_id.chars().count() <= super::MAX_MODEL_ID_CHARS
+                && alias.canonical_model_id.chars().count() <= super::MAX_MODEL_ID_CHARS
+        }));
+
+        let canonical = super::query_aliases_on(&connection, Some("TARGET-3"), 1, 25).unwrap();
+        assert_eq!(canonical.total, 10);
+        assert_eq!(canonical.items.len(), 10);
+        assert!(serde_json::to_vec(&canonical).unwrap().len() < 8 * 1024);
+    }
+
+    #[test]
+    fn alias_search_normalizes_unicode_before_deterministic_pagination() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO model_aliases(
+                    observed_model_id,canonical_model_id,created_at,source
+                 ) VALUES
+                    ('MÜNCHEN-É-02','gpt-5.5','2026-01-01T00:00:00Z','remote:test'),
+                    ('MÜNCHEN-É-01','gpt-5.5','2026-01-01T00:00:00Z','remote:test');",
+            )
+            .unwrap();
+
+        let first = super::query_aliases_on(&connection, Some("münchen-e\u{301}"), 1, 1).unwrap();
+        assert_eq!(first.total, 2);
+        assert_eq!(first.total_pages, 2);
+        assert_eq!(first.items[0].observed_model_id, "MÜNCHEN-É-01");
+
+        let second = super::query_aliases_on(&connection, Some("münchen-e\u{301}"), 2, 1).unwrap();
+        assert_eq!(second.total, 2);
+        assert_eq!(second.items[0].observed_model_id, "MÜNCHEN-É-02");
+    }
+
+    #[test]
+    fn date_filter_rejects_an_ambiguous_explicit_range() {
+        let error =
+            query_bounds(Some("2026-07-22"), Some("2026-07-01"), Some("2026-07-31")).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "date cannot be combined with start or end");
     }
 
     #[test]
@@ -7798,21 +8955,6 @@ mod tests {
                         '2026-01-01T00:00:00.000000000Z',value+1,
                         printf('unknown-model-%05d',value),1,0,0,0,1,1
                  FROM sequence;
-                 WITH RECURSIVE sequence(value) AS (
-                    SELECT 0 UNION ALL SELECT value+1 FROM sequence WHERE value<199
-                 )
-                 INSERT INTO model_aliases(
-                    observed_model_id,canonical_model_id,created_at,source
-                 )
-                 SELECT printf('bounded-alias-%03d',value),'gpt-5.5',
-                        '2026-01-01T00:00:00.000000000Z','remote:test'
-                 FROM sequence;
-                 INSERT INTO model_aliases(
-                    observed_model_id,canonical_model_id,created_at,source
-                 ) VALUES(
-                    replace(hex(zeroblob(300)),'00','x'),'gpt-5.5',
-                    '2026-01-01T00:00:00.000000000Z','remote:test'
-                 );
                  INSERT INTO usage_facts(
                     id,thread_id,rollout_id,timestamp,source_line,model,
                     input_tokens,cached_input_tokens,output_tokens,
@@ -7826,12 +8968,6 @@ mod tests {
             .unwrap();
 
         let metadata = super::query_price_metadata_on(&connection, 100).unwrap();
-        assert_eq!(metadata.aliases_total, 202);
-        assert_eq!(metadata.aliases.len(), 100);
-        assert!(metadata.aliases.iter().all(|row| {
-            row.observed_model_id.chars().count() <= super::MAX_MODEL_ID_CHARS
-                && row.canonical_model_id.chars().count() <= super::MAX_MODEL_ID_CHARS
-        }));
         assert_eq!(metadata.observed_unknown_total, 20_001);
         assert_eq!(metadata.observed_unknown.len(), 100);
         assert!(
@@ -7865,7 +9001,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open(temp.path().join("usage.db")).unwrap();
-        let executor = DbExecutor::new(2, 1);
+        let executor = DbExecutor::new(3, 1);
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let (blocker_started_tx, blocker_started_rx) = oneshot::channel();
         let blocker = {
@@ -7939,6 +9075,76 @@ mod tests {
         let _ = prices_task.await.unwrap().unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_pricing_mutations_queue_before_blocking_workers() {
+        use tokio::sync::oneshot;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let state = ApiState::with_executor(
+            db,
+            IngestRoots {
+                active: None,
+                archive: None,
+            },
+            temp.path().join("frontend"),
+            PricingConfig {
+                url: "http://127.0.0.1:9/prices.json".into(),
+                refresh_interval_hours: 24,
+                timeout_seconds: 1,
+            },
+            DbExecutor::new(3, 1),
+        );
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (first_started_tx, first_started_rx) = oneshot::channel();
+        let first = {
+            let state = state.clone();
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                run_manual_mutation(&state, move || {
+                    first_started_tx.send(()).unwrap();
+                    let (lock, ready) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                    Ok(())
+                })
+                .await
+            })
+        };
+        first_started_rx.await.unwrap();
+        first.abort();
+
+        let (second_started_tx, mut second_started_rx) = oneshot::channel();
+        let second = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                run_manual_mutation(&state, move || {
+                    second_started_tx.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(100), &mut second_started_rx)
+                .await
+                .is_err(),
+            "a queued mutation consumed a blocking worker before the active mutation completed"
+        );
+
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        assert!(first.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(StdDuration::from_secs(2), &mut second_started_rx)
+            .await
+            .expect("queued mutation did not start after the active mutation finished")
+            .unwrap();
+        second.await.unwrap().unwrap();
+    }
+
     #[test]
     fn analytical_bucket_queries_have_constant_statement_budgets() {
         let _trace_guard = TRACE_LOCK.lock().unwrap();
@@ -7972,6 +9178,27 @@ mod tests {
         let stats = query_stats_on(&connection, "all", anchor).unwrap();
         assert_eq!(stats.rows.len(), 1);
         assert_eq!(QUERY_COUNT.swap(0, Ordering::SeqCst), 5);
+        connection.trace(None);
+    }
+
+    #[test]
+    fn startup_prewarm_executes_both_current_year_analytical_plans() {
+        let _trace_guard = TRACE_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let mut connection = db.connect().unwrap();
+        connection.trace(Some(count_query));
+        OVERVIEW_USAGE_QUERY_COUNT.store(0, Ordering::SeqCst);
+        STATS_USAGE_QUERY_COUNT.store(0, Ordering::SeqCst);
+
+        prewarm_current_year_analytics_on(
+            &connection,
+            NaiveDate::from_ymd_opt(2026, 7, 23).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(OVERVIEW_USAGE_QUERY_COUNT.swap(0, Ordering::SeqCst), 1);
+        assert_eq!(STATS_USAGE_QUERY_COUNT.swap(0, Ordering::SeqCst), 1);
         connection.trace(None);
     }
 
@@ -8176,6 +9403,79 @@ mod tests {
             .expect("SQLite query kept running after its request was cancelled")
             .unwrap();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn dropping_snapshot_work_stays_cancelled_between_sqlite_statements() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let state = ApiState::with_executor(
+            db.clone(),
+            IngestRoots {
+                active: None,
+                archive: None,
+            },
+            temp.path().join("frontend"),
+            PricingConfig {
+                url: "http://127.0.0.1:9/prices.json".into(),
+                refresh_interval_hours: 24,
+                timeout_seconds: 1,
+            },
+            DbExecutor::default(),
+        );
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let (first_done_tx, first_done_rx) = tokio::sync::oneshot::channel();
+        let (second_done_tx, second_done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_snapshot_work(&state, WorkClass::Heavy, db, move |connection| {
+                let first: i64 = connection.query_row("SELECT 1", [], |row| row.get(0))?;
+                assert_eq!(first, 1);
+                let _ = first_done_tx.send(());
+
+                let (lock, ready) = &*worker_gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = ready.wait(released).unwrap();
+                }
+                drop(released);
+
+                let second = connection.query_row(
+                    "WITH RECURSIVE counter(value) AS (
+                         VALUES(0) UNION ALL
+                         SELECT value+1 FROM counter WHERE value<100000000
+                     ) SELECT SUM(value) FROM counter",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                );
+                let interrupted = matches!(
+                    second,
+                    Err(rusqlite::Error::SqliteFailure(error, _))
+                        if error.code == rusqlite::ErrorCode::OperationInterrupted
+                );
+                let _ = second_done_tx.send(interrupted);
+                Ok(())
+            })
+            .await
+        });
+
+        first_done_rx.await.unwrap();
+        // No SQLite statement is running at this point. The immediate
+        // InterruptHandle call is therefore insufficient on its own; the
+        // connection-wide progress handler must stop the next statement.
+        task.abort();
+        let _ = task.await;
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), second_done_rx)
+                .await
+                .expect("SQLite cancellation was lost between statements")
+                .unwrap(),
+            "the second SQLite statement was not interrupted"
+        );
     }
 
     #[test]
@@ -9118,7 +10418,8 @@ mod tests {
         let connection = db.connect().unwrap();
         connection
             .execute_batch(
-                "INSERT INTO threads(id,title,started_at,last_event_at)
+                "PRAGMA ignore_check_constraints=ON;
+                 INSERT INTO threads(id,title,started_at,last_event_at)
                  VALUES('bounded-extremes','Bounded extremes',
                         '2026-07-15T10:00:00.000000000Z',
                         '2026-07-17T12:00:00.000000000Z');
@@ -9139,7 +10440,8 @@ mod tests {
                     'overflowing-duration','bounded-extremes','bounded-extremes',
                     '2026-07-16T09:00:00.000000000Z',1,'tool_call',
                     9223372036854775807,1
-                 );",
+                 );
+                 PRAGMA ignore_check_constraints=OFF;",
             )
             .unwrap();
 
@@ -9308,13 +10610,763 @@ mod tests {
             "expanded detail must not issue SQL per descendant"
         );
         // The canonical child projection uses one bounded COUNT plus one
-        // indexed page seek. That adds a single statement while removing the
-        // repeated full-turn materialization from every page.
+        // indexed page seek. Descendant attribution, group metadata, labels,
+        // and interval-union duration add four set-based/streamed statements;
+        // none varies with descendant count. The equality above is the guard
+        // against the old per-descendant query path.
         assert!(
-            many_descendant_count <= 19,
+            many_descendant_count <= 21,
             "expanded Activity used {many_descendant_count} SELECTs"
         );
         connection.trace(None);
+    }
+
+    #[test]
+    fn legacy_activity_page_decodes_only_selected_message_bodies() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('bounded-legacy','Bounded legacy',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:10:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('bounded-legacy','bounded-legacy',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:10:00.000000000Z',0);
+                 INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 ) VALUES(
+                    'bounded-legacy-first','bounded-legacy','bounded-legacy',
+                    '2026-07-01T00:00:00.000000000Z','user','First request',1
+                 );",
+            )
+            .unwrap();
+        for index in 0..200_i64 {
+            connection
+                .execute(
+                    "INSERT INTO messages(
+                        id,thread_id,rollout_id,timestamp,role,content,source_line
+                     ) VALUES(?1,'bounded-legacy','bounded-legacy',?2,'user',?3,?4)",
+                    params![
+                        format!("bounded-legacy-unselected-{index:03}"),
+                        format!("2026-07-01T00:05:{:02}.{:03}Z", index / 10, index % 10),
+                        rusqlite::types::Value::Blob(vec![0x80]),
+                        index + 2,
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 ) VALUES(
+                    'bounded-legacy-latest','bounded-legacy','bounded-legacy',
+                    '2026-07-01T00:10:00.000000000Z','assistant','Latest answer',?1
+                 )",
+                [202_i64],
+            )
+            .unwrap();
+
+        let detail = query_activity_detail_page_on(
+            &connection,
+            "bounded-legacy",
+            "legacy:bounded-legacy",
+            1,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(detail.child_total, Some(202));
+        assert_eq!(detail.children.len(), 1);
+        assert_eq!(
+            detail.children[0].id,
+            "legacy-message:bounded-legacy-latest"
+        );
+        assert_eq!(detail.children[0].body.as_deref(), Some("Latest answer"));
+    }
+
+    #[test]
+    fn legacy_message_previews_are_bounded_and_preserve_wrapped_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('large-legacy','Large legacy',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('large-legacy','large-legacy',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z',0);",
+            )
+            .unwrap();
+        let wrapped_user = format!(
+            "# Applications mentioned by the user:\n{}\n\n## My request for Codex:\nKeep the tail request visible",
+            "context ".repeat(super::ACTIVITY_MESSAGE_PARSE_BYTES as usize)
+        );
+        let assistant = "🙂".repeat(super::ACTIVITY_MESSAGE_PARSE_BYTES as usize * 2);
+        connection
+            .execute(
+                "INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 ) VALUES('large-legacy-user','large-legacy','large-legacy',
+                          '2026-07-01T00:00:00.000000000Z','user',?1,1)",
+                [&wrapped_user],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 ) VALUES('large-legacy-assistant','large-legacy','large-legacy',
+                          '2026-07-01T00:01:00.000000000Z','assistant',?1,2)",
+                [&assistant],
+            )
+            .unwrap();
+
+        let items = super::query_legacy_message_child_rows(
+            &connection,
+            "large-legacy",
+            &[
+                "large-legacy-user".to_owned(),
+                "large-legacy-assistant".to_owned(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            items["large-legacy-user"].body.as_deref(),
+            Some("Keep the tail request visible")
+        );
+        let assistant_preview = items["large-legacy-assistant"].body.as_deref().unwrap();
+        assert_eq!(
+            assistant_preview.chars().count(),
+            super::ACTIVITY_PREVIEW_CHARS as usize + 1
+        );
+        assert!(assistant_preview.ends_with('…'));
+        assert!(
+            assistant_preview.len()
+                <= super::ACTIVITY_PREVIEW_CHARS as usize * char::MAX.len_utf8() + '…'.len_utf8()
+        );
+    }
+
+    #[test]
+    fn legacy_activity_root_previews_read_only_bounded_message_edges() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('large-legacy-root','Large legacy root',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:02:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('large-legacy-root','large-legacy-root',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:02:00.000000000Z',0);",
+            )
+            .unwrap();
+
+        let body_bytes = super::ACTIVITY_MESSAGE_PARSE_BYTES as usize * 4;
+        let mut context_only = vec![b'x'; body_bytes];
+        let context_prefix = b"# Applications mentioned by the user:\n";
+        context_only[..context_prefix.len()].copy_from_slice(context_prefix);
+        context_only[body_bytes / 2] = 0x80;
+
+        let mut wrapped_request = vec![b'y'; body_bytes];
+        wrapped_request[..context_prefix.len()].copy_from_slice(context_prefix);
+        wrapped_request[body_bytes / 2] = 0x80;
+        let request_suffix = b"\n\n## My request for Codex:\nKeep the bounded root request";
+        wrapped_request[body_bytes - request_suffix.len()..].copy_from_slice(request_suffix);
+
+        let mut assistant = vec![b'z'; body_bytes];
+        let assistant_prefix = b"Latest data:image/png;base64,ZmFrZQ== answer ";
+        assistant[..assistant_prefix.len()].copy_from_slice(assistant_prefix);
+        assistant[body_bytes / 2] = 0x80;
+
+        connection
+            .execute(
+                "INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 ) VALUES('large-legacy-context','large-legacy-root','large-legacy-root',
+                          '2026-07-01T00:00:00.000000000Z','user',?1,1)",
+                [context_only],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 ) VALUES('large-legacy-request','large-legacy-root','large-legacy-root',
+                          '2026-07-01T00:01:00.000000000Z','user',?1,2)",
+                [wrapped_request],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 ) VALUES('large-legacy-answer','large-legacy-root','large-legacy-root',
+                          '2026-07-01T00:02:00.000000000Z','assistant',?1,3)",
+                [assistant],
+            )
+            .unwrap();
+
+        let item = super::query_legacy_activity_item(
+            &connection,
+            "large-legacy-root",
+            "large-legacy-root",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(item.label.as_deref(), Some("Keep the bounded root request"));
+        let answer = item.body.as_deref().unwrap();
+        assert!(answer.starts_with("Latest [embedded attachment] answer"));
+        assert!(!answer.contains("data:image"));
+        assert_eq!(
+            answer.chars().count(),
+            super::ACTIVITY_PREVIEW_CHARS as usize + 1
+        );
+        assert!(answer.ends_with('…'));
+    }
+
+    #[test]
+    fn modern_activity_root_previews_read_bounded_edges() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        seed_activity_roots(&connection, "large-modern", 1);
+        let wrapped_user = format!(
+            "# Applications mentioned by the user:\n{}\n\n## My request for Codex:\nKeep the bounded modern tail",
+            "context ".repeat(super::ACTIVITY_MESSAGE_PARSE_BYTES as usize)
+        );
+        connection
+            .execute(
+                "UPDATE events SET body=?1 WHERE thread_id='large-modern' AND id='user-0'",
+                [&wrapped_user],
+            )
+            .unwrap();
+
+        let response = query_activity_on(&connection, "large-modern", 1, 1).unwrap();
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(
+            response.items[0].label.as_deref(),
+            Some("Keep the bounded modern tail")
+        );
+    }
+
+    #[test]
+    fn synthetic_group_page_decodes_only_selected_turn_bodies() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('bounded-group','Bounded group',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:10:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('bounded-group','bounded-group',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:10:00.000000000Z',0);
+                 INSERT INTO turns(id,thread_id,rollout_id,started_at,status)
+                 VALUES('bounded-group-root','bounded-group','bounded-group',
+                        '2026-07-01T00:00:00.000000000Z','completed');
+                 INSERT INTO rollouts(
+                    id,thread_id,parent_rollout_id,parent_thread_id,started_at,last_event_at,archived
+                 ) VALUES('bounded-group-agent','bounded-group','bounded-group','bounded-group',
+                          '2026-07-01T00:01:00.000000000Z',
+                          '2026-07-01T00:10:00.000000000Z',0);
+                 INSERT INTO agent_runs(
+                    id,thread_id,rollout_id,parent_rollout_id,nickname,started_at,status
+                 ) VALUES('bounded-group-agent','bounded-group','bounded-group-agent',
+                          'bounded-group','Bounded agent',
+                          '2026-07-01T00:01:00.000000000Z','completed');",
+            )
+            .unwrap();
+        for index in 0..200_i64 {
+            connection
+                .execute(
+                    "INSERT INTO turns(
+                        id,thread_id,rollout_id,agent_run_id,started_at,status,last_agent_message
+                     ) VALUES(?1,'bounded-group','bounded-group-agent','bounded-group-agent',
+                              ?2,'completed',?3)",
+                    params![
+                        format!("bounded-group-unselected-{index:03}"),
+                        format!("2026-07-01T00:05:{:02}.{:03}Z", index / 10, index % 10),
+                        rusqlite::types::Value::Blob(vec![0x80]),
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO turns(
+                    id,thread_id,rollout_id,agent_run_id,started_at,status,last_agent_message
+                 ) VALUES('bounded-group-latest','bounded-group','bounded-group-agent',
+                          'bounded-group-agent','2026-07-01T00:10:00.000000000Z',
+                          'completed','Latest child')",
+                [],
+            )
+            .unwrap();
+
+        let detail = query_activity_detail_page_on(
+            &connection,
+            "bounded-group",
+            "group:agents:bounded-group-root",
+            1,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(detail.child_total, Some(201));
+        assert_eq!(detail.children.len(), 1);
+        assert_eq!(detail.children[0].id, "bounded-group-latest");
+        assert_eq!(detail.children[0].body.as_deref(), Some("Latest child"));
+
+        let root =
+            query_activity_detail_page_on(&connection, "bounded-group", "bounded-group-root", 1, 1)
+                .unwrap()
+                .unwrap();
+        let group = root
+            .children
+            .iter()
+            .find(|child| child.kind == "agent_group")
+            .expect("root detail must retain the lazy agent-group placeholder");
+        assert!(group.children.is_empty());
+        assert_eq!(group.child_total, Some(201));
+    }
+
+    #[test]
+    fn legacy_activity_cursor_is_stable_across_inserts_and_seeks_deep() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('legacy-cursor','Legacy cursor',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('legacy-cursor','legacy-cursor',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z',0);
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL SELECT value+1 FROM sequence WHERE value<2047
+                 )
+                 INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 )
+                 SELECT printf('legacy-cursor-message-%04d',value),
+                        'legacy-cursor','legacy-cursor',
+                        printf('2026-07-01T00:00:00.%09dZ',value),
+                        'assistant',printf('Message %d',value),value+1
+                 FROM sequence;",
+            )
+            .unwrap();
+
+        let item_id = "legacy:legacy-cursor";
+        let first = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "legacy-cursor",
+            item_id,
+            1,
+            2,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first
+                .children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "legacy-message:legacy-cursor-message-2047",
+                "legacy-message:legacy-cursor-message-2046"
+            ]
+        );
+        let first_cursor = first.child_next_cursor.unwrap();
+        let numeric_second =
+            query_activity_detail_page_on(&connection, "legacy-cursor", item_id, 2, 2)
+                .unwrap()
+                .unwrap();
+        let cursor_second = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "legacy-cursor",
+            item_id,
+            2,
+            2,
+            Some(&first_cursor),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cursor_second
+                .children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>(),
+            numeric_second
+                .children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        connection
+            .execute(
+                "INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 ) VALUES('legacy-cursor-newer','legacy-cursor','legacy-cursor',
+                          '2026-07-01T00:00:00.999999999Z','assistant','Newer',3000)",
+                [],
+            )
+            .unwrap();
+        let after_insert = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "legacy-cursor",
+            item_id,
+            2,
+            2,
+            Some(&first_cursor),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            after_insert
+                .children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "legacy-message:legacy-cursor-message-2045",
+                "legacy-message:legacy-cursor-message-2044"
+            ],
+            "a newer insertion must not repeat or displace older cursor results"
+        );
+
+        let deep_cursor = super::encode_activity_collection_cursor(
+            "legacy-cursor",
+            item_id,
+            "2026-07-01T00:00:00.000000010Z",
+            Some(11),
+            "legacy-message:legacy-cursor-message-0010",
+        )
+        .unwrap();
+        let deep = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "legacy-cursor",
+            item_id,
+            2040,
+            1,
+            Some(&deep_cursor),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            deep.children[0].id,
+            "legacy-message:legacy-cursor-message-0009"
+        );
+    }
+
+    #[test]
+    fn legacy_activity_orders_equal_timestamps_by_source_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('legacy-source-order','Legacy source order',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:00:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('legacy-source-order','legacy-source-order',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:00:00.000000000Z',0);
+                 INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 ) VALUES
+                    ('legacy-source-z','legacy-source-order','legacy-source-order',
+                     '2026-07-01T00:00:00.000000000Z','assistant','Earlier line',1),
+                    ('legacy-source-a','legacy-source-order','legacy-source-order',
+                     '2026-07-01T00:00:00.000000000Z','assistant','Later line',2);",
+            )
+            .unwrap();
+
+        let item_id = "legacy:legacy-source-order";
+        let first = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "legacy-source-order",
+            item_id,
+            1,
+            1,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.children[0].id, "legacy-message:legacy-source-a");
+        let cursor = first.child_next_cursor.unwrap();
+        let decoded =
+            super::decode_activity_collection_cursor_for(&cursor, "legacy-source-order", item_id)
+                .unwrap();
+        assert_eq!(decoded.source_line, Some(2));
+        let second = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "legacy-source-order",
+            item_id,
+            2,
+            1,
+            Some(&cursor),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.children[0].id, "legacy-message:legacy-source-z");
+
+        let old_cursor = serde_json::json!({
+            "version": 1,
+            "threadId": "legacy-source-order",
+            "itemId": item_id,
+            "timestamp": "2026-07-01T00:00:00.000000000Z",
+            "sortId": "legacy-message:legacy-source-z"
+        })
+        .to_string();
+        let from_old_cursor = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "legacy-source-order",
+            item_id,
+            2,
+            1,
+            Some(&old_cursor),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            from_old_cursor.children[0].id,
+            "legacy-message:legacy-source-a"
+        );
+    }
+
+    #[test]
+    fn synthetic_group_cursor_is_stable_across_inserts_and_seeks_deep() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('group-cursor','Group cursor',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('group-cursor','group-cursor',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:01:00.000000000Z',0);
+                 INSERT INTO turns(id,thread_id,rollout_id,started_at,status)
+                 VALUES('group-cursor-root','group-cursor','group-cursor',
+                        '2026-07-01T00:00:00.000000000Z','completed');
+                 INSERT INTO rollouts(
+                    id,thread_id,parent_rollout_id,parent_thread_id,started_at,last_event_at,archived
+                 ) VALUES('group-cursor-agent','group-cursor','group-cursor','group-cursor',
+                          '2026-07-01T00:00:00.000000000Z',
+                          '2026-07-01T00:01:00.000000000Z',0);
+                 INSERT INTO agent_runs(
+                    id,thread_id,rollout_id,parent_rollout_id,nickname,started_at,status
+                 ) VALUES('group-cursor-agent','group-cursor','group-cursor-agent',
+                          'group-cursor','Cursor agent',
+                          '2026-07-01T00:00:00.000000000Z','completed');
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL SELECT value+1 FROM sequence WHERE value<2047
+                 )
+                 INSERT INTO turns(
+                    id,thread_id,rollout_id,agent_run_id,started_at,status,last_agent_message
+                 )
+                 SELECT printf('group-cursor-turn-%04d',value),
+                        'group-cursor','group-cursor-agent','group-cursor-agent',
+                        printf('2026-07-01T00:00:00.%09dZ',value),
+                        'completed',printf('Child %d',value)
+                 FROM sequence;",
+            )
+            .unwrap();
+
+        let item_id = "group:agents:group-cursor-root";
+        let first = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "group-cursor",
+            item_id,
+            1,
+            2,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first
+                .children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>(),
+            ["group-cursor-turn-2047", "group-cursor-turn-2046"]
+        );
+        let first_cursor = first.child_next_cursor.unwrap();
+        let numeric_second =
+            query_activity_detail_page_on(&connection, "group-cursor", item_id, 2, 2)
+                .unwrap()
+                .unwrap();
+        let cursor_second = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "group-cursor",
+            item_id,
+            2,
+            2,
+            Some(&first_cursor),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cursor_second
+                .children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>(),
+            numeric_second
+                .children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        connection
+            .execute(
+                "INSERT INTO turns(
+                    id,thread_id,rollout_id,agent_run_id,started_at,status,last_agent_message
+                 ) VALUES('group-cursor-newer','group-cursor','group-cursor-agent',
+                          'group-cursor-agent','2026-07-01T00:00:00.999999999Z',
+                          'completed','Newer')",
+                [],
+            )
+            .unwrap();
+        let after_insert = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "group-cursor",
+            item_id,
+            2,
+            2,
+            Some(&first_cursor),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            after_insert
+                .children
+                .iter()
+                .map(|child| child.id.as_str())
+                .collect::<Vec<_>>(),
+            ["group-cursor-turn-2045", "group-cursor-turn-2044"],
+            "a newer group turn must not repeat or displace older cursor results"
+        );
+
+        let deep_cursor = super::encode_activity_collection_cursor(
+            "group-cursor",
+            item_id,
+            "2026-07-01T00:00:00.000000010Z",
+            None,
+            "group-cursor-turn-0010",
+        )
+        .unwrap();
+        let deep = super::query_activity_detail_cursor_page_on(
+            &connection,
+            "group-cursor",
+            item_id,
+            2040,
+            1,
+            Some(&deep_cursor),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(deep.children[0].id, "group-cursor-turn-0009");
+    }
+
+    #[test]
+    fn synthetic_group_totals_saturate_after_per_turn_sql_groups() {
+        const MAX_ROLLUP_TOKENS: u64 = 9_007_199_254_740_991;
+        const CHILDREN: u64 = 1_025;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('group-overflow','Group overflow',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T01:00:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('group-overflow','group-overflow',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T01:00:00.000000000Z',0);
+                 INSERT INTO turns(id,thread_id,rollout_id,started_at,status)
+                 VALUES('group-overflow-root','group-overflow','group-overflow',
+                        '2026-07-01T00:00:00.000000000Z','completed');
+                 INSERT INTO rollouts(
+                    id,thread_id,parent_rollout_id,parent_thread_id,started_at,last_event_at,archived
+                 ) VALUES('group-overflow-agent','group-overflow','group-overflow','group-overflow',
+                          '2026-07-01T00:01:00.000000000Z',
+                          '2026-07-01T01:00:00.000000000Z',0);
+                 INSERT INTO agent_runs(
+                    id,thread_id,rollout_id,parent_rollout_id,nickname,started_at,status
+                 ) VALUES('group-overflow-agent','group-overflow','group-overflow-agent',
+                          'group-overflow','Overflow agent',
+                          '2026-07-01T00:01:00.000000000Z','completed');
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL SELECT value+1 FROM sequence WHERE value<1024
+                 )
+                 INSERT INTO turns(
+                    id,thread_id,rollout_id,agent_run_id,started_at,status
+                 )
+                 SELECT printf('group-overflow-turn-%04d',value),
+                        'group-overflow','group-overflow-agent','group-overflow-agent',
+                        printf('2026-07-01T00:01:00.%09dZ',value),'completed'
+                 FROM sequence;
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL SELECT value+1 FROM sequence WHERE value<1024
+                 )
+                 INSERT INTO usage_activity_rollups(
+                    thread_id,rollout_id,turn_key,activity_hour,model,fact_count,
+                    input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens
+                 )
+                 SELECT 'group-overflow','group-overflow-agent',
+                        printf('group-overflow-turn-%04d',value),
+                        '2026-07-01T00:00:00.000000000Z','overflow-unpriced',1,
+                        9007199254740991,0,0,0,9007199254740991
+                 FROM sequence;",
+            )
+            .unwrap();
+
+        let detail = query_activity_detail_page_on(
+            &connection,
+            "group-overflow",
+            "group:agents:group-overflow-root",
+            1,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let totals = detail.usage.unwrap();
+        assert_eq!(totals.input_tokens, MAX_ROLLUP_TOKENS * CHILDREN);
+        assert_eq!(totals.total_tokens, MAX_ROLLUP_TOKENS * CHILDREN);
+        assert_eq!(totals.unpriced_tokens, MAX_ROLLUP_TOKENS * CHILDREN);
+        assert!(totals.cost_usd.is_none());
     }
 
     #[test]
@@ -9699,6 +11751,192 @@ mod tests {
         assert_eq!(model[0].cost_usd.unwrap().decimal_string(), "1.00");
         let agent_summary = super::query_agent_summary_on(&connection, "exact-activity").unwrap();
         assert_eq!(agent_summary[0].cost_usd.unwrap().decimal_string(), "1.00");
+    }
+
+    #[test]
+    #[ignore = "100k-descendant performance regression; run explicitly with --ignored --nocapture"]
+    fn activity_hundred_thousand_descendants_stay_sql_backed_and_page_bounded() {
+        const DESCENDANTS: u64 = 100_000;
+        const REVIEWS: u64 = DESCENDANTS / 10;
+        const AGENT_TURNS: u64 = DESCENDANTS - REVIEWS;
+        const NON_REVIEW_AGENTS: u64 = 90;
+        const REGRESSION_BUDGET: StdDuration = StdDuration::from_secs(3);
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES('descendant-scale','Descendant scale',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:10:00.000000000Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES('descendant-scale','descendant-scale',
+                        '2026-07-01T00:00:00.000000000Z',
+                        '2026-07-01T00:10:00.000000000Z',0);
+                 INSERT INTO turns(id,thread_id,rollout_id,started_at,status)
+                 VALUES('descendant-scale-root','descendant-scale','descendant-scale',
+                        '2026-07-01T00:00:00.000000000Z','completed');
+                 INSERT INTO events(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,
+                    kind,role,body,native
+                 ) VALUES(
+                    'descendant-scale-user','descendant-scale','descendant-scale',
+                    'descendant-scale-root','2026-07-01T00:00:00.000000000Z',1,
+                    'user','user','Scale request',1);
+                 INSERT INTO rollouts(
+                    id,thread_id,parent_rollout_id,parent_thread_id,
+                    started_at,last_event_at,archived
+                 ) VALUES(
+                    'descendant-scale-agent','descendant-scale','descendant-scale',
+                    'descendant-scale','2026-07-01T00:00:01.000000000Z',
+                    '2026-07-01T00:10:00.000000000Z',0);
+                 WITH RECURSIVE agents(value) AS (
+                    SELECT 0 UNION ALL SELECT value+1 FROM agents WHERE value+1<100
+                 )
+                 INSERT INTO agent_runs(
+                    id,thread_id,rollout_id,parent_rollout_id,nickname,started_at,status
+                 )
+                 SELECT printf('descendant-scale-agent-%03d',value),
+                        'descendant-scale','descendant-scale-agent','descendant-scale',
+                        printf('Scale agent %03d',value),
+                        '2026-07-01T00:00:01.000000000Z','completed'
+                 FROM agents;
+                 INSERT INTO events(
+                    id,thread_id,rollout_id,turn_id,timestamp,source_line,
+                    kind,payload_json,native
+                 ) VALUES(
+                    'descendant-scale-spawn','descendant-scale','descendant-scale',
+                    'descendant-scale-root','2026-07-01T00:00:01.000000000Z',2,
+                    'subagent','{\"agent_thread_id\":\"descendant-scale-agent-000\"}',1);
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL
+                    SELECT value+1 FROM sequence WHERE value+1<100000
+                 )
+                 INSERT INTO turns(
+                    id,thread_id,rollout_id,agent_run_id,started_at,status,
+                    model,duration_ms,last_agent_message
+                 )
+                 SELECT printf('descendant-scale-turn-%06d',value),
+                        'descendant-scale','descendant-scale-agent',
+                        printf('descendant-scale-agent-%03d',value%100),
+                        '2026-07-01T00:01:00.000000000Z',
+                        CASE WHEN value=1 THEN 'running'
+                             WHEN value=10 THEN 'failed' ELSE 'completed' END,
+                        CASE WHEN value%10=0 THEN 'codex-auto-review' ELSE 'gpt-5.5' END,
+                        1000,
+                        CASE WHEN value>=99992
+                             THEN printf('Descendant %d',value) ELSE x'80' END
+                 FROM sequence;
+                 WITH RECURSIVE sequence(value) AS (
+                    SELECT 0 UNION ALL
+                    SELECT value+1 FROM sequence WHERE value+1<100000
+                 )
+                 INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,turn_id,agent_run_id,timestamp,source_line,
+                    model,input_tokens,cached_input_tokens,output_tokens,
+                    reasoning_tokens,total_tokens,native
+                 )
+                 SELECT printf('descendant-scale-usage-%06d',value),
+                        'descendant-scale','descendant-scale-agent',
+                        printf('descendant-scale-turn-%06d',value),
+                        printf('descendant-scale-agent-%03d',value%100),
+                        '2026-07-01T00:01:01.000000000Z',
+                        value+3,
+                        CASE WHEN value%10=0 THEN 'codex-auto-review' ELSE 'gpt-5.5' END,
+                        2,1,3,1,5,1
+                 FROM sequence;",
+            )
+            .unwrap();
+
+        let started = Instant::now();
+        let list = query_activity_on(&connection, "descendant-scale", 1, 1).unwrap();
+        let list_elapsed = started.elapsed();
+        assert_eq!(list.items.len(), 1);
+        let item = &list.items[0];
+        assert_eq!(item.counts.as_ref().unwrap().agent_runs, NON_REVIEW_AGENTS);
+        assert_eq!(item.counts.as_ref().unwrap().reviews, REVIEWS);
+        assert_eq!(item.usage.as_ref().unwrap().total_tokens, DESCENDANTS * 5);
+
+        let started = Instant::now();
+        let detail = query_activity_detail_page_on(
+            &connection,
+            "descendant-scale",
+            "descendant-scale-root",
+            1,
+            1,
+        )
+        .unwrap()
+        .unwrap();
+        let detail_elapsed = started.elapsed();
+        assert!(
+            detail.children.len() <= 3,
+            "root detail materialized descendants"
+        );
+        assert!(serde_json::to_vec(&detail).unwrap().len() < 32 * 1024);
+        let agent_group = detail
+            .children
+            .iter()
+            .find(|child| child.kind == "agent_group")
+            .unwrap();
+        assert_eq!(agent_group.child_total, Some(AGENT_TURNS));
+        assert_eq!(agent_group.status.as_deref(), Some("running"));
+        assert_eq!(agent_group.duration_ms, Some(1000));
+        let labels = agent_group.body.as_deref().unwrap();
+        assert!(labels.contains("Scale agent 099"));
+        assert!(labels.ends_with("+82 more"), "{labels}");
+        assert_eq!(
+            agent_group.usage.as_ref().unwrap().total_tokens,
+            AGENT_TURNS * 5
+        );
+        let review_group = detail
+            .children
+            .iter()
+            .find(|child| child.kind == "review_group")
+            .unwrap();
+        assert_eq!(review_group.child_total, Some(REVIEWS));
+        assert_eq!(review_group.status.as_deref(), Some("attention"));
+        assert_eq!(review_group.duration_ms, Some(1000));
+        assert_eq!(
+            review_group.usage.as_ref().unwrap().total_tokens,
+            REVIEWS * 5
+        );
+
+        let started = Instant::now();
+        let first_group_page = query_activity_detail_page_on(
+            &connection,
+            "descendant-scale",
+            "group:agents:descendant-scale-root",
+            1,
+            7,
+        )
+        .unwrap()
+        .unwrap();
+        let group_elapsed = started.elapsed();
+        assert_eq!(first_group_page.child_total, Some(AGENT_TURNS));
+        assert_eq!(first_group_page.children.len(), 7);
+        assert_eq!(first_group_page.child_has_more, Some(true));
+        assert!(first_group_page.child_next_cursor.is_some());
+        assert_eq!(
+            first_group_page.children[0].body.as_deref(),
+            Some("Descendant 99999")
+        );
+
+        eprintln!(
+            "Activity 100k descendants: list={list_elapsed:?}, root detail={detail_elapsed:?}, \
+             group page={group_elapsed:?}; budget={REGRESSION_BUDGET:?}"
+        );
+        for (name, elapsed) in [
+            ("list", list_elapsed),
+            ("root detail", detail_elapsed),
+            ("group page", group_elapsed),
+        ] {
+            assert!(
+                elapsed <= REGRESSION_BUDGET,
+                "100k-descendant Activity {name} regressed: {elapsed:?}"
+            );
+        }
     }
 
     #[test]

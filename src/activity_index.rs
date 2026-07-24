@@ -41,6 +41,7 @@ pub(crate) fn validate_cursor_for(value: &str, thread_id: &str, turn_id: &str) -
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn query_all(
     connection: &Connection,
     thread_id: &str,
@@ -69,6 +70,7 @@ pub(crate) fn query_all(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 pub(crate) fn query_all_in_turn(
     connection: &Connection,
     thread_id: &str,

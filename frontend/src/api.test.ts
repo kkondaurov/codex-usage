@@ -278,11 +278,26 @@ describe('api client', () => {
   })
 
   it('loads non-paginated price metadata separately from the price ledger', async () => {
-    const response = { aliases: [], aliasesTotal: 0, observedUnknown: [], observedUnknownTotal: 0 }
+    const response = { observedUnknown: [], observedUnknownTotal: 0 }
     const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(response))
     vi.stubGlobal('fetch', fetchMock)
 
     await expect(api.priceMetadata()).resolves.toEqual(response)
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/prices/metadata', expect.any(Object))
+  })
+
+  it('loads a filtered alias page through its dedicated endpoint', async () => {
+    const response = {
+      items: [{ observedModelId: 'legacy model', canonicalModelId: 'gpt-5.5' }],
+      page: 2,
+      pageSize: 25,
+      total: 30,
+      totalPages: 2,
+    }
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(response))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.aliases({ q: 'legacy model', page: 2 })).resolves.toEqual(response)
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/aliases?q=legacy+model&page=2&pageSize=25', expect.any(Object))
   })
 })

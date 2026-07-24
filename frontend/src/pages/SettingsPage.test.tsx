@@ -1,9 +1,9 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter, useNavigate } from 'react-router-dom'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../api'
 import { useCachedAsync } from '../hooks'
-import type { PriceMetadataResponse, PricesResponse, SettingsResponse } from '../types'
+import type { AliasesResponse, PriceMetadataResponse, PricesResponse, SettingsResponse } from '../types'
 import { SettingsPage } from './SettingsPage'
 
 const prices: PricesResponse = {
@@ -18,7 +18,8 @@ const prices: PricesResponse = {
   refreshErrorKind: null,
   source: null,
 }
-const priceMetadata: PriceMetadataResponse = { aliases: [], aliasesTotal: 0, observedUnknown: [], observedUnknownTotal: 0 }
+const aliases: AliasesResponse = { items: [], page: 1, pageSize: 25, total: 0, totalPages: 0 }
+const priceMetadata: PriceMetadataResponse = { observedUnknown: [], observedUnknownTotal: 0 }
 
 const settings: SettingsResponse = {
   databasePath: '/tmp/codex-usage.db',
@@ -51,29 +52,130 @@ function SettingsHistoryHarness() {
   return <><button type="button" onClick={() => navigate(-1)}>BACK</button><SettingsPage /></>
 }
 
+function LocationProbe() {
+  const location = useLocation()
+  return <output aria-label="Current location">{location.pathname}{location.search}</output>
+}
+
 afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
 beforeEach(() => {
   vi.spyOn(api, 'pricedModelIds').mockResolvedValue([])
+  vi.spyOn(api, 'aliases').mockResolvedValue(aliases)
   vi.spyOn(api, 'priceMetadata').mockResolvedValue(priceMetadata)
   vi.spyOn(api, 'settings').mockResolvedValue(settings)
 })
 
 describe('SettingsPage price editor', () => {
-  it('states when the bounded alias ledger omits additional mappings', async () => {
-    vi.spyOn(api, 'prices').mockResolvedValue(prices)
-    vi.mocked(api.priceMetadata).mockResolvedValue({
-      aliases: [{ observedModelId: 'legacy-model', canonicalModelId: 'gpt-5.5' }],
-      aliasesTotal: 120,
-      observedUnknown: [],
-      observedUnknownTotal: 0,
+  it('loads model aliases from their dedicated paginated endpoint', async () => {
+    vi.spyOn(api, 'prices').mockResolvedValue({ ...prices, total: 50, totalPages: 2 })
+    vi.mocked(api.aliases).mockResolvedValue({
+      items: [{ observedModelId: 'legacy-model', canonicalModelId: 'gpt-5.5' }],
+      page: 1,
+      pageSize: 25,
+      total: 120,
+      totalPages: 5,
     })
     render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
 
-    expect(await screen.findByText('Showing the first 1 of 120 model aliases.')).toBeVisible()
-    expect(screen.getByText('legacy-model')).toBeVisible()
+    expect(await screen.findByText('legacy-model')).toBeVisible()
+    expect(api.aliases).toHaveBeenCalledWith({ q: undefined, page: 1 }, expect.any(AbortSignal))
+    expect(screen.getByRole('navigation', { name: 'Model price pagination' })).toBeVisible()
+    expect(screen.getByRole('navigation', { name: 'Model alias pagination' })).toBeVisible()
+    expect(within(screen.getByRole('region', { name: 'Scrollable model alias ledger' })).getByText(/1–25 \/ 120/)).toBeVisible()
+  })
+
+  it('searches aliases independently and preserves the price ledger URL state', async () => {
+    vi.spyOn(api, 'prices').mockImplementation(({ q, page = 1 }) => Promise.resolve({
+      ...prices,
+      page,
+      total: 100,
+      totalPages: 4,
+      items: q ? [] : prices.items,
+    }))
+    const loadAliases = vi.mocked(api.aliases).mockImplementation(({ q, page = 1 }) => Promise.resolve({
+      ...aliases,
+      page,
+      total: q ? 1 : 50,
+      totalPages: q ? 1 : 2,
+      items: q ? [{ observedModelId: `${q}-observed`, canonicalModelId: 'gpt-5.5' }] : [],
+    }))
+    render(
+      <MemoryRouter initialEntries={['/settings?tab=price-data&q=gpt&page=3&aliasPage=2']}>
+        <SettingsPage />
+        <LocationProbe />
+      </MemoryRouter>,
+    )
+
+    const search = await screen.findByRole('textbox', { name: 'Search model aliases' })
+    fireEvent.change(search, { target: { value: '  legacy  ' } })
+
+    await waitFor(() => expect(loadAliases).toHaveBeenLastCalledWith({ q: 'legacy', page: 1 }, expect.any(AbortSignal)))
+    expect(await screen.findByText('legacy-observed')).toBeVisible()
+    const location = screen.getByLabelText('Current location')
+    expect(location).toHaveTextContent('q=gpt')
+    expect(location).toHaveTextContent('page=3')
+    expect(location).toHaveTextContent('aliasQ=legacy')
+    expect(location).not.toHaveTextContent('aliasPage=')
+  })
+
+  it('pages aliases through aliasPage without changing the price ledger page', async () => {
+    vi.spyOn(api, 'prices').mockImplementation(({ page = 1 }) => Promise.resolve({
+      ...prices,
+      page,
+      total: 100,
+      totalPages: 4,
+    }))
+    const loadAliases = vi.mocked(api.aliases).mockImplementation(({ page = 1 }) => Promise.resolve({
+      ...aliases,
+      page,
+      total: 50,
+      totalPages: 2,
+      items: [{ observedModelId: `alias-page-${page}`, canonicalModelId: 'gpt-5.5' }],
+    }))
+    render(
+      <MemoryRouter initialEntries={['/settings?tab=price-data&page=3']}>
+        <SettingsPage />
+        <LocationProbe />
+      </MemoryRouter>,
+    )
+
+    const aliasRegion = await screen.findByRole('region', { name: 'Scrollable model alias ledger' })
+    fireEvent.click(within(aliasRegion).getByRole('button', { name: '02' }))
+    await waitFor(() => expect(loadAliases).toHaveBeenLastCalledWith({ q: undefined, page: 2 }, expect.any(AbortSignal)))
+    expect(await within(aliasRegion).findByText('alias-page-2')).toBeVisible()
+    expect(screen.getByLabelText('Current location')).toHaveTextContent('page=3')
+    expect(screen.getByLabelText('Current location')).toHaveTextContent('aliasPage=2')
+
+    fireEvent.click(within(aliasRegion).getByRole('button', { name: '01' }))
+    await waitFor(() => expect(loadAliases).toHaveBeenLastCalledWith({ q: undefined, page: 1 }, expect.any(AbortSignal)))
+    expect(screen.getByLabelText('Current location')).toHaveTextContent('page=3')
+    expect(screen.getByLabelText('Current location')).not.toHaveTextContent('aliasPage=')
+  })
+
+  it('canonicalizes trimmed alias search and an out-of-range alias page', async () => {
+    vi.spyOn(api, 'prices').mockResolvedValue(prices)
+    const loadAliases = vi.mocked(api.aliases).mockImplementation(({ page = 1 }) => Promise.resolve({
+      ...aliases,
+      page,
+      total: 50,
+      totalPages: 2,
+      items: [{ observedModelId: `alias-page-${page}`, canonicalModelId: 'gpt-5.5' }],
+    }))
+    render(
+      <MemoryRouter initialEntries={['/settings?tab=price-data&aliasQ=%20legacy%20&aliasPage=999']}>
+        <SettingsPage />
+        <LocationProbe />
+      </MemoryRouter>,
+    )
+
+    await waitFor(() => expect(loadAliases).toHaveBeenLastCalledWith({ q: 'legacy', page: 2 }, expect.any(AbortSignal)))
+    const location = screen.getByLabelText('Current location')
+    expect(location).toHaveTextContent('aliasQ=legacy')
+    expect(location).toHaveTextContent('aliasPage=2')
+    expect(location).not.toHaveTextContent('%20legacy%20')
   })
 
   it('surfaces the local database footprint and explains that retained history can grow', async () => {
@@ -124,6 +226,10 @@ describe('SettingsPage price editor', () => {
     render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
 
     expect(await screen.findByText('gpt-test')).toBeInTheDocument()
+    const priceTable = screen.getByRole('table', { name: 'Model prices' })
+    expect(priceTable).toHaveAttribute('aria-rowcount', '2')
+    expect(within(priceTable).getAllByRole('row')[0]).toHaveAttribute('aria-rowindex', '1')
+    expect(within(priceTable).getAllByRole('row')[1]).toHaveAttribute('aria-rowindex', '2')
     expect(screen.queryByRole('columnheader', { name: 'EFFECTIVE' })).not.toBeInTheDocument()
     expect(screen.getByRole('columnheader', { name: 'SOURCE' })).toBeInTheDocument()
     expect(screen.queryByText('1970-01-01')).not.toBeInTheDocument()
@@ -267,7 +373,10 @@ describe('SettingsPage price editor', () => {
     expect(nextPage).toHaveFocus()
     expect(nextPage).not.toBeDisabled()
     expect(nextPage).toHaveAttribute('aria-disabled', 'true')
-    expect(screen.getByRole('navigation', { name: 'Pagination' })).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByRole('navigation', { name: 'Model price pagination' })).toHaveAttribute(
+      'aria-busy',
+      'true',
+    )
     expect(screen.queryByText('gpt-page-one')).not.toBeInTheDocument()
     expect(screen.getByRole('table', { name: 'Model prices' })).toBeVisible()
 
@@ -305,7 +414,10 @@ describe('SettingsPage price editor', () => {
     expect(nextPage).toHaveFocus()
     expect(nextPage).not.toBeDisabled()
     expect(nextPage).toHaveAttribute('aria-disabled', 'true')
-    expect(screen.getByRole('navigation', { name: 'Pagination' })).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByRole('navigation', { name: 'Model price pagination' })).toHaveAttribute(
+      'aria-busy',
+      'true',
+    )
     expect(screen.queryByText('gpt-page-one')).not.toBeInTheDocument()
 
     fireEvent.click(nextPage)
@@ -498,6 +610,7 @@ describe('SettingsPage price editor', () => {
   it('keeps a pending alias save modal until the mutation completes', async () => {
     const save = deferred<void>()
     vi.spyOn(api, 'prices').mockResolvedValue(prices)
+    const loadAliases = vi.mocked(api.aliases)
     vi.spyOn(api, 'saveAlias').mockReturnValue(save.promise)
 
     render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
@@ -516,6 +629,29 @@ describe('SettingsPage price editor', () => {
 
     save.resolve()
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Map observed model ID' })).not.toBeInTheDocument())
+    expect(loadAliases).toHaveBeenCalledTimes(2)
+  })
+
+  it('refreshes the alias ledger after deleting a mapping', async () => {
+    vi.spyOn(api, 'prices').mockResolvedValue(prices)
+    const loadAliases = vi.mocked(api.aliases)
+      .mockResolvedValueOnce({
+        ...aliases,
+        items: [{ observedModelId: 'legacy-model', canonicalModelId: 'gpt-5.5' }],
+        total: 1,
+        totalPages: 1,
+      })
+      .mockResolvedValueOnce(aliases)
+    const remove = vi.spyOn(api, 'deleteAlias').mockResolvedValue(undefined)
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+
+    render(<MemoryRouter initialEntries={['/settings']}><SettingsPage /></MemoryRouter>)
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete alias legacy-model' }))
+
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('legacy-model'))
+    await waitFor(() => expect(loadAliases).toHaveBeenCalledTimes(2))
+    expect(screen.queryByText('legacy-model')).not.toBeInTheDocument()
+    expect(screen.getByText('No model aliases configured.')).toBeVisible()
   })
 
   it('contains price-editor focus and restores it to the opening control', async () => {
@@ -571,8 +707,6 @@ describe('SettingsPage price editor', () => {
   it('starts a locked unknown-model mapping at the canonical model field', async () => {
     vi.spyOn(api, 'prices').mockResolvedValue(prices)
     vi.mocked(api.priceMetadata).mockResolvedValue({
-      aliases: [],
-      aliasesTotal: 0,
       observedUnknown: [{ modelId: 'unpriced-model', usageCount: 1, totalTokens: 42, lastSeenAt: '2026-07-18T12:00:00Z' }],
       observedUnknownTotal: 1,
     })

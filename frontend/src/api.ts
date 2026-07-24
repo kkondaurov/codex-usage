@@ -1,5 +1,6 @@
 import type {
   ActivityResponse,
+  AliasesResponse,
   OverviewResponse,
   OverviewYearResponse,
   PricesResponse,
@@ -16,6 +17,7 @@ import type {
 import {
   activityItemResponse,
   activityResponse,
+  aliasesResponse,
   overviewResponse,
   overviewYearResponse,
   pricesResponse,
@@ -94,6 +96,7 @@ export const api = {
     requestJson<ActivityResponse['items'][number]>(`${base}/sessions/${encodeURIComponent(id)}/activity/${encodeURIComponent(eventId)}?${params({ childPage, childPageSize, childCursor })}`, { signal }, activityItemResponse),
   stats: (range: StatsRange, anchor?: string, signal?: AbortSignal) => requestJson<StatsResponse>(`${base}/stats?${params({ range, anchor })}`, { signal }, statsResponse),
   prices: (options: { q?: string; page?: number; pageSize?: number }, signal?: AbortSignal) => requestJson<PricesResponse>(`${base}/prices?${params({ ...options, pageSize: options.pageSize ?? 25 })}`, { signal }, pricesResponse),
+  aliases: (options: { q?: string; page?: number; pageSize?: number }, signal?: AbortSignal) => requestJson<AliasesResponse>(queryPath(`${base}/aliases`, { ...options, pageSize: options.pageSize ?? 25 }), { signal }, aliasesResponse),
   priceMetadata: (signal?: AbortSignal, unknownLimit?: number) => requestJson<PriceMetadataResponse>(queryPath(`${base}/prices/metadata`, { unknownLimit }), { signal }, priceMetadataResponse),
   pricedModelIds: async (options: { q?: string; limit?: number } = {}, signal?: AbortSignal) => (
     await requestJson<PriceModelIdsResponse>(queryPath(`${base}/prices/model-ids`, options), { signal }, priceModelIdsResponse)

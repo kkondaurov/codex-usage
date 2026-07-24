@@ -24,6 +24,7 @@ blob-report/
 *.shm
 *.journal
 *.ingest.lock
+*.ingest-scanner.lock
 *.pricing-refresh.lock
 
 # Local Codex session roots. Keep these root-anchored so test fixtures remain tracked.

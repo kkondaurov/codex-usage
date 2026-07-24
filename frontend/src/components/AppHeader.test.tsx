@@ -50,6 +50,36 @@ describe('AppHeader ingestion status', () => {
     })
 
     expect(screen.getByText('Updated 5m ago')).toBeInTheDocument()
+    expect(document.querySelector('.header-status')).not.toHaveAttribute('aria-live')
+    expect(document.querySelector('.header-status .sr-only')).toHaveAttribute('aria-live', 'polite')
+    expect(document.querySelector('.header-status .sr-only')).toHaveTextContent('Usage data is up to date')
+  })
+
+  it('keeps age ticks visual without changing the live status message', async () => {
+    const status: StatusResponse = {
+      state: 'idle',
+      lastIngestAt: '2026-07-19T07:59:01Z',
+      lastIngestAttemptAt: '2026-07-19T07:59:01Z',
+      lastEventAt: '2026-07-19T07:59:01Z',
+      filesScanned: 3_425,
+      filesFailed: 0,
+    }
+    vi.spyOn(api, 'status').mockResolvedValue(status)
+    render(<MemoryRouter><AppHeader /></MemoryRouter>)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+
+    const liveStatus = document.querySelector('.header-status .sr-only')
+    expect(screen.getByText('Updated 59s ago')).toBeInTheDocument()
+    expect(liveStatus).toHaveTextContent('Usage data is up to date')
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByText('Updated 1m ago')).toBeInTheDocument()
+    expect(liveStatus).toHaveTextContent('Usage data is up to date')
   })
 
   it('makes a failed ingest visible instead of presenting the last success as current', async () => {

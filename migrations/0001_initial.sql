@@ -84,7 +84,11 @@ CREATE TABLE turns (
     model TEXT,
     effort TEXT,
     last_agent_message TEXT,
-    duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+    duration_ms INTEGER CHECK(
+        duration_ms IS NULL OR (
+            typeof(duration_ms) = 'integer' AND duration_ms BETWEEN 0 AND 2592000000
+        )
+    ),
     time_to_first_token_ms INTEGER CHECK(time_to_first_token_ms IS NULL OR time_to_first_token_ms >= 0)
 );
 
@@ -114,7 +118,11 @@ CREATE TABLE events (
     status TEXT,
     tool_name TEXT,
     call_id TEXT,
-    duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+    duration_ms INTEGER CHECK(
+        duration_ms IS NULL OR (
+            typeof(duration_ms) = 'integer' AND duration_ms BETWEEN 0 AND 2592000000
+        )
+    ),
     model TEXT,
     effort TEXT,
     payload_json TEXT,
@@ -234,7 +242,11 @@ CREATE TABLE tool_calls (
     namespace TEXT,
     name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'running',
-    duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
+    duration_ms INTEGER CHECK(
+        duration_ms IS NULL OR (
+            typeof(duration_ms) = 'integer' AND duration_ms BETWEEN 0 AND 2592000000
+        )
+    ),
     UNIQUE(rollout_id, call_id)
 );
 
@@ -528,12 +540,23 @@ INSERT INTO model_aliases(
 
 CREATE INDEX idx_source_files_path ON source_files(path);
 CREATE INDEX idx_rollouts_thread ON rollouts(thread_id);
+CREATE INDEX idx_agent_runs_rollout ON agent_runs(rollout_id);
+CREATE INDEX idx_agent_runs_parent_rollout
+    ON agent_runs(parent_rollout_id) WHERE rollout_id IS NULL;
+CREATE INDEX idx_turns_rollout ON turns(rollout_id);
 CREATE INDEX idx_turns_thread_time ON turns(thread_id, started_at);
+CREATE INDEX idx_messages_rollout ON messages(rollout_id);
+CREATE INDEX idx_messages_turn ON messages(turn_id);
 CREATE INDEX idx_messages_thread_time ON messages(thread_id, timestamp);
 CREATE INDEX idx_messages_time_thread ON messages(timestamp, thread_id);
+CREATE INDEX idx_events_rollout_kind ON events(rollout_id, kind);
+CREATE INDEX idx_events_subagent_agent_time
+    ON events(json_extract(payload_json, '$.agent_thread_id'), timestamp)
+    WHERE kind = 'subagent';
 CREATE INDEX idx_events_thread_time ON events(thread_id, timestamp, source_line);
 CREATE INDEX idx_events_time_thread ON events(timestamp, thread_id);
 CREATE INDEX idx_events_turn ON events(turn_id, timestamp, source_line);
+CREATE INDEX idx_events_agent_run ON events(agent_run_id);
 CREATE INDEX idx_activity_event_index_thread_time
     ON activity_event_index(thread_id, timestamp DESC, source_line DESC, event_id DESC);
 CREATE INDEX idx_activity_event_index_turn_time
@@ -541,6 +564,8 @@ CREATE INDEX idx_activity_event_index_turn_time
         thread_id, turn_key, timestamp DESC, source_line DESC, event_id DESC
     );
 CREATE INDEX idx_tools_thread_time ON tool_calls(thread_id, started_at);
+CREATE INDEX idx_tools_turn ON tool_calls(turn_id);
+CREATE INDEX idx_usage_rollout ON usage_facts(rollout_id);
 CREATE INDEX idx_usage_thread_time ON usage_facts(thread_id, timestamp);
 CREATE INDEX idx_usage_time ON usage_facts(timestamp);
 CREATE INDEX idx_usage_model_time ON usage_facts(model, timestamp);

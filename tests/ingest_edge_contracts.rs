@@ -145,6 +145,14 @@ fn task(timestamp: &str, turn: &str) -> Value {
     })
 }
 
+fn task_complete(timestamp: &str, turn: &str) -> Value {
+    json!({
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {"type": "task_complete", "turn_id": turn}
+    })
+}
+
 fn context(timestamp: &str, turn: &str, model: &str) -> Value {
     json!({
         "timestamp": timestamp,
@@ -196,6 +204,24 @@ fn assistant_message(timestamp: &str, text: &str) -> Value {
             "content": [{"type": "output_text", "text": text}]
         }
     })
+}
+
+fn assistant_message_with_id(timestamp: &str, id: &str, text: &str) -> Value {
+    json!({
+        "timestamp": timestamp,
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "id": id,
+            "role": "assistant",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": text}]
+        }
+    })
+}
+
+fn projected_message_id(rollout_id: &str, source_id: &str) -> String {
+    format!("message:{}", json!([rollout_id, source_id]))
 }
 
 fn tool_call(timestamp: &str, call_id: &str, command: &str) -> Value {
@@ -441,6 +467,239 @@ fn projection_is_deterministic_when_source_names_reverse_discovery_order() {
     assert_eq!(child_first, root_first);
 }
 
+#[test]
+fn message_ids_are_normalized_consistently_across_activity_relations() {
+    let harness = Harness::new();
+    write_jsonl(
+        &harness.active.join("message-id.jsonl"),
+        &[
+            root_meta("2026-07-15T09:00:00Z", ROOT),
+            task("2026-07-15T09:00:01Z", ROOT_TURN),
+            json!({
+                "timestamp": "2026-07-15T09:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": " final-message ",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Finished."}]
+                }
+            }),
+        ],
+    );
+
+    scan_once(&harness.db, &harness.roots()).unwrap();
+    let joined: (String, String, String) = harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT m.id,e.call_id,m.content
+             FROM events e
+             JOIN messages m
+               ON m.id=COALESCE(e.call_id,e.id) AND m.thread_id=e.thread_id
+             WHERE e.kind='final'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        joined,
+        (
+            projected_message_id(ROOT, "final-message"),
+            projected_message_id(ROOT, "final-message"),
+            "Finished.".into(),
+        )
+    );
+}
+
+#[test]
+fn repeated_source_message_ids_are_scoped_across_rollouts_in_one_thread() {
+    let harness = Harness::new();
+    write_jsonl(
+        &harness.active.join("a-root.jsonl"),
+        &[
+            root_meta("2026-07-15T09:00:00Z", ROOT),
+            task("2026-07-15T09:00:01Z", ROOT_TURN),
+            assistant_message_with_id("2026-07-15T09:00:02Z", "reused-message", "Root response."),
+        ],
+    );
+    write_jsonl(
+        &harness.active.join("z-child.jsonl"),
+        &[
+            child_meta("2026-07-15T09:00:03Z", CHILD, ROOT),
+            task("2026-07-15T09:00:04Z", CHILD_TURN),
+            assistant_message_with_id("2026-07-15T09:00:05Z", "reused-message", "Child response."),
+        ],
+    );
+
+    assert_eq!(
+        scan_once(&harness.db, &harness.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+    let rows = harness
+        .db
+        .connect()
+        .unwrap()
+        .prepare(
+            "SELECT m.rollout_id,m.id,e.call_id,m.content
+             FROM messages m
+             JOIN events e
+               ON e.rollout_id=m.rollout_id
+              AND e.call_id=m.id
+              AND e.kind='final'
+             WHERE m.thread_id=?1
+             ORDER BY m.rollout_id",
+        )
+        .unwrap()
+        .query_map([ROOT], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                ROOT.into(),
+                projected_message_id(ROOT, "reused-message"),
+                projected_message_id(ROOT, "reused-message"),
+                "Root response.".into(),
+            ),
+            (
+                CHILD.into(),
+                projected_message_id(CHILD, "reused-message"),
+                projected_message_id(CHILD, "reused-message"),
+                "Child response.".into(),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn repeated_source_message_ids_are_scoped_across_threads() {
+    const OTHER_ROOT: &str = "019f64ae-0000-7000-8000-000000000000";
+    const OTHER_TURN: &str = "019f64af-0000-7000-8000-000000000000";
+    let harness = Harness::new();
+    write_jsonl(
+        &harness.active.join("a-root.jsonl"),
+        &[
+            root_meta("2026-07-15T09:00:00Z", ROOT),
+            task("2026-07-15T09:00:01Z", ROOT_TURN),
+            assistant_message_with_id(
+                "2026-07-15T09:00:02Z",
+                "reused-message",
+                "First thread response.",
+            ),
+        ],
+    );
+    write_jsonl(
+        &harness.active.join("z-other-root.jsonl"),
+        &[
+            root_meta("2026-07-15T09:00:03Z", OTHER_ROOT),
+            task("2026-07-15T09:00:04Z", OTHER_TURN),
+            assistant_message_with_id(
+                "2026-07-15T09:00:05Z",
+                "reused-message",
+                "Second thread response.",
+            ),
+        ],
+    );
+
+    assert_eq!(
+        scan_once(&harness.db, &harness.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+    let rows = harness
+        .db
+        .connect()
+        .unwrap()
+        .prepare(
+            "SELECT m.thread_id,m.id,e.call_id,m.content
+             FROM messages m
+             JOIN events e
+               ON e.thread_id=m.thread_id
+              AND e.rollout_id=m.rollout_id
+              AND e.call_id=m.id
+              AND e.kind='final'
+             ORDER BY m.thread_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                ROOT.into(),
+                projected_message_id(ROOT, "reused-message"),
+                projected_message_id(ROOT, "reused-message"),
+                "First thread response.".into(),
+            ),
+            (
+                OTHER_ROOT.into(),
+                projected_message_id(OTHER_ROOT, "reused-message"),
+                projected_message_id(OTHER_ROOT, "reused-message"),
+                "Second thread response.".into(),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn oversized_message_identifier_rolls_back_the_file_projection() {
+    let harness = Harness::new();
+    let oversized_id = "m".repeat(257);
+    write_jsonl(
+        &harness.active.join("oversized-message-id.jsonl"),
+        &[
+            root_meta("2026-07-15T09:00:00Z", ROOT),
+            task("2026-07-15T09:00:01Z", ROOT_TURN),
+            json!({
+                "timestamp": "2026-07-15T09:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": oversized_id,
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Finished."}]
+                }
+            }),
+        ],
+    );
+
+    let error = scan_once(&harness.db, &harness.roots()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("message id exceeds the 256-character identifier limit"),
+        "unexpected error: {error:#}"
+    );
+    let connection = harness.db.connect().unwrap();
+    assert_eq!(scalar(&connection, "SELECT COUNT(*) FROM rollouts"), 0);
+    assert_eq!(scalar(&connection, "SELECT COUNT(*) FROM messages"), 0);
+    assert_eq!(scalar(&connection, "SELECT COUNT(*) FROM events"), 0);
+    assert_eq!(scalar(&connection, "SELECT COUNT(*) FROM source_files"), 0);
+}
+
 fn ingest_owner_metadata(
     root_name: &str,
     child_name: &str,
@@ -662,6 +921,577 @@ fn removing_promoted_child_restores_surviving_parent_agent_observation() {
             Some("2026-07-15T09:00:01.000000000Z".into()),
             "/root/contract-child".into(),
         )
+    );
+}
+
+#[test]
+fn removing_only_parent_restores_promoted_child_native_metadata() {
+    let parent_records = [
+        root_meta("2026-07-15T09:00:00Z", ROOT),
+        subagent_activity(
+            "2026-07-15T09:00:01Z",
+            CHILD,
+            "/root/from-removed-parent",
+            "started",
+        ),
+    ];
+    let child_records = [
+        conflicting_child_meta("2026-07-15T09:00:02Z"),
+        task("2026-07-15T09:00:03Z", CHILD_TURN),
+    ];
+
+    let incremental = Harness::new();
+    let removed_parent = incremental.active.join("a-parent.jsonl");
+    write_jsonl(&removed_parent, &parent_records);
+    write_jsonl(&incremental.active.join("z-child.jsonl"), &child_records);
+    scan_once(&incremental.db, &incremental.roots()).unwrap();
+    fs::remove_file(removed_parent).unwrap();
+    scan_once(&incremental.db, &incremental.roots()).unwrap();
+
+    let fresh = Harness::new();
+    write_jsonl(&fresh.active.join("z-child.jsonl"), &child_records);
+    scan_once(&fresh.db, &fresh.roots()).unwrap();
+
+    let projected_agent = |connection: &Connection| {
+        connection
+            .query_row(
+                "SELECT thread_id,parent_rollout_id,agent_path,nickname,started_at
+                 FROM agent_runs WHERE id=?1 AND rollout_id=?1",
+                [CHILD],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let incremental_agent = projected_agent(&incremental.db.connect().unwrap());
+    let fresh_agent = projected_agent(&fresh.db.connect().unwrap());
+
+    assert_eq!(incremental_agent, fresh_agent);
+    assert_eq!(
+        incremental_agent,
+        (
+            ROOT.into(),
+            Some(ROOT.into()),
+            Some("/root/metadata-child".into()),
+            Some("Noether".into()),
+            "2026-07-15T09:00:02.000000000Z".into(),
+        )
+    );
+    assert_eq!(
+        canonical_projection(&incremental.db.connect().unwrap()),
+        canonical_projection(&fresh.db.connect().unwrap())
+    );
+}
+
+#[test]
+fn removing_one_parent_rematerializes_a_child_observed_by_another_parent() {
+    const PARENT_A: &str = "019f64aa-0000-7000-8000-0000000000a1";
+    const PARENT_B: &str = "019f64aa-0000-7000-8000-0000000000b1";
+    let parent_a_records = [
+        root_meta("2026-07-15T09:00:00Z", PARENT_A),
+        subagent_activity(
+            "2026-07-15T09:00:02Z",
+            CHILD,
+            "/root/from-parent-a",
+            "completed",
+        ),
+    ];
+    let parent_b_records = [
+        root_meta("2026-07-15T09:00:00Z", PARENT_B),
+        subagent_activity(
+            "2026-07-15T09:00:01Z",
+            CHILD,
+            "/root/from-parent-b",
+            "started",
+        ),
+    ];
+
+    let incremental = Harness::new();
+    write_jsonl(
+        &incremental.active.join("a-parent-b.jsonl"),
+        &parent_b_records,
+    );
+    let removed_parent = incremental.active.join("z-parent-a.jsonl");
+    write_jsonl(&removed_parent, &parent_a_records);
+    assert_eq!(
+        scan_once(&incremental.db, &incremental.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+    fs::remove_file(removed_parent).unwrap();
+    assert_eq!(
+        scan_once(&incremental.db, &incremental.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+
+    let fresh = Harness::new();
+    write_jsonl(&fresh.active.join("a-parent-b.jsonl"), &parent_b_records);
+    assert_eq!(
+        scan_once(&fresh.db, &fresh.roots()).unwrap().files_failed,
+        0
+    );
+
+    assert_eq!(
+        canonical_projection(&incremental.db.connect().unwrap()),
+        canonical_projection(&fresh.db.connect().unwrap())
+    );
+    let surviving_child: (Option<String>, String, String, Option<String>, String) = incremental
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT rollout_id,parent_rollout_id,status,completed_at,agent_path
+             FROM agent_runs WHERE id=?1",
+            [CHILD],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        surviving_child,
+        (
+            None,
+            PARENT_B.into(),
+            "running".into(),
+            None,
+            "/root/from-parent-b".into(),
+        )
+    );
+}
+
+#[test]
+fn removing_earlier_non_winning_parent_can_raise_synthetic_child_start() {
+    const EARLIER_PARENT: &str = "019f64aa-0000-7000-8000-0000000000c1";
+    const LATER_PARENT: &str = "019f64aa-0000-7000-8000-0000000000d1";
+    let earlier_records = [
+        root_meta("2026-07-15T09:00:00Z", EARLIER_PARENT),
+        subagent_activity(
+            "2026-07-15T09:00:01Z",
+            CHILD,
+            "/root/from-earlier-parent",
+            "started",
+        ),
+    ];
+    let later_records = [
+        root_meta("2026-07-15T09:00:00Z", LATER_PARENT),
+        subagent_activity(
+            "2026-07-15T09:00:02Z",
+            CHILD,
+            "/root/from-later-parent",
+            "completed",
+        ),
+    ];
+
+    let incremental = Harness::new();
+    let removed_parent = incremental.active.join("a-earlier-parent.jsonl");
+    write_jsonl(&removed_parent, &earlier_records);
+    write_jsonl(
+        &incremental.active.join("z-later-parent.jsonl"),
+        &later_records,
+    );
+    assert_eq!(
+        scan_once(&incremental.db, &incremental.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+    let before_removal: (String, String) = incremental
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT parent_rollout_id,started_at FROM agent_runs WHERE id=?1",
+            [CHILD],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        before_removal,
+        (LATER_PARENT.into(), "2026-07-15T09:00:01.000000000Z".into(),)
+    );
+
+    fs::remove_file(removed_parent).unwrap();
+    assert_eq!(
+        scan_once(&incremental.db, &incremental.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+
+    let fresh = Harness::new();
+    write_jsonl(&fresh.active.join("z-later-parent.jsonl"), &later_records);
+    assert_eq!(
+        scan_once(&fresh.db, &fresh.roots()).unwrap().files_failed,
+        0
+    );
+    assert_eq!(
+        canonical_projection(&incremental.db.connect().unwrap()),
+        canonical_projection(&fresh.db.connect().unwrap())
+    );
+
+    let rebuilt: (String, String, String, Option<String>, String) = incremental
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT parent_rollout_id,started_at,status,completed_at,agent_path
+             FROM agent_runs WHERE id=?1",
+            [CHILD],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        rebuilt,
+        (
+            LATER_PARENT.into(),
+            "2026-07-15T09:00:02.000000000Z".into(),
+            "completed".into(),
+            Some("2026-07-15T09:00:02.000000000Z".into()),
+            "/root/from-later-parent".into(),
+        )
+    );
+}
+
+#[test]
+fn equal_timestamp_parent_observations_converge_after_incremental_discovery() {
+    const PARENT_A: &str = "019f64aa-0000-7000-8000-0000000000a3";
+    const PARENT_B: &str = "019f64aa-0000-7000-8000-0000000000b3";
+    let parent_a_records = [
+        root_meta("2026-07-15T09:00:00Z", PARENT_A),
+        subagent_activity(
+            "2026-07-15T09:00:01Z",
+            CHILD,
+            "/root/from-parent-a",
+            "completed",
+        ),
+    ];
+    let parent_b_records = [
+        root_meta("2026-07-15T09:00:00Z", PARENT_B),
+        subagent_activity(
+            "2026-07-15T09:00:01Z",
+            CHILD,
+            "/root/from-parent-b",
+            "started",
+        ),
+    ];
+
+    let incremental = Harness::new();
+    write_jsonl(
+        &incremental.active.join("z-parent-b.jsonl"),
+        &parent_b_records,
+    );
+    scan_once(&incremental.db, &incremental.roots()).unwrap();
+    write_jsonl(
+        &incremental.active.join("a-parent-a.jsonl"),
+        &parent_a_records,
+    );
+    scan_once(&incremental.db, &incremental.roots()).unwrap();
+
+    let fresh = Harness::new();
+    write_jsonl(&fresh.active.join("a-parent-a.jsonl"), &parent_a_records);
+    write_jsonl(&fresh.active.join("z-parent-b.jsonl"), &parent_b_records);
+    scan_once(&fresh.db, &fresh.roots()).unwrap();
+
+    assert_eq!(
+        canonical_projection(&incremental.db.connect().unwrap()),
+        canonical_projection(&fresh.db.connect().unwrap())
+    );
+    let child: (String, String, String, Option<String>) = incremental
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT parent_rollout_id,agent_path,status,completed_at
+             FROM agent_runs WHERE id=?1",
+            [CHILD],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        child,
+        (
+            PARENT_B.into(),
+            "/root/from-parent-b".into(),
+            "running".into(),
+            None,
+        )
+    );
+}
+
+#[test]
+fn removing_terminal_parent_restores_promoted_child_from_surviving_running_parent() {
+    const PARENT_A: &str = "019f64aa-0000-7000-8000-0000000000a2";
+    const PARENT_B: &str = "019f64aa-0000-7000-8000-0000000000b2";
+    let parent_a_records = [
+        root_meta("2026-07-15T09:00:00Z", PARENT_A),
+        subagent_activity(
+            "2026-07-15T09:00:04Z",
+            CHILD,
+            "/root/from-parent-a",
+            "completed",
+        ),
+    ];
+    let parent_b_records = [
+        root_meta("2026-07-15T09:00:00Z", PARENT_B),
+        subagent_activity(
+            "2026-07-15T09:00:01Z",
+            CHILD,
+            "/root/from-parent-b",
+            "started",
+        ),
+    ];
+    let child_records = [
+        child_meta("2026-07-15T09:00:02Z", CHILD, PARENT_B),
+        task("2026-07-15T09:00:03Z", CHILD_TURN),
+    ];
+
+    let incremental = Harness::new();
+    write_jsonl(
+        &incremental.active.join("a-parent-b.jsonl"),
+        &parent_b_records,
+    );
+    write_jsonl(&incremental.active.join("m-child.jsonl"), &child_records);
+    let removed_parent = incremental.active.join("z-parent-a.jsonl");
+    write_jsonl(&removed_parent, &parent_a_records);
+    assert_eq!(
+        scan_once(&incremental.db, &incremental.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+    fs::remove_file(removed_parent).unwrap();
+    assert_eq!(
+        scan_once(&incremental.db, &incremental.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+
+    let fresh = Harness::new();
+    write_jsonl(&fresh.active.join("a-parent-b.jsonl"), &parent_b_records);
+    write_jsonl(&fresh.active.join("m-child.jsonl"), &child_records);
+    assert_eq!(
+        scan_once(&fresh.db, &fresh.roots()).unwrap().files_failed,
+        0
+    );
+
+    assert_eq!(
+        canonical_projection(&incremental.db.connect().unwrap()),
+        canonical_projection(&fresh.db.connect().unwrap())
+    );
+    let child: (String, Option<String>, String, String, Option<String>) = incremental
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT
+                status,
+                completed_at,
+                agent_path,
+                (SELECT status FROM turns WHERE id=?2),
+                (SELECT completed_at FROM turns WHERE id=?2)
+             FROM agent_runs WHERE id=?1 AND rollout_id=?1",
+            [CHILD, CHILD_TURN],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        child,
+        (
+            "running".into(),
+            None,
+            "/root/from-parent-b".into(),
+            "running".into(),
+            None,
+        )
+    );
+}
+
+fn ingest_promoted_child_lifecycle(
+    parent_name: &str,
+    child_name: &str,
+) -> ((String, Option<String>), (String, Option<String>)) {
+    let harness = Harness::new();
+    write_jsonl(
+        &harness.active.join(parent_name),
+        &[
+            root_meta("2026-07-15T09:00:00Z", ROOT),
+            subagent_activity(
+                "2026-07-15T09:00:03Z",
+                CHILD,
+                "/root/contract-child",
+                "completed",
+            ),
+        ],
+    );
+    write_jsonl(
+        &harness.active.join(child_name),
+        &[
+            child_meta("2026-07-15T09:00:01Z", CHILD, ROOT),
+            task("2026-07-15T09:00:02Z", CHILD_TURN),
+        ],
+    );
+    assert_eq!(
+        scan_once(&harness.db, &harness.roots())
+            .unwrap()
+            .files_failed,
+        0
+    );
+    harness
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT
+                status,
+                completed_at,
+                (SELECT status FROM turns WHERE id=?2),
+                (SELECT completed_at FROM turns WHERE id=?2)
+             FROM agent_runs WHERE id=?1",
+            [CHILD, CHILD_TURN],
+            |row| Ok(((row.get(0)?, row.get(1)?), (row.get(2)?, row.get(3)?))),
+        )
+        .unwrap()
+}
+
+#[test]
+fn terminal_parent_closes_an_open_promoted_child_in_both_discovery_orders() {
+    let terminal = (
+        "completed".into(),
+        Some("2026-07-15T09:00:03.000000000Z".into()),
+    );
+    let expected = (terminal.clone(), terminal);
+    assert_eq!(
+        ingest_promoted_child_lifecycle("a-parent.jsonl", "z-child.jsonl"),
+        expected
+    );
+    assert_eq!(
+        ingest_promoted_child_lifecycle("z-parent.jsonl", "a-child.jsonl"),
+        expected
+    );
+}
+
+#[test]
+fn native_child_terminal_and_newer_running_evidence_remain_authoritative() {
+    let completed = Harness::new();
+    write_jsonl(
+        &completed.active.join("a-child.jsonl"),
+        &[
+            child_meta("2026-07-15T09:00:01Z", CHILD, ROOT),
+            task("2026-07-15T09:00:02Z", CHILD_TURN),
+            task_complete("2026-07-15T09:00:03Z", CHILD_TURN),
+        ],
+    );
+    write_jsonl(
+        &completed.active.join("z-parent.jsonl"),
+        &[
+            root_meta("2026-07-15T09:00:00Z", ROOT),
+            subagent_activity(
+                "2026-07-15T09:00:04Z",
+                CHILD,
+                "/root/contract-child",
+                "interrupted",
+            ),
+        ],
+    );
+    scan_once(&completed.db, &completed.roots()).unwrap();
+    let completed_state: (String, Option<String>, String, Option<String>) = completed
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT
+                status,
+                completed_at,
+                (SELECT status FROM turns WHERE id=?2),
+                (SELECT completed_at FROM turns WHERE id=?2)
+             FROM agent_runs WHERE id=?1",
+            [CHILD, CHILD_TURN],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        completed_state,
+        (
+            "completed".into(),
+            Some("2026-07-15T09:00:03.000000000Z".into()),
+            "completed".into(),
+            Some("2026-07-15T09:00:03.000000000Z".into()),
+        )
+    );
+
+    let newer_native = Harness::new();
+    write_jsonl(
+        &newer_native.active.join("a-parent.jsonl"),
+        &[
+            root_meta("2026-07-15T09:00:00Z", ROOT),
+            subagent_activity(
+                "2026-07-15T09:00:03Z",
+                CHILD,
+                "/root/contract-child",
+                "completed",
+            ),
+        ],
+    );
+    write_jsonl(
+        &newer_native.active.join("z-child.jsonl"),
+        &[
+            child_meta("2026-07-15T09:00:01Z", CHILD, ROOT),
+            task("2026-07-15T09:00:04Z", CHILD_TURN),
+        ],
+    );
+    scan_once(&newer_native.db, &newer_native.roots()).unwrap();
+    let newer_state: (String, Option<String>, String, Option<String>) = newer_native
+        .db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT
+                status,
+                completed_at,
+                (SELECT status FROM turns WHERE id=?2),
+                (SELECT completed_at FROM turns WHERE id=?2)
+             FROM agent_runs WHERE id=?1",
+            [CHILD, CHILD_TURN],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        newer_state,
+        ("running".into(), None, "running".into(), None)
     );
 }
 

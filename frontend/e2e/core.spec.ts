@@ -268,14 +268,18 @@ test('session Summary discloses and expands compact model and tool category list
 
 test('primary navigation and a reloaded Activity deep link preserve route identity', async ({ page, app }) => {
   await page.goto(`${app.baseUrl}/`)
+  await expect(page).toHaveTitle('Overview · Codex usage')
   const primaryNavigation = page.getByRole('navigation', { name: 'Primary navigation' })
 
   await primaryNavigation.getByRole('link', { name: 'Sessions' }).click()
   await expect(page.getByRole('heading', { name: 'Sessions', exact: true })).toBeVisible()
+  await expect(page).toHaveTitle('Sessions · Codex usage')
   await primaryNavigation.getByRole('link', { name: 'Stats' }).click()
   await expect(page.getByRole('heading', { name: 'Stats', exact: true })).toBeVisible()
+  await expect(page).toHaveTitle('Stats · Codex usage')
   await page.getByRole('link', { name: 'Codex usage overview' }).click()
   await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible()
+  await expect(page).toHaveTitle('Overview · Codex usage')
 
   await page.goto(`${app.baseUrl}/sessions/${RICH_SESSION}?tab=activity`)
   await page.reload()
@@ -284,6 +288,7 @@ test('primary navigation and a reloaded Activity deep link preserve route identi
   await expect(page.getByRole('heading', {
     name: 'Revisit the usage application from ingestion through the browser UI.',
   })).toBeVisible()
+  await expect(page).toHaveTitle('Revisit the usage application from ingestion through the browser UI. · Codex usage')
   await expect(page.getByRole('link', {
     name: `Open session ${RICH_SESSION} in Codex`,
   })).toHaveAttribute('href', `codex://threads/${RICH_SESSION}`)
@@ -327,30 +332,58 @@ test('Sessions supports sorting, debounced search, inset geometry, and detail na
 })
 
 test('pagination stays focused and inert while replacement pages load', async ({ page, app }) => {
+  await page.goto(`${app.baseUrl}/`)
+  const nextYear = page.getByRole('button', { name: 'Next year' })
+  await expect(nextYear).toHaveAttribute('aria-disabled', 'true')
+  await nextYear.focus()
+  await nextYear.press('Enter')
+  await expect(nextYear).toBeFocused()
+  await expect(page.getByRole('region', { name: `${overviewScaleYear} yearly usage ledger` })).toBeVisible()
+
+  await page.goto(`${app.baseUrl}/stats?range=year&anchor=${overviewScaleYear}-01-01`)
+  const statsNext = page.locator('.stats-navigator').getByRole('button', { name: 'NEXT' })
+  await expect(statsNext).toHaveAttribute('aria-disabled', 'true')
+  await statsNext.focus()
+  await statsNext.press('Enter')
+  await expect(statsNext).toBeFocused()
+  await expect(page).toHaveURL(`${app.baseUrl}/stats?range=year&anchor=${overviewScaleYear}-01-01`)
+
   let sessionsRequestSeen = false
+  let sessionsRequestCount = 0
   let releaseSessions!: () => void
   const sessionsGate = new Promise<void>(resolve => { releaseSessions = resolve })
   await page.route('**/api/v1/sessions?*', async route => {
     const url = new URL(route.request().url())
-    if (url.pathname === '/api/v1/sessions' && url.searchParams.get('page') === '2') {
+    if (url.pathname !== '/api/v1/sessions') {
+      await route.continue()
+      return
+    }
+    sessionsRequestCount += 1
+    const requestedPage = Number(url.searchParams.get('page') ?? 1)
+    if (requestedPage === 2) {
       sessionsRequestSeen = true
       await sessionsGate
     }
-    await route.continue()
+    const response = await route.fetch()
+    const body = await response.json() as Record<string, unknown>
+    await route.fulfill({ response, json: { ...body, page: requestedPage, total: 100, totalPages: 2 } })
   })
 
   await page.goto(`${app.baseUrl}/sessions`)
   const sessionsPagination = page.getByRole('navigation', { name: 'Pagination' })
-  const sessionsPageTwo = sessionsPagination.getByRole('button', { name: '02' })
-  await sessionsPageTwo.focus()
-  await sessionsPageTwo.click()
+  const sessionsNext = sessionsPagination.getByRole('button', { name: 'NEXT' })
+  await sessionsNext.focus()
+  await sessionsNext.click()
   await expect.poll(() => sessionsRequestSeen).toBe(true)
-  await expect(sessionsPageTwo).toBeFocused()
-  await expect(sessionsPageTwo).not.toHaveAttribute('disabled')
-  await expect(sessionsPageTwo).toHaveAttribute('aria-disabled', 'true')
+  await expect(sessionsNext).toBeFocused()
+  await expect(sessionsNext).not.toHaveAttribute('disabled')
+  await expect(sessionsNext).toHaveAttribute('aria-disabled', 'true')
   releaseSessions()
   await expect(sessionsPagination).not.toHaveAttribute('aria-busy')
-  await expect(sessionsPageTwo).toBeFocused()
+  await expect(sessionsNext).toBeFocused()
+  await expect(sessionsNext).toHaveAttribute('aria-disabled', 'true')
+  await sessionsNext.press('Enter')
+  expect(sessionsRequestCount).toBe(2)
 
   let pricesRequestSeen = false
   let releasePrices!: () => void
@@ -368,7 +401,7 @@ test('pagination stays focused and inert while replacement pages load', async ({
   })
 
   await page.goto(`${app.baseUrl}/settings?tab=price-data`)
-  const pricesPagination = page.getByRole('navigation', { name: 'Pagination' })
+  const pricesPagination = page.getByRole('navigation', { name: 'Model price pagination' })
   const pricesPageTwo = pricesPagination.getByRole('button', { name: '02' })
   await pricesPageTwo.focus()
   await pricesPageTwo.click()

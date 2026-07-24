@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   activityItemResponse,
   activityResponse,
+  aliasesResponse,
   overviewResponse,
   overviewYearResponse,
   priceMetadataResponse,
@@ -78,7 +79,8 @@ const prices = {
   refreshError: null,
   source: null,
 }
-const priceMetadata = { aliases: [], aliasesTotal: 0, observedUnknown: [], observedUnknownTotal: 0 }
+const aliases = { items: [], page: 1, pageSize: 25, total: 0, totalPages: 0 }
+const priceMetadata = { observedUnknown: [], observedUnknownTotal: 0 }
 
 const price = {
   modelId: 'gpt-test',
@@ -392,15 +394,38 @@ describe('runtime API contracts', () => {
     expect(() => pricesResponse(candidate)).toThrow(`Invalid API response at ${path}`)
   })
 
+  it.each([
+    ['inputPerMillion', '-1'],
+    ['inputPerMillion', '01.5'],
+    ['outputPerMillion', 'free'],
+    ['cachedInputPerMillion', '-0.1'],
+  ])('rejects invalid price rate %s=%s', (field, value) => {
+    expect(() => pricesResponse({
+      ...prices,
+      items: [{ ...price, [field]: value }],
+    })).toThrow(`Invalid API response at prices.items[0].${field}`)
+  })
+
+  it('rejects non-USD price rows', () => {
+    expect(() => pricesResponse({
+      ...prices,
+      items: [{ ...price, currency: 'EUR' }],
+    })).toThrow('Invalid API response at prices.items[0].currency: expected USD')
+  })
+
   it('validates dedicated price metadata and model ID responses', () => {
+    expect(() => aliasesResponse({
+      ...aliases,
+      items: [{ observedModelId: 'legacy', canonicalModelId: 7 }],
+    })).toThrow('Invalid API response at aliases.items[0].canonicalModelId')
+    expect(() => aliasesResponse({ ...aliases, page: -1 }))
+      .toThrow('Invalid API response at aliases.page')
     expect(() => priceMetadataResponse({
       ...priceMetadata,
       observedUnknown: [{ modelId: 'unknown', usageCount: 1, totalTokens: 1, lastSeenAt: '2026-07-19T24:00:00Z' }],
     })).toThrow('Invalid API response at priceMetadata.observedUnknown[0].lastSeenAt')
     expect(() => priceMetadataResponse({ ...priceMetadata, observedUnknownTotal: -1 }))
       .toThrow('Invalid API response at priceMetadata.observedUnknownTotal')
-    expect(() => priceMetadataResponse({ ...priceMetadata, aliasesTotal: -1 }))
-      .toThrow('Invalid API response at priceMetadata.aliasesTotal')
     expect(() => priceModelIdsResponse({ items: ['gpt-5', 7] }))
       .toThrow('Invalid API response at priceModelIds.items[1]')
   })

@@ -1,6 +1,7 @@
 import type {
   ActivityItem,
   ActivityResponse,
+  AliasesResponse,
   OverviewResponse,
   OverviewYearResponse,
   PricesResponse,
@@ -84,6 +85,12 @@ function nonnegativeSafeInteger(value: unknown, path: string) {
 function decimal(value: unknown, path: string) {
   if (!isDecimalString(value)) {
     throw new ResponseValidationError(path, 'a canonical decimal string')
+  }
+}
+
+function nonnegativeDecimal(value: unknown, path: string) {
+  if (!isDecimalString(value) || value.startsWith('-')) {
+    throw new ResponseValidationError(path, 'a canonical non-negative decimal string')
   }
 }
 
@@ -331,12 +338,18 @@ export function pricesResponse(value: unknown): PricesResponse {
   const item = object(value, 'prices')
   arrayOf(item.items, 'prices.items', (price, path) => {
     const candidate = object(price, path)
-    for (const key of ['modelId', 'inputPerMillion', 'outputPerMillion', 'currency', 'source']) {
+    for (const key of ['modelId', 'source']) {
       string(candidate[key], `${path}.${key}`)
+    }
+    for (const key of ['inputPerMillion', 'outputPerMillion']) {
+      nonnegativeDecimal(candidate[key], `${path}.${key}`)
+    }
+    if (candidate.currency !== 'USD') {
+      throw new ResponseValidationError(`${path}.currency`, 'USD')
     }
     timestamp(candidate.effectiveFrom, `${path}.effectiveFrom`)
     nullable(candidate.effectiveTo, `${path}.effectiveTo`, timestamp)
-    nullable(candidate.cachedInputPerMillion, `${path}.cachedInputPerMillion`, string)
+    nullable(candidate.cachedInputPerMillion, `${path}.cachedInputPerMillion`, nonnegativeDecimal)
   })
   paged(item, 'prices')
   nullable(item.lastRefreshAt, 'prices.lastRefreshAt', timestamp)
@@ -347,14 +360,19 @@ export function pricesResponse(value: unknown): PricesResponse {
   return item as unknown as PricesResponse
 }
 
-export function priceMetadataResponse(value: unknown): PriceMetadataResponse {
-  const item = object(value, 'priceMetadata')
-  arrayOf(item.aliases, 'priceMetadata.aliases', (alias, path) => {
+export function aliasesResponse(value: unknown): AliasesResponse {
+  const item = object(value, 'aliases')
+  arrayOf(item.items, 'aliases.items', (alias, path) => {
     const candidate = object(alias, path)
     string(candidate.observedModelId, `${path}.observedModelId`)
     string(candidate.canonicalModelId, `${path}.canonicalModelId`)
   })
-  nonnegativeSafeInteger(item.aliasesTotal, 'priceMetadata.aliasesTotal')
+  paged(item, 'aliases')
+  return item as unknown as AliasesResponse
+}
+
+export function priceMetadataResponse(value: unknown): PriceMetadataResponse {
+  const item = object(value, 'priceMetadata')
   arrayOf(item.observedUnknown, 'priceMetadata.observedUnknown', (unknown, path) => {
     const candidate = object(unknown, path)
     string(candidate.modelId, `${path}.modelId`)

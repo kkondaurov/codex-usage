@@ -167,7 +167,7 @@ describe('OverviewPage staged loading', () => {
 
     expect(screen.getByText('summary broke')).toBeInTheDocument()
     expect(screen.getAllByText('year broke').length).toBeGreaterThan(0)
-    expect(screen.getByRole('button', { name: /2026-07-16:/ })).toBeDisabled()
+    expect(screen.getByRole('group', { name: '2026 usage by day' }).querySelectorAll('.heatmap-tile')).toHaveLength(0)
     const retryButtons = screen.getAllByRole('button', { name: 'TRY AGAIN' })
     fireEvent.click(retryButtons[0])
     fireEvent.click(retryButtons[1])
@@ -210,9 +210,12 @@ describe('OverviewPage staged loading', () => {
     await flush()
 
     const previous = screen.getByRole('button', { name: 'Previous year' })
-    expect(previous).toBeDisabled()
+    expect(previous).toHaveAttribute('aria-disabled', 'true')
+    expect(previous).not.toBeDisabled()
+    previous.focus()
     fireEvent.click(previous)
     await flush()
+    expect(previous).toHaveFocus()
     expect(yearSpy).toHaveBeenCalledTimes(1)
     expect(yearSpy).toHaveBeenCalledWith(1970, expect.any(AbortSignal))
     expect(screen.getByRole('region', { name: '1970 yearly usage ledger' })).toBeVisible()
@@ -276,6 +279,16 @@ describe('OverviewPage heatmap hover card', () => {
     expect(previousDay).toHaveFocus()
     fireEvent.keyDown(previousDay, { key: 'ArrowRight' })
     expect(screen.getByRole('button', { name: /2026-07-15:/ })).toHaveFocus()
+
+    const monday = screen.getByRole('button', { name: /2026-07-13:/ })
+    act(() => monday.focus())
+    fireEvent.keyDown(monday, { key: 'ArrowUp' })
+    expect(monday).toHaveFocus()
+
+    const sunday = screen.getByRole('button', { name: /2026-07-12:/ })
+    act(() => sunday.focus())
+    fireEvent.keyDown(sunday, { key: 'ArrowDown' })
+    expect(sunday).toHaveFocus()
   })
 
   it('scrolls the arrow-focused tile into the visible heatmap viewport', async () => {

@@ -60,25 +60,20 @@ describe('RangeCalendar', () => {
     expect(onApply).not.toHaveBeenCalled()
   })
 
-  it('moves focus into the modal and contains keyboard focus', () => {
+  it('moves focus into the non-modal popover without trapping background focus', () => {
     render(<CalendarHarness />)
-    fireEvent.click(screen.getByRole('button', { name: 'OPEN CALENDAR' }))
+    const trigger = screen.getByRole('button', { name: 'OPEN CALENDAR' })
+    fireEvent.click(trigger)
 
     const dialog = screen.getByRole('dialog', { name: 'Choose date range' })
-    const previous = screen.getByRole('button', { name: 'PREVIOUS' })
-    const cancel = screen.getByRole('button', { name: 'CANCEL' })
     const focusedDay = dialog.querySelector<HTMLButtonElement>('.calendar-days button[tabindex="0"]')!
 
-    expect(dialog).toHaveAttribute('aria-modal', 'true')
+    expect(dialog).toHaveAttribute('aria-modal', 'false')
     expect(focusedDay).toHaveFocus()
 
-    previous.focus()
-    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
-    expect(cancel).toHaveFocus()
-
-    cancel.focus()
+    trigger.focus()
     fireEvent.keyDown(document, { key: 'Tab' })
-    expect(previous).toHaveFocus()
+    expect(trigger).toHaveFocus()
   })
 
   it('uses one roving day tab stop and supports spatial arrow navigation', async () => {
@@ -129,7 +124,7 @@ describe('RangeCalendar', () => {
     await waitFor(() => expect(document.querySelector('[data-calendar-date="2025-02-28"]:not(.outside)')).toHaveFocus())
   })
 
-  it('restores focus to the trigger after Escape closes the modal', () => {
+  it('restores focus to the trigger after Escape closes the popover', () => {
     render(<CalendarHarness />)
     const trigger = screen.getByRole('button', { name: 'OPEN CALENDAR' })
     trigger.focus()

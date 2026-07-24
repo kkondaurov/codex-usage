@@ -3,6 +3,7 @@ use crate::{
     db::{Db, seed_fallback_prices},
     db_executor::{DbExecutor, WorkClass},
     fixed_price::PriceMicros,
+    manual_pricing::{MAX_MODEL_ID_CHARS, resolved_alias_layer_validation_message},
     process_lock::DatabaseLock,
 };
 use anyhow::{Context, Result, bail};
@@ -11,13 +12,23 @@ use reqwest::Client;
 use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::Number;
-use std::{collections::HashMap, sync::Arc, time::Duration as StdDuration};
-use tokio::sync::Mutex;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration as StdDuration,
+};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const EFFECTIVE_FROM: &str = "1970-01-01T00:00:00.000000000Z";
 const MIN_RETRY_SECONDS: u64 = 30;
 const MAX_RETRY_SECONDS: u64 = 30 * 60;
 const MAX_DUE_CHECK_SECONDS: u64 = 60 * 60;
+// SQLite can spend up to thirty seconds waiting on a healthy writer. Leave one
+// additional second for scheduling and committing after the fetch deadline.
+const PRICING_STORAGE_GRACE: StdDuration = StdDuration::from_secs(31);
 const MAX_REMOTE_PRICING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REMOTE_PRICING_RECORDS: usize = 10_000;
 
@@ -76,6 +87,57 @@ pub struct PricingSync {
     refresh_gate: Arc<Mutex<()>>,
 }
 
+pub struct PricingRefresher {
+    cancelled: Arc<AtomicBool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+struct CancelLockWaitOnDrop {
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl CancelLockWaitOnDrop {
+    fn new(cancelled: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled: Some(cancelled),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cancelled = None;
+    }
+}
+
+impl Drop for CancelLockWaitOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancelled) = self.cancelled.take() {
+            cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl PricingRefresher {
+    fn cancel(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        self.cancel();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for PricingRefresher {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 impl PricingSync {
     pub fn new(executor: DbExecutor) -> Self {
         Self {
@@ -107,12 +169,17 @@ impl PricingSync {
         }
     }
 
-    pub fn spawn_refresher(&self, db: Db, config: PricingConfig) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_refresher(&self, db: Db, config: PricingConfig) -> PricingRefresher {
         let sync = self.clone();
-        tokio::spawn(async move {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = cancelled.clone();
+        let task = tokio::spawn(async move {
             let mut failures = 0_u32;
-            loop {
-                match sync.refresh_if_due(&db, &config).await {
+            while !task_cancelled.load(Ordering::Acquire) {
+                match sync
+                    .refresh_if_due_until(&db, &config, task_cancelled.clone())
+                    .await
+                {
                     Ok(Some(updated)) => {
                         failures = 0;
                         tracing::info!(updated, source = %config.url, "refreshed remote pricing");
@@ -131,17 +198,39 @@ impl PricingSync {
                 };
                 tokio::time::sleep(delay).await;
             }
-        })
+        });
+        PricingRefresher {
+            cancelled,
+            task: Some(task),
+        }
     }
 
     pub async fn force_sync(&self, db: &Db, config: &PricingConfig) -> Result<usize> {
-        let _refresh_guard = self.refresh_gate.lock().await;
-        let _database_guard = self.acquire_database_lock(db).await?;
-        self.force_sync_locked(db, config).await
+        let refresh_guard = self.refresh_gate.clone().lock_owned().await;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let database_guard = self
+            .acquire_database_lock(db, config, cancelled)
+            .await?
+            .context("pricing refresh cancelled while waiting for database ownership")?;
+        self.force_sync_locked(db, config, refresh_guard, database_guard)
+            .await
     }
 
     async fn refresh_if_due(&self, db: &Db, config: &PricingConfig) -> Result<Option<usize>> {
-        let _refresh_guard = self.refresh_gate.lock().await;
+        self.refresh_if_due_until(db, config, Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    async fn refresh_if_due_until(
+        &self,
+        db: &Db,
+        config: &PricingConfig,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Option<usize>> {
+        let refresh_guard = self.refresh_gate.clone().lock_owned().await;
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         if !self.is_refresh_due(db, config).await? {
             return Ok(None);
         }
@@ -149,11 +238,21 @@ impl PricingSync {
         // Another process may have refreshed after our optimistic due check.
         // Acquire ownership, then recheck while holding it before doing any
         // network or replacement work.
-        let _database_guard = self.acquire_database_lock(db).await?;
+        let Some(database_guard) = self
+            .acquire_database_lock(db, config, cancelled.clone())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         if !self.is_refresh_due(db, config).await? {
             return Ok(None);
         }
-        self.force_sync_locked(db, config).await.map(Some)
+        self.force_sync_locked(db, config, refresh_guard, database_guard)
+            .await
+            .map(Some)
     }
 
     async fn is_refresh_due(&self, db: &Db, config: &PricingConfig) -> Result<bool> {
@@ -166,43 +265,67 @@ impl PricingSync {
             .await
     }
 
-    async fn acquire_database_lock(&self, db: &Db) -> Result<DatabaseLock> {
-        let lock_db = db.clone();
-        self.executor
-            .run(WorkClass::Light, move || {
-                DatabaseLock::acquire(&lock_db, "pricing-refresh")
-            })
+    async fn acquire_database_lock(
+        &self,
+        db: &Db,
+        config: &PricingConfig,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Option<DatabaseLock>> {
+        self.acquire_database_lock_with_timeout(db, cancelled, pricing_process_lock_timeout(config))
             .await
     }
 
-    async fn force_sync_locked(&self, db: &Db, config: &PricingConfig) -> Result<usize> {
-        let result = match fetch_prices(config).await {
-            Ok(prices) => {
-                let db = db.clone();
-                let source_url = config.url.clone();
-                self.executor
-                    .run(WorkClass::Light, move || {
-                        replace_remote_prices(&db, &prices, &source_url, Utc::now())
-                    })
-                    .await
-            }
-            Err(error) => Err(error),
-        };
-        match result {
-            Ok(updated) => Ok(updated),
-            Err(error) => {
-                let db = db.clone();
-                let kind = classify_refresh_error(&error);
-                if let Err(meta_error) = self
-                    .executor
-                    .run(WorkClass::Light, move || record_refresh_error(&db, kind))
-                    .await
-                {
-                    tracing::warn!(%meta_error, "failed to record pricing refresh error");
+    async fn acquire_database_lock_with_timeout(
+        &self,
+        db: &Db,
+        cancelled: Arc<AtomicBool>,
+        lock_timeout: StdDuration,
+    ) -> Result<Option<DatabaseLock>> {
+        let lock_db = db.clone();
+        let mut cancel_wait_on_drop = CancelLockWaitOnDrop::new(cancelled.clone());
+        let worker_result = tokio::task::spawn_blocking(move || {
+            DatabaseLock::acquire_interruptible(
+                &lock_db,
+                "pricing-refresh",
+                lock_timeout,
+                &cancelled,
+            )
+        })
+        .await;
+        cancel_wait_on_drop.disarm();
+        worker_result.context("pricing lock worker failed")?
+    }
+
+    async fn force_sync_locked(
+        &self,
+        db: &Db,
+        config: &PricingConfig,
+        refresh_guard: OwnedMutexGuard<()>,
+        database_guard: DatabaseLock,
+    ) -> Result<usize> {
+        let fetched = fetch_prices(config).await;
+        let db = db.clone();
+        let source_url = config.url.clone();
+        self.executor
+            .run(WorkClass::Light, move || {
+                let _refresh_guard = refresh_guard;
+                let _database_guard = database_guard;
+                let result = match fetched {
+                    Ok(prices) => replace_remote_prices(&db, &prices, &source_url, Utc::now()),
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(updated) => Ok(updated),
+                    Err(error) => {
+                        let kind = classify_refresh_error(&error);
+                        if let Err(meta_error) = record_refresh_error(&db, kind) {
+                            tracing::warn!(%meta_error, "failed to record pricing refresh error");
+                        }
+                        Err(error)
+                    }
                 }
-                Err(error)
-            }
-        }
+            })
+            .await
     }
 }
 
@@ -217,6 +340,10 @@ fn retry_delay(failures: u32) -> StdDuration {
 fn due_check_delay(config: &PricingConfig) -> StdDuration {
     let configured = config.refresh_interval_hours.saturating_mul(60 * 60);
     StdDuration::from_secs(configured.clamp(60, MAX_DUE_CHECK_SECONDS))
+}
+
+fn pricing_process_lock_timeout(config: &PricingConfig) -> StdDuration {
+    StdDuration::from_secs(config.timeout_seconds.max(1)).saturating_add(PRICING_STORAGE_GRACE)
 }
 
 fn refresh_is_due(db: &Db, config: &PricingConfig) -> Result<bool> {
@@ -335,12 +462,17 @@ fn build_prices(raw: HashMap<String, RemotePricing>) -> Vec<RemotePrice> {
 fn normalize_model_key(key: &str) -> Option<(String, u8)> {
     let trimmed = key.trim();
     if let Some(value) = trimmed.strip_prefix("openai/").map(str::trim) {
-        return (!value.is_empty()).then(|| (value.to_string(), 3));
+        return valid_remote_model_id(value).then(|| (value.to_string(), 3));
     }
     if let Some(value) = trimmed.strip_prefix("openai.").map(str::trim) {
-        return (!value.is_empty()).then(|| (value.to_string(), 2));
+        return valid_remote_model_id(value).then(|| (value.to_string(), 2));
     }
-    looks_like_openai_model(trimmed).then(|| (trimmed.to_string(), 1))
+    (valid_remote_model_id(trimmed) && looks_like_openai_model(trimmed))
+        .then(|| (trimmed.to_string(), 1))
+}
+
+fn valid_remote_model_id(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= MAX_MODEL_ID_CHARS
 }
 
 fn looks_like_openai_model(value: &str) -> bool {
@@ -412,7 +544,9 @@ fn replace_remote_prices(
             ],
         )?;
     }
-    validate_resolved_alias_layer(&transaction)?;
+    if let Some(message) = resolved_alias_layer_validation_message(&transaction)? {
+        bail!("pricing refresh would leave {message}");
+    }
     transaction.execute(
         "INSERT OR REPLACE INTO app_meta(key,value) VALUES('pricing_last_refresh_at',?1)",
         [fetched_at.to_rfc3339()],
@@ -429,49 +563,6 @@ fn replace_remote_prices(
     )?;
     transaction.commit()?;
     Ok(prices.len())
-}
-
-fn validate_resolved_alias_layer(connection: &rusqlite::Connection) -> Result<()> {
-    let chain: Option<(String, String)> = connection
-        .query_row(
-            "SELECT a.observed_model_id,a.canonical_model_id
-             FROM resolved_model_aliases a
-             WHERE a.observed_model_id=a.canonical_model_id
-                OR EXISTS(
-                    SELECT 1 FROM resolved_model_aliases target
-                    WHERE target.observed_model_id=a.canonical_model_id
-                )
-             ORDER BY a.observed_model_id
-             LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((observed, canonical)) = chain {
-        bail!("pricing refresh would leave alias {observed} pointing through alias {canonical}");
-    }
-
-    let dangling: Option<(String, String)> = connection
-        .query_row(
-            "SELECT a.observed_model_id,a.canonical_model_id
-             FROM resolved_model_aliases a
-             WHERE NOT EXISTS(
-                SELECT 1 FROM resolved_model_prices price
-                WHERE price.model_id=a.canonical_model_id
-             )
-             ORDER BY a.observed_model_id
-             LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((observed, canonical)) = dangling {
-        bail!(
-            "pricing refresh would leave alias {observed} pointing to unpriced model {canonical}"
-        );
-    }
-
-    Ok(())
 }
 
 fn classify_refresh_error(error: &anyhow::Error) -> RefreshErrorKind {
@@ -562,6 +653,10 @@ mod tests {
         );
         assert_eq!(normalize_model_key("anthropic/claude-opus"), None);
         assert_eq!(normalize_model_key("azure/gpt-5.5"), None);
+        assert_eq!(
+            normalize_model_key(&format!("openai/gpt-{}", "x".repeat(MAX_MODEL_ID_CHARS))),
+            None
+        );
     }
 
     #[test]
@@ -586,6 +681,28 @@ mod tests {
         assert_eq!(retry_delay(2), StdDuration::from_secs(60));
         assert_eq!(retry_delay(7), StdDuration::from_secs(1_800));
         assert_eq!(retry_delay(u32::MAX), StdDuration::from_secs(1_800));
+    }
+
+    #[test]
+    fn process_lock_timeout_covers_fetch_and_storage_without_overflow() {
+        let config = |timeout_seconds| PricingConfig {
+            url: "https://example.test/prices.json".into(),
+            refresh_interval_hours: 24,
+            timeout_seconds,
+        };
+
+        assert_eq!(
+            pricing_process_lock_timeout(&config(9)),
+            StdDuration::from_secs(40)
+        );
+        assert_eq!(
+            pricing_process_lock_timeout(&config(0)),
+            StdDuration::from_secs(32)
+        );
+        assert_eq!(
+            pricing_process_lock_timeout(&config(u64::MAX)),
+            StdDuration::MAX
+        );
     }
 
     #[test]
@@ -715,6 +832,101 @@ mod tests {
     }
 
     #[test]
+    fn fresh_projection_hydrates_remote_only_alias_before_remote_price_arrives() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("codex-usage.db");
+        let pricing_path = temp.path().join("codex-usage.pricing.json");
+        std::fs::write(
+            &pricing_path,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "prices": [],
+                "aliases": [{
+                    "observedModelId": "observed-remote-only",
+                    "canonicalModelId": "gpt-9-remote-only"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let db = Db::open_with_pricing_config(&db_path, &pricing_path).unwrap();
+        let connection = db.connect().unwrap();
+        let hydrated_target: String = connection
+            .query_row(
+                "SELECT canonical_model_id FROM resolved_model_aliases
+                 WHERE observed_model_id='observed-remote-only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let target_is_priced: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM resolved_model_prices
+                    WHERE model_id='gpt-9-remote-only'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hydrated_target, "gpt-9-remote-only");
+        assert!(!target_is_priced);
+        drop(connection);
+
+        let unrelated = RemotePrice {
+            model_id: "gpt-8-unrelated".into(),
+            input_microusd_per_million: 3_000_000,
+            cached_input_microusd_per_million: None,
+            output_microusd_per_million: 4_000_000,
+        };
+        let error = replace_remote_prices(
+            &db,
+            &[unrelated],
+            "https://example.invalid/prices.json",
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("observed-remote-only pointing to unpriced model gpt-9-remote-only"),
+            "{error:#}"
+        );
+
+        let remote_target = RemotePrice {
+            model_id: "gpt-9-remote-only".into(),
+            input_microusd_per_million: 1_000_000,
+            cached_input_microusd_per_million: Some(100_000),
+            output_microusd_per_million: 2_000_000,
+        };
+        replace_remote_prices(
+            &db,
+            &[remote_target],
+            "https://example.invalid/prices.json",
+            Utc::now(),
+        )
+        .unwrap();
+        let resolved_source: String = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT price.source
+                 FROM resolved_model_aliases alias
+                 JOIN resolved_model_prices price
+                   ON price.model_id=alias.canonical_model_id
+                 WHERE alias.observed_model_id='observed-remote-only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            resolved_source,
+            "remote:https://example.invalid/prices.json"
+        );
+    }
+
+    #[test]
     fn refresh_rollback_preserves_remote_alias_target_when_next_snapshot_omits_it() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
@@ -774,6 +986,146 @@ mod tests {
             ("gpt-9-remote-only".into(), format!("remote:{source_url}"))
         );
         assert_eq!(unrelated_count, 0, "the rejected snapshot must roll back");
+    }
+
+    #[test]
+    fn alias_delete_rejects_a_revealed_chain_without_changing_either_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("codex-usage.db");
+        let db = Db::open(&db_path).unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO model_aliases(
+                    observed_model_id,canonical_model_id,created_at,source
+                 ) VALUES('layered','middle',CURRENT_TIMESTAMP,'bundled-baseline')",
+                [],
+            )
+            .unwrap();
+        db.manual_pricing()
+            .save_alias(
+                &db,
+                crate::manual_pricing::ManualAlias {
+                    observed_model_id: "layered".into(),
+                    canonical_model_id: "gpt-5.4".into(),
+                },
+            )
+            .unwrap();
+        db.manual_pricing()
+            .save_alias(
+                &db,
+                crate::manual_pricing::ManualAlias {
+                    observed_model_id: "middle".into(),
+                    canonical_model_id: "gpt-5.5".into(),
+                },
+            )
+            .unwrap();
+
+        fn aliases(db: &Db) -> Vec<(String, String, String)> {
+            db.connect()
+                .unwrap()
+                .prepare(
+                    "SELECT observed_model_id,canonical_model_id,source
+                     FROM model_aliases
+                     WHERE observed_model_id IN ('layered','middle')
+                     ORDER BY observed_model_id,source",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        }
+
+        let aliases_before = aliases(&db);
+        let sidecar_before = std::fs::read(db.manual_pricing().path()).unwrap();
+        let error = db
+            .manual_pricing()
+            .delete_alias(&db, "layered")
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::manual_pricing::MutationError::Validation(_)),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("alias chain"), "{error:#}");
+        assert_eq!(aliases(&db), aliases_before);
+        assert_eq!(
+            std::fs::read(db.manual_pricing().path()).unwrap(),
+            sidecar_before
+        );
+
+        drop(db);
+        let reopened = Db::open(&db_path).unwrap();
+        assert_eq!(aliases(&reopened), aliases_before);
+        let unrelated = RemotePrice {
+            model_id: "gpt-8-unrelated".into(),
+            input_microusd_per_million: 3_000_000,
+            cached_input_microusd_per_million: None,
+            output_microusd_per_million: 4_000_000,
+        };
+        replace_remote_prices(
+            &reopened,
+            &[unrelated],
+            "https://example.invalid/prices.json",
+            Utc::now(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn alias_delete_ignores_an_unrelated_hydrated_remote_only_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("codex-usage.db");
+        let pricing_path = temp.path().join("manual-pricing.json");
+        std::fs::write(
+            &pricing_path,
+            serde_json::to_vec_pretty(&json!({
+                "version": 1,
+                "prices": [],
+                "aliases": [{
+                    "observedModelId": "remote-only-observed",
+                    "canonicalModelId": "gpt-9-remote-only"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let db = Db::open_with_pricing_config(&db_path, &pricing_path).unwrap();
+        db.manual_pricing()
+            .save_alias(
+                &db,
+                crate::manual_pricing::ManualAlias {
+                    observed_model_id: "temporary".into(),
+                    canonical_model_id: "gpt-5.4".into(),
+                },
+            )
+            .unwrap();
+
+        db.manual_pricing().delete_alias(&db, "temporary").unwrap();
+
+        let resolved: Vec<(String, String)> = db
+            .connect()
+            .unwrap()
+            .prepare(
+                "SELECT observed_model_id,canonical_model_id
+                 FROM resolved_model_aliases
+                 WHERE observed_model_id IN ('remote-only-observed','temporary')
+                 ORDER BY observed_model_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            resolved,
+            [(
+                "remote-only-observed".to_string(),
+                "gpt-9-remote-only".to_string()
+            )]
+        );
+        drop(db);
+        Db::open_with_pricing_config(&db_path, &pricing_path).unwrap();
     }
 
     async fn fixture_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -938,6 +1290,315 @@ mod tests {
             0,
             "fresh metadata written by the lock owner must suppress a stale fetch"
         );
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn contended_pricing_locks_are_cancellable_without_using_executor_permits() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
+        let _guard = DatabaseLock::acquire(&db, "pricing-refresh").unwrap();
+        let executor = DbExecutor::new(3, 1);
+        let sync = PricingSync::new(executor.clone());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let sync = sync.clone();
+            let db = db.clone();
+            let cancelled = cancelled.clone();
+            waiters.push(tokio::spawn(async move {
+                sync.acquire_database_lock_with_timeout(&db, cancelled, StdDuration::from_secs(5))
+                    .await
+            }));
+        }
+
+        tokio::time::sleep(StdDuration::from_millis(75)).await;
+        assert!(
+            waiters.iter().all(|waiter| !waiter.is_finished()),
+            "contended waiter unexpectedly acquired ownership"
+        );
+        let light_result = tokio::time::timeout(
+            StdDuration::from_secs(1),
+            executor.run(WorkClass::Light, || Ok(42)),
+        )
+        .await
+        .expect("pricing lock waiters occupied the database executor")
+        .unwrap();
+        assert_eq!(light_result, 42);
+
+        cancelled.store(true, Ordering::Release);
+        for waiter in waiters {
+            assert!(
+                tokio::time::timeout(StdDuration::from_secs(1), waiter)
+                    .await
+                    .expect("cancelled pricing lock waiter did not stop")
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_lock_acquisition_honors_supplied_bound_for_healthy_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
+        let database_guard = DatabaseLock::acquire(&db, "pricing-refresh").unwrap();
+        let sync = PricingSync::new(DbExecutor::new(3, 1));
+
+        let short_error = sync
+            .acquire_database_lock_with_timeout(
+                &db,
+                Arc::new(AtomicBool::new(false)),
+                StdDuration::from_millis(25),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{short_error:#}").contains("timed out waiting for process lock"),
+            "short acquisition bound did not expire: {short_error:#}"
+        );
+
+        let patient_waiter = {
+            let sync = sync.clone();
+            let db = db.clone();
+            tokio::spawn(async move {
+                sync.acquire_database_lock_with_timeout(
+                    &db,
+                    Arc::new(AtomicBool::new(false)),
+                    StdDuration::from_millis(250),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(StdDuration::from_millis(75)).await;
+        assert!(
+            !patient_waiter.is_finished(),
+            "healthy owner outlived the supplied acquisition bound"
+        );
+        drop(database_guard);
+
+        let acquired = tokio::time::timeout(StdDuration::from_secs(1), patient_waiter)
+            .await
+            .expect("patient lock waiter did not observe the healthy owner release")
+            .unwrap()
+            .unwrap();
+        assert!(acquired.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aborting_refresh_waiting_for_process_lock_cancels_blocking_waiter_promptly() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
+        let database_guard = DatabaseLock::acquire(&db, "pricing-refresh").unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let sync = PricingSync::new(DbExecutor::new(3, 1));
+            let config = PricingConfig {
+                url: "http://127.0.0.1:9/prices.json".into(),
+                refresh_interval_hours: 24,
+                timeout_seconds: 1,
+            };
+            let (barrier_started_tx, barrier_started_rx) = tokio::sync::oneshot::channel();
+            let (barrier_release_tx, barrier_release_rx) = std::sync::mpsc::channel();
+            let blocking_barrier = tokio::task::spawn_blocking(move || {
+                let _ = barrier_started_tx.send(());
+                let _ = barrier_release_rx.recv();
+            });
+            barrier_started_rx.await.unwrap();
+
+            let mut refresh_future = Box::pin({
+                let sync = sync.clone();
+                let db = db.clone();
+                async move { sync.force_sync(&db, &config).await }
+            });
+            std::future::poll_fn(|cx| {
+                match std::future::Future::poll(refresh_future.as_mut(), cx) {
+                    std::task::Poll::Pending if sync.refresh_gate.try_lock().is_err() => {
+                        std::task::Poll::Ready(())
+                    }
+                    std::task::Poll::Pending => {
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                    std::task::Poll::Ready(result) => {
+                        panic!("refresh stopped before waiting for ownership: {result:?}")
+                    }
+                }
+            })
+            .await;
+            let refresh = tokio::spawn(refresh_future);
+
+            let (probe_tx, mut probe_rx) = tokio::sync::oneshot::channel();
+            let blocking_probe = tokio::task::spawn_blocking(move || {
+                let _ = probe_tx.send(());
+            });
+            barrier_release_tx.send(()).unwrap();
+            blocking_barrier.await.unwrap();
+            assert!(
+                tokio::time::timeout(StdDuration::from_millis(100), &mut probe_rx)
+                    .await
+                    .is_err(),
+                "process-lock waiter did not occupy the blocking worker"
+            );
+            refresh.abort();
+            let _ = refresh.await;
+
+            let waiter_stopped =
+                tokio::time::timeout(StdDuration::from_secs(1), &mut probe_rx).await;
+            drop(database_guard);
+            blocking_probe.await.unwrap();
+            assert!(
+                waiter_stopped.is_ok(),
+                "aborted refresh left its process-lock worker blocking the runtime"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_dispatched_refresh_keeps_ownership_until_replace_finishes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc as std_mpsc,
+        };
+        use tokio::sync::{Notify, mpsc};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release_first_response = Arc::new(Notify::new());
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/prices.json",
+            get({
+                let calls = calls.clone();
+                let release_first_response = release_first_response.clone();
+                move || {
+                    let calls = calls.clone();
+                    let release_first_response = release_first_response.clone();
+                    let request_tx = request_tx.clone();
+                    async move {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        request_tx.send(call).unwrap();
+                        if call == 0 {
+                            release_first_response.notified().await;
+                        }
+                        let input = if call == 0 { 0.000001 } else { 0.000009 };
+                        Json(json!({
+                            "openai/gpt-5.5": {
+                                "input_cost_per_token": input,
+                                "output_cost_per_token": 0.000030
+                            }
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
+        let config = PricingConfig {
+            url: format!("http://{address}/prices.json"),
+            refresh_interval_hours: 24,
+            timeout_seconds: 2,
+        };
+        let executor = DbExecutor::new(3, 1);
+        let sync = PricingSync::new(executor.clone());
+
+        let mut write_connection = db.connect().unwrap();
+        let write_lock = write_connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+
+        let first = {
+            let sync = sync.clone();
+            let db = db.clone();
+            let config = config.clone();
+            tokio::spawn(async move { sync.force_sync(&db, &config).await })
+        };
+        assert_eq!(request_rx.recv().await, Some(0));
+
+        let (blocker_release_tx, blocker_release_rx) = std_mpsc::channel();
+        let (blocker_started_tx, mut blocker_started_rx) = mpsc::unbounded_channel();
+        let executor_blocker = {
+            let executor = executor.clone();
+            tokio::spawn(async move {
+                executor
+                    .run(WorkClass::Light, move || {
+                        blocker_started_tx.send(()).unwrap();
+                        let _ = blocker_release_rx.recv();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        blocker_started_rx.recv().await.unwrap();
+        release_first_response.notify_one();
+
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            loop {
+                match tokio::time::timeout(
+                    StdDuration::from_millis(20),
+                    executor.run(WorkClass::Light, || Ok(())),
+                )
+                .await
+                {
+                    Err(_) => break,
+                    Ok(result) => result.unwrap(),
+                }
+            }
+        })
+        .await
+        .expect("pricing replacement was not dispatched to the blocking executor");
+
+        first.abort();
+        let _ = first.await;
+        assert!(
+            sync.refresh_gate.try_lock().is_err(),
+            "aborting the caller released in-process refresh ownership"
+        );
+        let lock_probe_cancelled = AtomicBool::new(false);
+        let lock_error = DatabaseLock::acquire_interruptible(
+            &db,
+            "pricing-refresh",
+            StdDuration::ZERO,
+            &lock_probe_cancelled,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{lock_error:#}").contains("timed out waiting for process lock"),
+            "detached replacement released database ownership: {lock_error:#}"
+        );
+        let second = {
+            let sync = PricingSync::new(executor.clone());
+            let db = db.clone();
+            let config = config.clone();
+            tokio::spawn(async move { sync.force_sync(&db, &config).await })
+        };
+
+        drop(write_lock);
+        blocker_release_tx.send(()).unwrap();
+        executor_blocker.await.unwrap().unwrap();
+        let second_request = tokio::time::timeout(StdDuration::from_secs(2), request_rx.recv())
+            .await
+            .expect("next refresh did not start after terminal replacement finished")
+            .expect("pricing fixture server stopped before the next refresh");
+        assert_eq!(second_request, 1);
+        assert_eq!(second.await.unwrap().unwrap(), 1);
         server.abort();
     }
 

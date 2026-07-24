@@ -14,6 +14,21 @@ const WAL_RETRY_MAX_DELAY: Duration = Duration::from_millis(50);
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_1)];
+const REQUIRED_RUNTIME_INDEXES: &str = "
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_rollout ON agent_runs(rollout_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_parent_rollout
+        ON agent_runs(parent_rollout_id) WHERE rollout_id IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_turns_rollout ON turns(rollout_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_rollout ON messages(rollout_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_turn ON messages(turn_id);
+    CREATE INDEX IF NOT EXISTS idx_events_rollout_kind ON events(rollout_id, kind);
+    CREATE INDEX IF NOT EXISTS idx_events_agent_run ON events(agent_run_id);
+    CREATE INDEX IF NOT EXISTS idx_events_subagent_agent_time
+        ON events(json_extract(payload_json, '$.agent_thread_id'), timestamp)
+        WHERE kind = 'subagent';
+    CREATE INDEX IF NOT EXISTS idx_tools_turn ON tool_calls(turn_id);
+    CREATE INDEX IF NOT EXISTS idx_usage_rollout ON usage_facts(rollout_id);
+";
 
 #[derive(Clone, Debug)]
 pub struct Db {
@@ -33,6 +48,10 @@ impl Db {
         pricing_config: impl AsRef<Path>,
     ) -> Result<Self> {
         let path = canonicalize_storage_path(path.as_ref())?;
+        reject_multiply_linked_storage(
+            &path,
+            "SQLite locks and WAL sidecars require one path identity",
+        )?;
         // Probe an existing database read-only before WAL setup, permission
         // repair, migrations, seeding, or pricing hydration can mutate it.
         // An older binary must never try to reinterpret a newer schema.
@@ -52,6 +71,7 @@ impl Db {
         restrict_private_file(&db.path)?;
         enable_wal(&connection)?;
         migrate(&connection)?;
+        ensure_runtime_indexes(&connection)?;
         seed_pricing(&connection)?;
         restrict_sqlite_sidecars(&db.path)?;
         drop(connection);
@@ -65,6 +85,19 @@ impl Db {
 
     pub fn manual_pricing(&self) -> &ManualPricingStore {
         &self.manual_pricing
+    }
+
+    pub fn storage_bytes(&self) -> u64 {
+        [
+            self.path.clone(),
+            sqlite_sidecar_path(&self.path, "-wal"),
+            sqlite_sidecar_path(&self.path, "-shm"),
+        ]
+        .into_iter()
+        .filter_map(|path| std::fs::metadata(path).ok())
+        .fold(0_u64, |total, metadata| {
+            total.saturating_add(metadata.len())
+        })
     }
 
     pub fn connect(&self) -> Result<Connection> {
@@ -117,6 +150,31 @@ pub(crate) fn canonicalize_storage_path(path: &Path) -> Result<PathBuf> {
     let parent = std::fs::canonicalize(parent)
         .with_context(|| format!("failed to resolve {}", parent.display()))?;
     Ok(parent.join(file_name))
+}
+
+#[cfg(unix)]
+pub(crate) fn reject_multiply_linked_storage(path: &Path, reason: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let links = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.nlink(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if links > 1 {
+        bail!(
+            "refusing multiply-linked storage file {}: {reason}",
+            path.display(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn reject_multiply_linked_storage(_path: &Path, _reason: &str) -> Result<()> {
+    Ok(())
 }
 
 fn enable_wal(connection: &Connection) -> Result<()> {
@@ -197,6 +255,19 @@ fn migrate(connection: &Connection) -> Result<()> {
     for &(version, sql) in MIGRATIONS {
         apply_migration(connection, version, sql)?;
     }
+    Ok(())
+}
+
+/// Repair performance-critical indexes that were added after the schema was
+/// squashed to migration 1. Existing projections legitimately already report
+/// migration 1, so migration bookkeeping alone cannot deliver these indexes.
+///
+/// Keep this list limited to idempotent, data-preserving additions. Semantic
+/// projection changes belong to the projector-generation replay boundary.
+fn ensure_runtime_indexes(connection: &Connection) -> Result<()> {
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+    transaction.execute_batch(REQUIRED_RUNTIME_INDEXES)?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -358,6 +429,125 @@ mod tests {
             })
             .unwrap();
         assert_eq!(foreign_key_errors, 0);
+    }
+
+    #[test]
+    fn reopening_version_one_database_restores_rollout_replay_indexes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usage.db");
+        let db = Db::open(&path).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX idx_agent_runs_rollout;
+                 DROP INDEX idx_agent_runs_parent_rollout;
+                 DROP INDEX idx_turns_rollout;
+                 DROP INDEX idx_messages_rollout;
+                 DROP INDEX idx_messages_turn;
+                 DROP INDEX idx_events_rollout_kind;
+                 DROP INDEX idx_events_agent_run;
+                 DROP INDEX idx_events_subagent_agent_time;
+                 DROP INDEX idx_tools_turn;
+                 DROP INDEX idx_usage_rollout;
+                 INSERT INTO app_meta(key,value)
+                    VALUES('runtime-index-repair-sentinel','preserved');",
+            )
+            .unwrap();
+        let migration: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(migration, 1);
+        drop(connection);
+        drop(db);
+
+        let reopened = Db::open(&path).unwrap();
+        let connection = reopened.connect().unwrap();
+        let sentinel: String = connection
+            .query_row(
+                "SELECT value FROM app_meta
+                 WHERE key='runtime-index-repair-sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sentinel, "preserved");
+        let replay_queries = [
+            (
+                "idx_agent_runs_rollout",
+                "SELECT rowid FROM agent_runs WHERE rollout_id='rollout'",
+            ),
+            (
+                "idx_agent_runs_parent_rollout",
+                "SELECT rowid FROM agent_runs
+                 WHERE parent_rollout_id='rollout' AND rollout_id IS NULL",
+            ),
+            (
+                "idx_turns_rollout",
+                "SELECT rowid FROM turns WHERE rollout_id='rollout'",
+            ),
+            (
+                "idx_messages_rollout",
+                "SELECT rowid FROM messages WHERE rollout_id='rollout'",
+            ),
+            (
+                "idx_messages_turn",
+                "SELECT rowid FROM messages WHERE turn_id='turn'",
+            ),
+            (
+                "idx_events_rollout_kind",
+                "SELECT rowid FROM events
+                 WHERE rollout_id='rollout' AND kind='subagent'",
+            ),
+            (
+                "idx_events_agent_run",
+                "SELECT rowid FROM events WHERE agent_run_id='agent'",
+            ),
+            (
+                "idx_events_subagent_agent_time",
+                "SELECT rowid FROM events
+                 WHERE kind='subagent'
+                   AND json_extract(payload_json,'$.agent_thread_id')='agent'
+                   AND timestamp>'2026-01-01T00:00:00Z'",
+            ),
+            (
+                "idx_tools_turn",
+                "SELECT rowid FROM tool_calls WHERE turn_id='turn'",
+            ),
+            (
+                "idx_usage_rollout",
+                "SELECT rowid FROM usage_facts WHERE rollout_id='rollout'",
+            ),
+        ];
+
+        for (index, query) in replay_queries {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master
+                        WHERE type='index' AND name=?1
+                     )",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{index} was not restored");
+
+            let explain = format!("EXPLAIN QUERY PLAN {query}");
+            let plan = connection
+                .prepare(&explain)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                plan.contains(index),
+                "{query} did not use {index}; query plan:\n{plan}"
+            );
+        }
     }
 
     #[test]
@@ -717,6 +907,18 @@ mod tests {
     }
 
     #[test]
+    fn storage_bytes_include_wal_and_shared_memory_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usage.db");
+        let db = Db::open(&path).unwrap();
+        let main_bytes = std::fs::metadata(&path).unwrap().len();
+        std::fs::write(sqlite_sidecar_path(&path, "-wal"), [0_u8; 7]).unwrap();
+        std::fs::write(sqlite_sidecar_path(&path, "-shm"), [0_u8; 11]).unwrap();
+
+        assert_eq!(db.storage_bytes(), main_bytes + 18);
+    }
+
+    #[test]
     fn nonexistent_storage_path_uses_canonical_parent_identity() {
         let temp = tempfile::tempdir().unwrap();
         let nested = temp.path().join("new").join("projection.db");
@@ -755,6 +957,19 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_hardlink_alias_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("real.db");
+        let alias = temp.path().join("alias.db");
+        drop(Db::open(&target).unwrap());
+        std::fs::hard_link(&target, &alias).unwrap();
+
+        let error = Db::open(&alias).unwrap_err().to_string();
+        assert!(error.contains("multiply-linked storage file"), "{error}");
     }
 
     #[test]

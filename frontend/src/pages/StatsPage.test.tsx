@@ -90,8 +90,11 @@ describe('StatsPage', () => {
 
     await waitFor(() => expect(stats).toHaveBeenCalledWith(range, expectedAnchor, expect.any(AbortSignal)))
     const previous = screen.getByRole('button', { name: 'PREVIOUS' })
-    expect(previous).toBeDisabled()
+    expect(previous).toHaveAttribute('aria-disabled', 'true')
+    expect(previous).not.toBeDisabled()
+    previous.focus()
     fireEvent.click(previous)
+    expect(previous).toHaveFocus()
     expect(screen.getByTestId('location')).toHaveTextContent(`?range=${range}&anchor=${expectedAnchor}`)
   })
 
@@ -120,8 +123,11 @@ describe('StatsPage', () => {
 
     await waitFor(() => expect(stats).toHaveBeenCalledWith(range, expectedAnchor, expect.any(AbortSignal)))
     const next = screen.getByRole('button', { name: 'NEXT' })
-    expect(next).toBeDisabled()
+    expect(next).toHaveAttribute('aria-disabled', 'true')
+    expect(next).not.toBeDisabled()
+    next.focus()
     fireEvent.click(next)
+    expect(next).toHaveFocus()
     expect(screen.getByTestId('location')).toHaveTextContent(`?range=${range}&anchor=${expectedAnchor}`)
   })
 
@@ -213,7 +219,7 @@ describe('StatsPage', () => {
 
       await waitFor(() => expect(stats).toHaveBeenCalledWith('month', '2026-07-01', expect.any(AbortSignal)))
       expect(screen.getByTestId('location')).toHaveTextContent('?range=month&anchor=2026-07-01')
-      expect(screen.getByRole('button', { name: 'NEXT' })).toBeDisabled()
+      expect(screen.getByRole('button', { name: 'NEXT' })).toHaveAttribute('aria-disabled', 'true')
 
       view.unmount()
       clearAsyncCache()
@@ -228,10 +234,12 @@ describe('StatsPage', () => {
       await waitFor(() => expect(stats).toHaveBeenCalledWith('year', '2025-01-01', expect.any(AbortSignal)))
       const next = screen.getByRole('button', { name: 'NEXT' })
       expect(next).toBeEnabled()
+      next.focus()
       fireEvent.click(next)
       await waitFor(() => expect(stats).toHaveBeenLastCalledWith('year', '2026-01-01', expect.any(AbortSignal)))
       expect(screen.getByTestId('location')).toHaveTextContent('?range=year&anchor=2026-01-01')
-      expect(screen.getByRole('button', { name: 'NEXT' })).toBeDisabled()
+      expect(screen.getByRole('button', { name: 'NEXT' })).toHaveAttribute('aria-disabled', 'true')
+      expect(next).toHaveFocus()
     } finally {
       vi.useRealTimers()
     }

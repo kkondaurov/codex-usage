@@ -1,4 +1,4 @@
-use crate::db::{Db, canonicalize_storage_path};
+use crate::db::{Db, canonicalize_storage_path, reject_multiply_linked_storage};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -9,15 +9,21 @@ use std::{
     io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 #[cfg(unix)]
 use std::{
     os::fd::AsRawFd,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    thread,
+    time::Instant,
 };
 use thiserror::Error;
 
 const CONFIG_VERSION: u32 = 1;
+const PRICING_FILE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const PRICING_FILE_LOCK_RETRY: Duration = Duration::from_millis(25);
 pub const MAX_MODEL_ID_CHARS: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,8 +80,10 @@ pub struct ManualPricingStore {
 
 impl ManualPricingStore {
     pub fn new(path: PathBuf) -> Result<Self> {
+        let path = canonicalize_storage_path(&path)?;
+        reject_pricing_hardlinks(&path)?;
         Ok(Self {
-            path: canonicalize_storage_path(&path)?,
+            path,
             lock: Arc::new(Mutex::new(())),
         })
     }
@@ -111,6 +119,7 @@ impl ManualPricingStore {
                 &transaction,
                 &alias.observed_model_id,
                 &alias.canonical_model_id,
+                false,
             )? {
                 return Err(anyhow!(message));
             }
@@ -232,7 +241,7 @@ impl ManualPricingStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| MutationError::Storage(error.into()))?;
 
-        if let Some(message) = alias_validation_message(&transaction, observed, canonical)
+        if let Some(message) = alias_validation_message(&transaction, observed, canonical, true)
             .map_err(MutationError::Storage)?
         {
             return Err(validation(message));
@@ -278,12 +287,24 @@ impl ManualPricingStore {
                 [observed],
             )
             .map_err(|error| MutationError::Storage(error.into()))?;
+        if let Some(message) =
+            resolved_alias_layer_validation_message_for_observed(&transaction, observed)
+                .map_err(MutationError::Storage)?
+        {
+            return Err(validation(format!(
+                "cannot delete alias {observed}: {message}"
+            )));
+        }
         self.write_then_commit(&previous, &config, || {
             transaction.commit().map_err(Into::into)
         })
     }
 
     fn load_unlocked(&self) -> Result<ManualPricingConfig> {
+        // Recheck under the store/file-lock boundary. A second hard link may
+        // have been created after startup; continuing would derive a distinct
+        // lock path and an atomic rename would silently split the aliases.
+        reject_pricing_hardlinks(&self.path)?;
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Default::default()),
@@ -332,12 +353,14 @@ impl ManualPricingStore {
             .open(&path)
             .with_context(|| format!("failed to open {}", path.display()))?;
         repair_private_permissions(&file, &path)?;
-        lock_file(&file).with_context(|| format!("failed to lock {}", path.display()))?;
+        lock_file(&file, PRICING_FILE_LOCK_TIMEOUT)
+            .with_context(|| format!("failed to lock {}", path.display()))?;
         Ok(PricingFileLock { file })
     }
 
     fn write_unlocked(&self, config: &ManualPricingConfig) -> Result<()> {
         validate_config(config)?;
+        reject_pricing_hardlinks(&self.path)?;
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -399,6 +422,13 @@ impl ManualPricingStore {
     }
 }
 
+fn reject_pricing_hardlinks(path: &Path) -> Result<()> {
+    reject_multiply_linked_storage(
+        path,
+        "pricing locks and atomic replacement require one path identity",
+    )
+}
+
 struct PricingFileLock {
     file: File,
 }
@@ -410,22 +440,32 @@ impl Drop for PricingFileLock {
 }
 
 #[cfg(unix)]
-fn lock_file(file: &File) -> Result<()> {
+fn lock_file(file: &File, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
     loop {
         // SAFETY: `file` owns a valid descriptor for the duration of this call.
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
             return Ok(());
         }
         let error = std::io::Error::last_os_error();
-        if error.kind() != ErrorKind::Interrupted {
-            return Err(error.into());
+        match error.kind() {
+            ErrorKind::Interrupted => continue,
+            ErrorKind::WouldBlock if started.elapsed() < timeout => {
+                thread::sleep(
+                    PRICING_FILE_LOCK_RETRY.min(timeout.saturating_sub(started.elapsed())),
+                );
+            }
+            ErrorKind::WouldBlock => {
+                return Err(anyhow!("timed out waiting for pricing config lock"));
+            }
+            _ => return Err(error.into()),
         }
     }
 }
 
 #[cfg(not(unix))]
-fn lock_file(_file: &File) -> Result<()> {
+fn lock_file(_file: &File, _timeout: Duration) -> Result<()> {
     Ok(())
 }
 
@@ -513,17 +553,13 @@ fn alias_validation_message(
     connection: &rusqlite::Connection,
     observed: &str,
     canonical: &str,
+    require_priced_target: bool,
 ) -> Result<Option<String>> {
     let target_exists: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM resolved_model_prices WHERE model_id=?1)",
         [canonical],
         |row| row.get(0),
     )?;
-    if !target_exists {
-        return Ok(Some(format!(
-            "canonical model {canonical} does not have a price"
-        )));
-    }
 
     let target_is_alias: Option<String> = connection
         .query_row(
@@ -550,6 +586,90 @@ fn alias_validation_message(
     if observed_is_target.is_some() {
         return Ok(Some(format!(
             "model {observed} is already an alias target; alias chains are not supported"
+        )));
+    }
+
+    // The sidecar is durable while the SQLite projection is disposable. On a
+    // fresh projection, a valid alias may temporarily point at a remote-only
+    // model whose price has not been restored yet. Hydration still rejects
+    // malformed IDs, self-maps, and chains, while interactive mutations and
+    // the completed remote snapshot require a priced target.
+    if require_priced_target && !target_exists {
+        return Ok(Some(format!(
+            "canonical model {canonical} does not have a price"
+        )));
+    }
+
+    Ok(None)
+}
+
+pub(crate) fn resolved_alias_layer_validation_message(
+    connection: &rusqlite::Connection,
+) -> Result<Option<String>> {
+    resolved_alias_layer_validation_message_scoped(connection, None)
+}
+
+fn resolved_alias_layer_validation_message_for_observed(
+    connection: &rusqlite::Connection,
+    observed: &str,
+) -> Result<Option<String>> {
+    resolved_alias_layer_validation_message_scoped(connection, Some(observed))
+}
+
+fn resolved_alias_layer_validation_message_scoped(
+    connection: &rusqlite::Connection,
+    affected_observed: Option<&str>,
+) -> Result<Option<String>> {
+    let chain: Option<(String, String)> = connection
+        .query_row(
+            "SELECT a.observed_model_id,a.canonical_model_id
+             FROM resolved_model_aliases a
+             WHERE (
+                    ?1 IS NULL
+                    OR a.observed_model_id=?1
+                    OR a.canonical_model_id=?1
+                 )
+               AND (
+                    a.observed_model_id=a.canonical_model_id
+                    OR EXISTS(
+                        SELECT 1 FROM resolved_model_aliases target
+                        WHERE target.observed_model_id=a.canonical_model_id
+                    )
+                 )
+             ORDER BY a.observed_model_id
+             LIMIT 1",
+            [affected_observed],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((observed, canonical)) = chain {
+        return Ok(Some(format!(
+            "alias {observed} pointing through alias {canonical}; alias chains are not supported"
+        )));
+    }
+
+    let dangling: Option<(String, String)> = connection
+        .query_row(
+            "SELECT a.observed_model_id,a.canonical_model_id
+             FROM resolved_model_aliases a
+             WHERE (
+                    ?1 IS NULL
+                    OR a.observed_model_id=?1
+                    OR a.canonical_model_id=?1
+                 )
+               AND NOT EXISTS(
+                    SELECT 1 FROM resolved_model_prices price
+                    WHERE price.model_id=a.canonical_model_id
+                 )
+             ORDER BY a.observed_model_id
+             LIMIT 1",
+            [affected_observed],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((observed, canonical)) = dangling {
+        return Ok(Some(format!(
+            "alias {observed} pointing to unpriced model {canonical}"
         )));
     }
 
@@ -733,6 +853,34 @@ mod tests {
         assert_eq!(alias, "manual-model");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn multiply_linked_pricing_config_is_rejected_before_read_or_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("pricing.json");
+        let alias = temp.path().join("pricing-alias.json");
+        fs::write(
+            &primary,
+            serde_json::to_vec(&ManualPricingConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let store = ManualPricingStore::new(primary).unwrap();
+        fs::hard_link(store.path(), &alias).unwrap();
+
+        let read_error = store.load_unlocked().unwrap_err().to_string();
+        assert!(
+            read_error.contains("multiply-linked storage file"),
+            "{read_error}"
+        );
+        assert!(read_error.contains("atomic replacement"), "{read_error}");
+
+        let startup_error = ManualPricingStore::new(alias).unwrap_err().to_string();
+        assert!(
+            startup_error.contains("multiply-linked storage file"),
+            "{startup_error}"
+        );
+    }
+
     #[test]
     fn manual_pricing_rejects_unbounded_model_identifiers() {
         let temp = tempfile::tempdir().unwrap();
@@ -905,6 +1053,36 @@ mod tests {
             )
             .unwrap();
         assert!(stored);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advisory_lock_wait_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pricing.lock");
+        let first = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        lock_file(&first, Duration::from_secs(1)).unwrap();
+
+        let started = Instant::now();
+        let error = lock_file(&second, Duration::from_millis(75)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() >= Duration::from_millis(75));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        unlock_file(&first);
+        lock_file(&second, Duration::from_millis(75)).unwrap();
+        unlock_file(&second);
     }
 
     #[cfg(unix)]

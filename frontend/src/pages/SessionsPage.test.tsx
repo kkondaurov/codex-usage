@@ -55,6 +55,9 @@ describe('SessionsPage cost history', () => {
 
     expect(container.querySelector('.sessions-ledger')).toHaveClass('page-ledger-frame')
     expect(screen.getByRole('table', { name: 'Sessions' })).toContainElement(row)
+    expect(screen.getByRole('table', { name: 'Sessions' })).toHaveAttribute('aria-rowcount', '2')
+    expect(screen.getByRole('row', { name: /SESSION PROJECT/ })).toHaveAttribute('aria-rowindex', '1')
+    expect(row).toHaveAttribute('aria-rowindex', '2')
     expect(screen.getAllByRole('columnheader')).toHaveLength(7)
     expect(within(row).getAllByRole('cell')).toHaveLength(7)
     expect(within(cost as HTMLElement).getByText('$2.00')).toBeVisible()
@@ -163,6 +166,33 @@ describe('SessionsPage cost history', () => {
     expect(await screen.findByRole('link', { name: /Second page session/ })).toBeVisible()
     expect(nextPage).toHaveFocus()
     expect(nextPage).not.toHaveAttribute('aria-disabled')
+  })
+
+  it('keeps NEXT focused and semantically disabled after reaching the final page', async () => {
+    let resolveSecond!: (value: Awaited<ReturnType<typeof api.sessions>>) => void
+    const second = new Promise<Awaited<ReturnType<typeof api.sessions>>>(resolve => { resolveSecond = resolve })
+    vi.spyOn(api, 'sessions')
+      .mockResolvedValueOnce({ items: [session()], page: 1, pageSize: 50, total: 100, totalPages: 2, projects: ['codex-usage'] })
+      .mockReturnValueOnce(second)
+
+    render(<MemoryRouter initialEntries={['/sessions']}><SessionsPage /></MemoryRouter>)
+
+    const next = await screen.findByRole('button', { name: 'NEXT' })
+    next.focus()
+    fireEvent.click(next)
+    await waitFor(() => expect(api.sessions).toHaveBeenCalledTimes(2))
+    expect(next).toHaveFocus()
+    expect(next).toHaveAttribute('aria-disabled', 'true')
+
+    resolveSecond({ items: [session({ id: 'session-2', title: 'Final page session' })], page: 2, pageSize: 50, total: 100, totalPages: 2, projects: ['codex-usage'] })
+    const finalRow = (await screen.findByRole('link', { name: /Final page session/ })).closest('[role="row"]')
+    expect(finalRow).toHaveAttribute('aria-rowindex', '52')
+    expect(next).toHaveFocus()
+    expect(next).not.toBeDisabled()
+    expect(next).toHaveAttribute('aria-disabled', 'true')
+
+    fireEvent.click(next)
+    expect(api.sessions).toHaveBeenCalledTimes(2)
   })
 
   it('keeps retained pagination inert after a replacement page fails', async () => {

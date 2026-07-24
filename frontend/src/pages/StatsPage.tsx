@@ -88,7 +88,7 @@ export function StatsPage() {
       <PageTitle>Stats</PageTitle>
       <div className="stats-controls">
         <div className="period-tabs" role="tablist" aria-label="Stats period">{RANGES.map(item => <button type="button" role="tab" aria-selected={range === item.value} aria-controls="stats-range-panel" tabIndex={range === item.value ? 0 : -1} key={item.value} className={range === item.value ? 'active' : ''} onKeyDown={event => handleTabKeyDown(event, RANGE_VALUES, range, selectRange)} onClick={() => selectRange(item.value)}>{item.label}</button>)}</div>
-        {range !== 'all' && <div className="stats-navigator"><button type="button" disabled={!canPrevious} onClick={() => navigateRange(-1)}>PREVIOUS</button><strong>{data?.label ?? '…'}</strong><button type="button" disabled={!canNext} onClick={() => navigateRange(1)}>NEXT</button></div>}
+        {range !== 'all' && <div className="stats-navigator"><button type="button" aria-disabled={!canPrevious || undefined} onClick={() => { if (canPrevious) navigateRange(-1) }}>PREVIOUS</button><strong>{data?.label ?? '…'}</strong><button type="button" aria-disabled={!canNext || undefined} onClick={() => { if (canNext) navigateRange(1) }}>NEXT</button></div>}
       </div>
       <section id="stats-range-panel" className="stats-ledger" role="tabpanel" aria-label={`${range} statistics`} aria-busy={loading || undefined}>
         {error && !data ? <ErrorState error={error} onRetry={() => void refresh()} /> : null}

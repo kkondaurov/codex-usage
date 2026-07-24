@@ -2715,7 +2715,8 @@ async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() 
     assert!(unknown["source"].is_null());
     assert!(unknown.get("observedUnknown").is_none());
     let unknown_metadata = get_json(&harness.app, "/api/v1/prices/metadata").await;
-    assert!(unknown_metadata["aliasesTotal"].as_u64().is_some());
+    assert!(unknown_metadata.get("aliases").is_none());
+    assert!(unknown_metadata.get("aliasesTotal").is_none());
     assert!(unknown_metadata["observedUnknownTotal"].as_u64().unwrap() >= 1);
     assert!(
         unknown_metadata["observedUnknown"]
@@ -2811,13 +2812,23 @@ async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() 
     assert!(listed.get("aliases").is_none());
     assert!(listed.get("observedUnknown").is_none());
     let metadata = get_json(&harness.app, "/api/v1/prices/metadata").await;
-    assert!(metadata["aliasesTotal"].as_u64().unwrap() >= 1);
+    assert!(metadata.get("aliases").is_none());
+    assert!(metadata.get("aliasesTotal").is_none());
     assert_eq!(metadata["observedUnknownTotal"], 0);
-    assert!(metadata["aliases"].as_array().unwrap().iter().any(|row| {
-        row["observedModelId"] == "codex-auto-review"
-            && row["canonicalModelId"] == "contract-test-model"
-    }));
     assert!(metadata["observedUnknown"].as_array().unwrap().is_empty());
+    let alias_page = get_json(&harness.app, "/api/v1/aliases?q=CONTRACT&page=1&pageSize=1").await;
+    assert_eq!(alias_page["page"], 1);
+    assert_eq!(alias_page["pageSize"], 1);
+    assert_eq!(alias_page["total"], 1);
+    assert_eq!(alias_page["totalPages"], 1);
+    assert_eq!(
+        alias_page["items"][0]["observedModelId"],
+        "codex-auto-review"
+    );
+    assert_eq!(
+        alias_page["items"][0]["canonicalModelId"],
+        "contract-test-model"
+    );
     let effective_from = listed["items"][0]["effectiveFrom"].as_str().unwrap();
 
     let (status, _, _) = raw_request(
@@ -2828,6 +2839,13 @@ async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() 
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+    let aliases_after_delete = get_json(
+        &harness.app,
+        "/api/v1/aliases?q=contract-test&page=1&pageSize=25",
+    )
+    .await;
+    assert_eq!(aliases_after_delete["total"], 0);
+    assert!(aliases_after_delete["items"].as_array().unwrap().is_empty());
     let unpriced_again = get_json(
         &harness.app,
         &format!("/api/v1/sessions/{GUARDIAN_SESSION}/summary"),
@@ -2859,6 +2877,39 @@ async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() 
     assert!(refreshed["updated"].as_u64().unwrap() > 0);
     let refreshed_prices = get_json(&harness.app, "/api/v1/prices?page=1&pageSize=25").await;
     assert_eq!(refreshed_prices["source"], pricing_url);
+}
+
+#[tokio::test]
+async fn alias_search_normalizes_unicode_and_paginates_deterministically() {
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO model_aliases(
+                observed_model_id,canonical_model_id,created_at,source
+             ) VALUES
+                ('MÜNCHEN-É-02','gpt-5.5','2026-01-01T00:00:00Z','remote:test'),
+                ('MÜNCHEN-É-01','gpt-5.5','2026-01-01T00:00:00Z','remote:test');",
+        )
+        .unwrap();
+    drop(connection);
+
+    let first = get_json(
+        &harness.app,
+        "/api/v1/aliases?q=m%C3%BCnchen-e%CC%81&page=1&pageSize=1",
+    )
+    .await;
+    assert_eq!(first["total"], 2);
+    assert_eq!(first["totalPages"], 2);
+    assert_eq!(first["items"][0]["observedModelId"], "MÜNCHEN-É-01");
+
+    let second = get_json(
+        &harness.app,
+        "/api/v1/aliases?q=m%C3%BCnchen-e%CC%81&page=2&pageSize=1",
+    )
+    .await;
+    assert_eq!(second["total"], 2);
+    assert_eq!(second["items"][0]["observedModelId"], "MÜNCHEN-É-02");
 }
 
 #[tokio::test]
@@ -3541,6 +3592,64 @@ async fn browser_boundary_rejects_rebinding_and_cross_origin_mutations() {
         "frame-ancestors 'none'"
     );
     assert_eq!(response.headers()["x-frame-options"], "DENY");
+
+    for site in ["same-origin", "none"] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .header("host", "127.0.0.1:5610")
+                    .header("sec-fetch-site", site)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "site={site}");
+    }
+
+    for site in ["cross-site", "same-site"] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/overview/year?year=2026")
+                    .header("host", "127.0.0.1:5610")
+                    .header("sec-fetch-site", site)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "site={site}");
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"],
+            "cross-origin API requests are not allowed"
+        );
+    }
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header("host", "127.0.0.1:5610")
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "ordinary cross-site navigation to the local UI must remain usable"
+    );
 
     for (header, value, expected_error) in [
         (

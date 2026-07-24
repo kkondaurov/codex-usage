@@ -333,8 +333,8 @@ export function SessionsPage() {
       <section className="page-ledger-frame sessions-ledger" aria-busy={loading || undefined}>
           <div className="ledger-scroll sessions-scroll" role="region" aria-label="Scrollable sessions ledger" tabIndex={0}>
             <div className="ledger-banner">{data ? `${data.total.toLocaleString()} RESULTS` : loading ? 'LOADING RESULTS' : 'RESULTS UNAVAILABLE'}</div>
-            <div className="sessions-table" role="table" aria-label="Sessions" aria-rowcount={data ? data.total + 1 : undefined}>
-              <div className="sessions-head" role="row">
+            <div className="sessions-table" role="table" aria-label="Sessions" aria-rowcount={data && data.total > 0 ? data.total + 1 : undefined}>
+              <div className="sessions-head" role="row" aria-rowindex={data && data.total > 0 ? 1 : undefined}>
                 <span role="columnheader">SESSION</span><span role="columnheader">PROJECT / BRANCH</span>
                 <SortHeader label="LAST ACTIVITY" value="recent" sort={sort} onSort={value => update({ sort: value })} />
                 <SortHeader label="COST" value="cost" sort={sort} onSort={value => update({ sort: value })} />
@@ -344,8 +344,8 @@ export function SessionsPage() {
               {error && !data ? <div className="table-state-row" role="row"><div role="cell" aria-colspan={7}><ErrorState error={error} onRetry={() => void refresh()} /></div></div> : null}
               {data?.items.length === 0 ? (
               <div className="table-state-row" role="row"><div className="no-results" role="cell" aria-colspan={7}><strong>NO SESSIONS FOUND</strong><span>{querySearch ? `No sessions match “${querySearch}”.` : 'No sessions match the selected filters.'}</span><button type="button" className="clear-results" onClick={() => { setSearch(''); setSearchParams({}) }}>CLEAR FILTERS</button></div></div>
-            ) : data?.items.map(session => (
-              <div className={`session-row ${session.unpricedTokens > 0 ? 'unknown-price' : ''}`} role="row" key={session.id}>
+            ) : data?.items.map((session, index) => (
+              <div className={`session-row ${session.unpricedTokens > 0 ? 'unknown-price' : ''}`} role="row" aria-rowindex={(data.page - 1) * data.pageSize + index + 2} key={session.id}>
                 <span role="cell"><Link className="session-row-link" aria-label={`Open session ${session.title || 'Untitled session'}`} to={`/sessions/${session.id}`} /><strong>{session.title || 'Untitled session'}</strong><small>{session.id.slice(0, 8)}</small></span>
                 <span role="cell"><strong>{session.project || '—'}</strong><small>{session.branch || '—'}</small></span>
                 <time role="cell">{shortDateTime(session.lastEventAt)}</time>

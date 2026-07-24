@@ -1,93 +1,63 @@
-# Codex usage
+# Codex Usage
 
-`codex-usage` is a local-first browser application for exploring Codex sessions,
-activity, token usage, and estimated cost. It reads the active and archived Codex
-JSONL histories on this Mac, stores normalized facts in SQLite, and serves a
-React interface from the same Rust process.
+Codex Usage is a local dashboard for understanding how you use Codex. It turns
+the session history already stored on your Mac into searchable sessions,
+activity timelines, and summaries of token usage and estimated cost.
 
-## Shape
+## What you can explore
 
-- `src/` — Rust ingestion, SQLite queries, pricing, and Axum API/server.
-- `migrations/0001_initial.sql` — the complete SQLite schema for a fresh projection.
-- `frontend/` — React/TypeScript application.
-- `tests/fixtures/` — small real-data-derived histories used to validate lineage and
-  rich event representation.
+- See today, this week, and this month at a glance.
+- Browse, search, filter, and sort Codex sessions.
+- Open a session to review its messages, agents, tools, duration, tokens, and
+  estimated cost.
+- Compare usage over days, weeks, months, years, or your complete history.
+- Add model prices and aliases when a model is missing from the bundled pricing
+  data.
 
-The JSONL histories remain the source of truth. The database keeps distinct
-thread, rollout, turn, agent, event, tool, and usage identities. Fork lineage
-remains stored, while copied inherited records are not projected as new
-messages, events, tools, or usage.
+Everything runs on your computer and is served only on localhost. Codex Usage
+does not upload your session history. Costs are estimates based on the currently
+configured model prices; they are not an OpenAI bill.
 
-The SQLite file is a compact query projection, not a second copy of the
-histories. Tool calls retain only their identity, type, status, timing, lineage,
-and usage attribution. Tool arguments, results, raw payloads, generated images,
-and message attachments are never copied into SQLite or exposed by the API.
-Authored and captured text, assistant messages, and reasoning summaries remain
-available in Activity. The session ID links back to the full session in Codex
-when detailed source inspection is needed.
+The dashboard keeps the information needed for browsing and totals, but omits
+bulky tool inputs and outputs, attachments, and generated images. Every session
+page includes a link that opens the original thread in Codex when you want the
+complete record.
 
-User-visible task names come from Codex's append-only `session_index.jsonl`.
-Generated titles and later renames update without replaying the corresponding
-rollout. A rollout rename or compact first prompt is used only when that index
-does not contain the thread.
+## Run it
 
-Observed model IDs are retained verbatim; prices and explicit aliases are joined
-when totals are read, so adding a missing price or alias updates historical
-estimates immediately.
+You need Git, Rust, Node.js, and npm. The supported Rust and Node.js versions are
+pinned in the repository.
 
-## Run
-
-Run the application from the repository root. Startup rejects other working
-directories, and there is no installed-binary workflow.
-Rust and Node versions are pinned in `rust-toolchain.toml` and
-`frontend/.node-version`.
+From a fresh clone:
 
 ```sh
+git clone https://github.com/kkondaurov/codex-usage.git
+cd codex-usage
 npm --prefix frontend ci
 npm --prefix frontend run build
 cargo run
 ```
 
-`cargo run` starts the server and continuous ingestion. Run `cargo run -- ingest`
-for a one-shot ingestion pass. The default UI is served at
-<http://127.0.0.1:5610>. Use `--db`, `--sessions`, and `--archive` to run against
-an isolated database or fixture roots. Both `cargo run` and
-`cargo run -- serve` honor the `CODEX_USAGE_*` environment variables shown by
-`cargo run -- serve --help`.
-Manual prices and model aliases are saved in `codex-usage.pricing.json` beside
-the database. Use `--pricing-config` to choose another path.
+Then open <http://127.0.0.1:5610>.
 
-The SQLite projection is disposable. After a schema change, stop the server,
-rebuild `codex-usage.db` from the JSONL histories with `cargo run -- ingest`,
-then start the server again. The pricing JSON sidecar is independent of that
-rebuild.
+Run the application from the repository root and leave the terminal open while
+using it. Press `Ctrl-C` to stop it. The first launch may take a little longer
+while your existing Codex history is indexed.
 
-## Checks
+By default, Codex Usage reads `~/.codex/sessions` and
+`~/.codex/archived_sessions`. It stores its local database and pricing settings
+in the repository directory; those files are ignored by Git. New session
+activity is picked up automatically while the application is running.
+
+For a one-time refresh without starting the web interface:
 
 ```sh
-cargo test
-cargo check --all-targets --all-features
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-npm --prefix frontend test
-npm --prefix frontend run test:e2e:functional
-npm --prefix frontend run test:e2e:performance
-npm --prefix frontend run lint
-npm --prefix frontend run build
+cargo run -- ingest
 ```
 
-The ordinary debug suite skips the large-session Activity performance gates. Run
-both explicitly when changing Activity queries, attribution, rollups, or indexes.
-They cover a 500,000-event/tool session, deep numeric and cursor pages, and a
-separate 500,000-fact usage-heavy turn:
+To see optional paths, ports, and other configuration:
 
 ```sh
-cargo test --release --lib activity_large_session_query_and_assembly_stays_within_regression_budget -- --ignored --nocapture
-cargo test --release --lib activity_usage_heavy_queries_stay_under_one_second -- --nocapture
+cargo run -- serve --help
+cargo run -- ingest --help
 ```
-
-The browser suite builds and launches the real application against a temporary
-SQLite database, copied fixture session roots, and a loopback-only pricing
-server. It never reads the live Codex histories or `codex-usage.db`. Install its
-Chromium runtime once with `npm --prefix frontend run test:e2e:install` when
-Playwright requests it.

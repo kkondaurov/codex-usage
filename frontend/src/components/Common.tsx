@@ -67,6 +67,7 @@ export function Pagination({
   pageSize,
   onPage,
   busy = false,
+  ariaLabel = 'Pagination',
 }: {
   page: number
   totalPages: number
@@ -74,23 +75,26 @@ export function Pagination({
   pageSize: number
   onPage: (page: number) => void
   busy?: boolean
+  ariaLabel?: string
 }) {
   const first = total === 0 ? 0 : (page - 1) * pageSize + 1
   const last = Math.min(page * pageSize, total)
   const previousAtBoundary = page <= 1
   const nextAtBoundary = page >= totalPages
+  const previousUnavailable = busy || previousAtBoundary
+  const nextUnavailable = busy || nextAtBoundary
   return (
-    <nav className="pagination" aria-label="Pagination" aria-busy={busy || undefined}>
+    <nav className="pagination" aria-label={ariaLabel} aria-busy={busy || undefined}>
       <span>{first}–{last} / {total.toLocaleString()} · {pageSize} PER PAGE</span>
       <div className="pagination-controls">
-        <button type="button" disabled={previousAtBoundary} aria-disabled={busy && !previousAtBoundary ? true : undefined} onClick={() => { if (!busy && !previousAtBoundary) onPage(page - 1) }}>
+        <button type="button" aria-disabled={previousUnavailable || undefined} onClick={() => { if (!previousUnavailable) onPage(page - 1) }}>
           PREVIOUS
         </button>
         {pageNumbers(page, totalPages).map((value, index) => value === 'ellipsis'
           ? <span key={`e-${index}`}>…</span>
           : <button key={value} type="button" aria-disabled={busy || undefined} aria-current={value === page ? 'page' : undefined} className={value === page ? 'active' : ''} onClick={() => { if (!busy) onPage(value) }}>{String(value).padStart(2, '0')}</button>
         )}
-        <button type="button" disabled={nextAtBoundary} aria-disabled={busy && !nextAtBoundary ? true : undefined} onClick={() => { if (!busy && !nextAtBoundary) onPage(page + 1) }}>
+        <button type="button" aria-disabled={nextUnavailable || undefined} onClick={() => { if (!nextUnavailable) onPage(page + 1) }}>
           NEXT
         </button>
       </div>

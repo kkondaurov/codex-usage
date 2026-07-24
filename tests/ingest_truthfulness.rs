@@ -91,6 +91,10 @@ fn message(timestamp: &str, id: &str, text: String) -> Value {
     })
 }
 
+fn projected_message_id(source_id: &str) -> String {
+    format!("message:{}", json!([OWNER, source_id]))
+}
+
 fn api(db: Db, roots: IngestRoots, frontend: PathBuf) -> Router {
     router(ApiState::new(
         db,
@@ -170,11 +174,11 @@ fn source_timestamps_are_fixed_width_utc_and_sort_chronologically() {
         ordered,
         vec![
             (
-                "earlier-message".into(),
+                projected_message_id("earlier-message"),
                 "2025-12-31T22:45:00.000000000Z".into(),
             ),
             (
-                "later-message".into(),
+                projected_message_id("later-message"),
                 "2025-12-31T23:00:00.000000000Z".into(),
             ),
         ]
@@ -334,8 +338,8 @@ fn preserved_mtime_same_size_rewrite_is_reprojected() {
     let connection = harness.db.connect().unwrap();
     let content: String = connection
         .query_row(
-            "SELECT content FROM messages WHERE id='large-message'",
-            [],
+            "SELECT content FROM messages WHERE id=?1",
+            [projected_message_id("large-message")],
             |row| row.get(0),
         )
         .unwrap();
@@ -388,16 +392,16 @@ fn preserved_mtime_middle_rewrite_plus_append_rebuilds_the_prefix() {
     let connection = harness.db.connect().unwrap();
     let content: String = connection
         .query_row(
-            "SELECT content FROM messages WHERE id='large-message'",
-            [],
+            "SELECT content FROM messages WHERE id=?1",
+            [projected_message_id("large-message")],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(content.as_bytes()[100_000], b'b');
     let appended: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM messages WHERE id='appended-message'",
-            [],
+            "SELECT COUNT(*) FROM messages WHERE id=?1",
+            [projected_message_id("appended-message")],
             |row| row.get(0),
         )
         .unwrap();

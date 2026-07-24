@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Datelike, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -43,6 +43,15 @@ const UNKNOWN_METADATA_STRING_CHARS: usize = 256;
 const PROJECTED_EVENT_LABEL_CHARS: usize = 512;
 const PROJECTED_EVENT_BODY_CHARS: usize = 16 * 1024;
 const PROJECTED_IDENTIFIER_CHARS: usize = 256;
+const PROJECTED_SESSION_PATH_CHARS: usize = 4 * 1024;
+const PROJECTED_SESSION_TITLE_CHARS: usize = PROJECTED_EVENT_BODY_CHARS;
+const PROJECTOR_GENERATION: u64 = 1;
+const PROJECTOR_GENERATION_KEY: &str = "projector_generation";
+// Individual turns and tool calls can legitimately run for hours, but a
+// single projected activity lasting longer than 30 days is corrupt metadata.
+// Bounding each stored interval also keeps aggregate SQLite integer sums far
+// away from overflow for any realistic local corpus.
+const MAX_STORED_DURATION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoundedLine {
@@ -90,7 +99,13 @@ fn read_bounded_line<R: BufRead>(
 type ProcessFileAfterSnapshotHook = Box<dyn FnOnce(&Path)>;
 
 #[cfg(test)]
+type ProcessFileAfterTransactionReadHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
 type ProcessFileBeforeOpenHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+type ScanAfterStartHook = Box<dyn FnOnce(&Db) -> Result<()>>;
 
 #[cfg(test)]
 thread_local! {
@@ -100,6 +115,11 @@ thread_local! {
     static PROCESS_FILE_AFTER_SNAPSHOT_HOOK: std::cell::RefCell<
         Option<ProcessFileAfterSnapshotHook>,
     > = std::cell::RefCell::new(None);
+    static PROCESS_FILE_AFTER_TRANSACTION_READ_HOOK: std::cell::RefCell<
+        Option<ProcessFileAfterTransactionReadHook>,
+    > = std::cell::RefCell::new(None);
+    static SCAN_AFTER_START_HOOK: std::cell::RefCell<Option<ScanAfterStartHook>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -119,6 +139,24 @@ fn run_process_file_before_open_hook(path: &Path) {
 }
 
 #[cfg(test)]
+fn set_scan_after_start_hook(hook: impl FnOnce(&Db) -> Result<()> + 'static) {
+    SCAN_AFTER_START_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_scan_after_start_hook(db: &Db) -> Result<()> {
+    SCAN_AFTER_START_HOOK.with(|slot| {
+        let hook = slot.borrow_mut().take();
+        match hook {
+            Some(hook) => hook(db),
+            None => Ok(()),
+        }
+    })
+}
+
+#[cfg(test)]
 fn set_process_file_after_snapshot_hook(hook: impl FnOnce(&Path) + 'static) {
     PROCESS_FILE_AFTER_SNAPSHOT_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(hook));
@@ -130,6 +168,22 @@ fn run_process_file_after_snapshot_hook(path: &Path) {
     PROCESS_FILE_AFTER_SNAPSHOT_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
             hook(path);
+        }
+    });
+}
+
+#[cfg(test)]
+fn set_process_file_after_transaction_read_hook(hook: impl FnOnce() + 'static) {
+    PROCESS_FILE_AFTER_TRANSACTION_READ_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_process_file_after_transaction_read_hook() {
+    PROCESS_FILE_AFTER_TRANSACTION_READ_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
         }
     });
 }
@@ -165,6 +219,23 @@ impl ScanReport {
         self.records_read += other.records;
         self.inherited_records_skipped += other.inherited;
     }
+
+    fn merge_scan(&mut self, other: Self) {
+        self.files_seen = self.files_seen.saturating_add(other.files_seen);
+        self.files_ingested = self.files_ingested.saturating_add(other.files_ingested);
+        self.files_unchanged = self.files_unchanged.saturating_add(other.files_unchanged);
+        self.files_failed = self.files_failed.saturating_add(other.files_failed);
+        self.records_read = self.records_read.saturating_add(other.records_read);
+        self.inherited_records_skipped = self
+            .inherited_records_skipped
+            .saturating_add(other.inherited_records_skipped);
+    }
+}
+
+#[derive(Debug)]
+struct ScanOutcome {
+    report: ScanReport,
+    root_signature_adopted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -179,6 +250,8 @@ struct FileReport {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct CursorState {
+    #[serde(default)]
+    projector_generation: u64,
     owner_id: String,
     thread_id: String,
     parent_rollout_id: Option<String>,
@@ -320,6 +393,16 @@ struct OwnerMeta {
     source_json: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SessionMetadata {
+    cwd: Option<String>,
+    project: Option<String>,
+    repository_url: Option<String>,
+    branch: Option<String>,
+    source: Option<String>,
+    thread_source: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct SourceCandidate {
     path: PathBuf,
@@ -330,11 +413,217 @@ struct SourceCandidate {
 }
 
 pub fn scan_once(db: &Db, roots: &IngestRoots) -> Result<ScanReport> {
-    // A scan is one reconciliation transaction at the application level even
-    // though individual source files commit independently. Serialize that full
-    // decision window across processes that share this database.
     let _scan_guard = DatabaseLock::acquire(db, "ingest")?;
+    Ok(scan_once_locked(db, roots)?.report)
+}
+
+/// Exclusive ownership for one projection writer configuration.
+///
+/// A one-shot command retains it across recovery, pricing synchronization, and
+/// projection. A server retains it from recovery through prewarming and then
+/// transfers it into the background scanner. Both paths therefore discover a
+/// competing root owner before mutating shared state.
+#[derive(Debug)]
+pub struct IngestScannerLease {
+    database_path: PathBuf,
+    _scanner_lease: DatabaseLock,
+}
+
+impl IngestScannerLease {
+    pub fn acquire(db: &Db) -> Result<Self> {
+        Self::acquire_path(db.path())
+    }
+
+    /// Claim projection ownership before opening SQLite.
+    ///
+    /// `Db::open` performs migrations, seed writes, and manual-pricing
+    /// hydration, so command entrypoints that intend to ingest must establish
+    /// their exclusive writer identity from the canonical storage path first.
+    pub fn acquire_path(database_path: impl AsRef<Path>) -> Result<Self> {
+        let database_path = crate::db::canonicalize_storage_path(database_path.as_ref())?;
+        let cancelled = AtomicBool::new(false);
+        let scanner_lease = DatabaseLock::acquire_path_interruptible(
+            &database_path,
+            "ingest-scanner",
+            Duration::ZERO,
+            &cancelled,
+        )
+        .with_context(|| {
+            format!(
+                "failed to claim ingest ownership for {}; a live ingest scanner already owns this projection",
+                database_path.display()
+            )
+        })?
+        .ok_or_else(|| anyhow!("ingest ownership acquisition was cancelled"))?;
+        Ok(Self {
+            database_path,
+            _scanner_lease: scanner_lease,
+        })
+    }
+
+    fn require_database(&self, db: &Db) -> Result<()> {
+        if self.database_path != db.path() {
+            return Err(anyhow!(
+                "ingest scanner lease for {} cannot operate on {}",
+                self.database_path.display(),
+                db.path().display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Run the bounded scan sequence used by the one-shot CLI command.
+///
+/// `scan_once` deliberately requires two clean observations before removing
+/// projections that disappeared after a configured-root change. A long-lived
+/// server naturally supplies the confirmation scan; a one-shot command must
+/// do so itself or it can exit successfully with both source sets projected.
+pub fn scan_one_shot(db: &Db, roots: &IngestRoots) -> Result<ScanReport> {
+    let lease = IngestScannerLease::acquire(db)?;
+    scan_one_shot_with_lease(db, roots, &lease)
+}
+
+/// Run the bounded one-shot projection while the caller retains command-level
+/// scanner exclusion across its surrounding recovery and pricing work.
+pub fn scan_one_shot_with_lease(
+    db: &Db,
+    roots: &IngestRoots,
+    lease: &IngestScannerLease,
+) -> Result<ScanReport> {
+    scan_one_shot_with_lease_and_between_pass(db, roots, lease, || {})
+}
+
+#[cfg(test)]
+fn scan_one_shot_with_between_pass<F>(
+    db: &Db,
+    roots: &IngestRoots,
+    between_passes: F,
+) -> Result<ScanReport>
+where
+    F: FnOnce(),
+{
+    let lease = IngestScannerLease::acquire(db)?;
+    scan_one_shot_with_lease_and_between_pass(db, roots, &lease, between_passes)
+}
+
+fn scan_one_shot_with_lease_and_between_pass<F>(
+    db: &Db,
+    roots: &IngestRoots,
+    lease: &IngestScannerLease,
+    between_passes: F,
+) -> Result<ScanReport>
+where
+    F: FnOnce(),
+{
+    lease.require_database(db)?;
+    // Root adoption and its confirming reconciliation are one process-level
+    // decision. Releasing the lock between them would let a scanner using a
+    // different root set replace the signature and leave both projections
+    // present after this command reports success.
+    let _scan_guard = DatabaseLock::acquire(db, "ingest")?;
+    let first = scan_once_locked(db, roots)?;
+    let mut report = first.report;
+    if first.root_signature_adopted {
+        between_passes();
+        match scan_once_locked(db, roots) {
+            Ok(confirmation) => report.merge_scan(confirmation.report),
+            Err(error) => {
+                finalize_scan_sequence_error(db, &report, &error);
+                return Err(error);
+            }
+        }
+    }
+    if let Err(error) = advance_projector_generation(db) {
+        finalize_scan_sequence_error(db, &report, &error);
+        return Err(error);
+    }
+    Ok(report)
+}
+
+/// Whether every durable source checkpoint was produced by this projector and
+/// the last complete bounded scan published that generation globally.
+///
+/// A genuinely empty projection is vacuously current. This preserves the
+/// useful `serve --no-ingest` contract for isolated empty databases while any
+/// nonempty legacy projection still requires a synchronous one-shot replay.
+pub fn projector_generation_is_current(db: &Db) -> Result<bool> {
+    let connection = db.connect()?;
+    let generation = connection
+        .query_row(
+            "SELECT value FROM app_meta WHERE key=?1",
+            [PROJECTOR_GENERATION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|value| value.parse::<u64>().ok());
+    let has_sources: bool =
+        connection.query_row("SELECT EXISTS(SELECT 1 FROM source_files)", [], |row| {
+            row.get(0)
+        })?;
+    let has_threads: bool =
+        connection.query_row("SELECT EXISTS(SELECT 1 FROM threads)", [], |row| row.get(0))?;
+    if !has_sources && !has_threads {
+        return Ok(true);
+    }
+    if generation != Some(PROJECTOR_GENERATION) {
+        return Ok(false);
+    }
+    Ok(!has_stale_projector_checkpoints(&connection)?)
+}
+
+fn has_stale_projector_checkpoints(connection: &Connection) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM source_files
+                WHERE COALESCE(
+                    CASE WHEN json_valid(parse_state_json)
+                         THEN CAST(json_extract(
+                             parse_state_json,'$.projector_generation'
+                         ) AS INTEGER)
+                    END,
+                    0
+                )<>?1
+             )",
+            [PROJECTOR_GENERATION as i64],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn advance_projector_generation(db: &Db) -> Result<()> {
+    let mut connection = db.connect()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if has_stale_projector_checkpoints(&transaction)? {
+        return Err(anyhow!(
+            "projector generation {PROJECTOR_GENERATION} remains incomplete; stale source checkpoints still require replay"
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO app_meta(key,value) VALUES(?1,?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![PROJECTOR_GENERATION_KEY, PROJECTOR_GENERATION.to_string()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn scan_once_locked(db: &Db, roots: &IngestRoots) -> Result<ScanOutcome> {
+    // The caller owns the process lock across this complete application-level
+    // reconciliation decision even though source files commit independently.
     set_meta(db, "ingest_state", "scanning")?;
+    let attempt = scan_once_started(db, roots);
+    if let Err(error) = &attempt {
+        finalize_unexpected_scan_error(db, error);
+    }
+    attempt
+}
+
+fn scan_once_started(db: &Db, roots: &IngestRoots) -> Result<ScanOutcome> {
+    #[cfg(test)]
+    run_scan_after_start_hook(db)?;
+
     let mut report = ScanReport::default();
     let mut files = Vec::new();
     let mut observed = HashSet::new();
@@ -527,6 +816,7 @@ pub fn scan_once(db: &Db, roots: &IngestRoots) -> Result<ScanReport> {
             |row| row.get::<_, String>(0),
         )
         .optional()?;
+    let mut root_signature_adopted = false;
     if previous_signature.as_deref() == Some(root_signature.as_str()) {
         // Reconciliation depends on enumeration completeness, not projection
         // success. One malformed file must not keep deleted rollouts alive in
@@ -544,13 +834,17 @@ pub fn scan_once(db: &Db, roots: &IngestRoots) -> Result<ScanReport> {
         // Adopt it after one clean scan, then reconcile only if the next
         // clean scan confirms the same configuration.
         set_meta(db, "ingest_root_signature", &root_signature)?;
+        root_signature_adopted = true;
     }
     sync_session_index_titles(db, roots)?;
     let now = canonical_utc(Utc::now());
     let report_json = serde_json::to_string(&report)?;
     if report.files_failed == 0 {
         finish_scan_meta(db, &now, &report_json, None)?;
-        Ok(report)
+        Ok(ScanOutcome {
+            report,
+            root_signature_adopted,
+        })
     } else {
         let detail = if failures.is_empty() {
             format!("{} ingest source(s) failed", report.files_failed)
@@ -559,6 +853,87 @@ pub fn scan_once(db: &Db, roots: &IngestRoots) -> Result<ScanReport> {
         };
         finish_scan_meta(db, &now, &report_json, Some(&detail))?;
         Err(anyhow!("ingest scan failed: {detail}"))
+    }
+}
+
+fn finalize_unexpected_scan_error(db: &Db, original_error: &anyhow::Error) {
+    let still_scanning = match db.connect().and_then(|connection| {
+        connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key='ingest_state'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }) {
+        Ok(Some(state)) => state == "scanning",
+        Ok(None) => true,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to inspect ingest state after an unexpected scan error"
+            );
+            true
+        }
+    };
+    if !still_scanning {
+        return;
+    }
+
+    let detail = format!("{original_error:#}");
+    let now = canonical_utc(Utc::now());
+    let report_json =
+        serde_json::to_string(&ScanReport::default()).unwrap_or_else(|_| "{}".to_owned());
+    if let Err(finalizer_error) = finish_scan_meta(db, &now, &report_json, Some(detail.as_str())) {
+        // The triggering failure is the actionable cause. A secondary
+        // bookkeeping failure must never replace it at the API/CLI boundary.
+        tracing::warn!(
+            error = %finalizer_error,
+            original_error = %original_error,
+            "failed to finalize ingest metadata after an unexpected scan error"
+        );
+    }
+}
+
+fn finalize_scan_sequence_error(
+    db: &Db,
+    completed_report: &ScanReport,
+    original_error: &anyhow::Error,
+) {
+    let already_finalized = match db.connect().and_then(|connection| {
+        connection
+            .query_row(
+                "SELECT value='error' FROM app_meta WHERE key='ingest_state'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value == Some(1))
+            .map_err(Into::into)
+    }) {
+        Ok(already_finalized) => already_finalized,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to inspect ingest state after a one-shot confirmation error"
+            );
+            false
+        }
+    };
+    if already_finalized {
+        return;
+    }
+
+    let detail = format!("{original_error:#}");
+    let now = canonical_utc(Utc::now());
+    let report_json = serde_json::to_string(completed_report).unwrap_or_else(|_| "{}".to_owned());
+    if let Err(finalizer_error) = finish_scan_meta(db, &now, &report_json, Some(detail.as_str())) {
+        tracing::warn!(
+            error = %finalizer_error,
+            original_error = %original_error,
+            "failed to finalize a one-shot confirmation error"
+        );
     }
 }
 
@@ -611,13 +986,21 @@ fn sync_session_index_titles(db: &Db, roots: &IngestRoots) -> Result<usize> {
             // A malformed trailing record must not disturb the prior titles.
             continue;
         };
-        let Some(id) = value
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
+        let id = match normalized_relational_identifier(
+            value.get("id").and_then(Value::as_str),
+            "session index thread id",
+        ) {
+            Ok(Some(id)) => id,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(
+                    path = %index_path.display(),
+                    line_number,
+                    %error,
+                    "skipping Codex session title with an invalid thread id"
+                );
+                continue;
+            }
         };
         let Some(title) = value
             .get("thread_name")
@@ -639,17 +1022,17 @@ fn sync_session_index_titles(db: &Db, roots: &IngestRoots) -> Result<usize> {
             continue;
         };
         let candidate = IndexedTitle {
-            title: redact_data_urls(title),
+            title: redact_and_bound(title.trim(), PROJECTED_SESSION_TITLE_CHARS),
             updated_at: canonical_utc(timestamp.with_timezone(&Utc)),
             updated_micros: timestamp.timestamp_micros(),
             line_number,
         };
-        let replace = latest.get(id).is_none_or(|current| {
+        let replace = latest.get(&id).is_none_or(|current| {
             (candidate.updated_micros, candidate.line_number)
                 >= (current.updated_micros, current.line_number)
         });
         if replace {
-            latest.insert(id.to_owned(), candidate);
+            latest.insert(id, candidate);
         }
     }
 
@@ -708,25 +1091,139 @@ fn source_is_complete(path: &Path, size: u64) -> bool {
     file.read_exact(&mut tail).is_ok() && tail[0] == b'\n'
 }
 
-pub fn spawn_scanner(db: Db, roots: IngestRoots, interval: Duration) -> Arc<AtomicBool> {
-    let stopped = Arc::new(AtomicBool::new(false));
-    let stop = stopped.clone();
-    std::thread::spawn(move || {
-        while !stop.load(Ordering::Relaxed) {
-            if let Err(error) = scan_once(&db, &roots) {
+pub struct ScannerHandle {
+    cancelled: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ScannerHandle {
+    pub fn request_stop(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn shutdown(mut self) {
+        self.request_stop();
+        self.reap_finished();
+    }
+
+    fn reap_finished(&mut self) {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+            && let Some(worker) = self.worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for ScannerHandle {
+    fn drop(&mut self) {
+        self.request_stop();
+        // A scan may be inside a large source file or waiting on another
+        // process's ingest lock. Never turn server shutdown into an unbounded
+        // join; reap only a worker that has already completed and otherwise
+        // let the process boundary terminate it after the graceful window.
+        self.reap_finished();
+    }
+}
+
+pub fn spawn_scanner(db: Db, roots: IngestRoots, interval: Duration) -> Result<ScannerHandle> {
+    let lease = IngestScannerLease::acquire(&db).with_context(|| {
+        format!(
+            "failed to claim live ingest scanner ownership for {}",
+            db.path().display()
+        )
+    })?;
+    spawn_scanner_with_lease(db, roots, interval, lease)
+}
+
+/// Start a live scanner with ownership acquired earlier in startup.
+///
+/// This closes the handoff gap between synchronous projection recovery and
+/// the background worker: no competing one-shot command can claim the
+/// database during prewarming or scanner startup.
+pub fn spawn_scanner_with_lease(
+    db: Db,
+    roots: IngestRoots,
+    interval: Duration,
+    lease: IngestScannerLease,
+) -> Result<ScannerHandle> {
+    lease.require_database(&db)?;
+    // Hold the lifetime lease so another scanner or a one-shot ingest cannot
+    // alternate a conflicting root configuration between observations.
+    // Every successful live cycle uses the same bounded semantics as the CLI:
+    // confirm a newly adopted root set and only then publish the completed
+    // projector generation.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let stop = cancelled.clone();
+    let worker = std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            if let Err(error) = scan_one_shot_with_lease(&db, &roots, &lease) {
                 tracing::warn!(%error, "ingest scan failed");
                 let _ = set_meta(&db, "ingest_state", "error");
             }
             let slices = (interval.as_millis() / 250).max(1) as usize;
             for _ in 0..slices {
-                if stop.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Acquire) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
     });
-    stopped
+    Ok(ScannerHandle {
+        cancelled,
+        worker: Some(worker),
+    })
+}
+
+#[cfg(test)]
+mod scanner_handle_tests {
+    use super::*;
+    use std::{
+        sync::{Condvar, Mutex, mpsc},
+        time::Instant,
+    };
+
+    #[test]
+    fn scanner_shutdown_requests_cancellation_without_joining_blocked_work() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = gate.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*worker_gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            done_tx
+                .send(worker_cancelled.load(Ordering::Acquire))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let handle = ScannerHandle {
+            cancelled,
+            worker: Some(worker),
+        };
+
+        let started = Instant::now();
+        handle.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "scanner shutdown joined blocked work"
+        );
+
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
 }
 
 fn collect_jsonl(
@@ -1084,6 +1581,7 @@ fn process_file(
     // rolling schedule so the append-only assumption is verified rather than
     // trusted forever.
     if let Some(checkpoint) = checkpoint_by_path.as_ref()
+        && checkpoint.state.projector_generation == PROJECTOR_GENERATION
         && checkpoint.state.owner_id == resolved_owner.owner_id
         && checkpoint.size == size
         && checkpoint.modified_ns == modified_ns
@@ -1144,7 +1642,10 @@ fn process_file(
     }
     let existing = load_checkpoint(&connection, &owner.owner_id)?;
     let append_checkpoint = existing.as_ref().filter(|value| {
-        size > value.size && value.offset <= value.size && value.state.thread_id == owner.thread_id
+        value.state.projector_generation == PROJECTOR_GENERATION
+            && size > value.size
+            && value.offset <= value.size
+            && value.state.thread_id == owner.thread_id
     });
     let incremental_append = append_checkpoint.and_then(|checkpoint| {
         let fingerprint = ChunkedFingerprint::parse(&checkpoint.fingerprint)?;
@@ -1185,6 +1686,7 @@ fn process_file(
         // first scan after adopting chunk checkpoints) refreshes metadata
         // without rebuilding the normalized projection.
         if let Some(checkpoint) = checkpoint_by_path.as_ref()
+            && checkpoint.state.projector_generation == PROJECTOR_GENERATION
             && checkpoint.state.owner_id == owner.owner_id
             && checkpoint.state.thread_id == owner.thread_id
             && checkpoint.size == size
@@ -1268,8 +1770,13 @@ fn process_file(
             },
         )
     };
+    state.projector_generation = PROJECTOR_GENERATION;
 
-    let transaction = connection.transaction()?;
+    // Claim writer ownership before the first transactional read. A deferred
+    // read transaction cannot be upgraded after pricing commits on another
+    // connection; SQLite returns BUSY_SNAPSHOT immediately in that case even
+    // when a busy timeout is configured.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some((replaced_owner, replaced_thread)) = transaction
         .query_row(
             "SELECT rollout_id,root_thread_id FROM source_files WHERE path=?1 AND rollout_id<>?2",
@@ -1287,6 +1794,8 @@ fn process_file(
             delete_thread_if_abandoned(&transaction, &replaced_thread)?;
         }
     }
+    #[cfg(test)]
+    run_process_file_after_transaction_read_hook();
     if !append {
         let previous_thread = clear_rollout(&transaction, &owner.owner_id)?;
         if let Some(previous_thread) = previous_thread
@@ -1465,6 +1974,17 @@ fn process_file(
             [pending_source_shrink_key(&owner.owner_id)],
         )?;
     }
+    // A parent may have projected a terminal child observation before the
+    // child's own file was discovered. Re-apply surviving observations after
+    // this rollout's native events so chronological evidence, rather than
+    // source discovery order, determines the promoted lifecycle.
+    rematerialize_surviving_agent_observation(&transaction, &state.owner_id)?;
+    // Observations with identical timestamps use source path/line as their
+    // stable tie-break. A newly discovered parent can sort before an already
+    // projected parent, so replay every child touched by this rollout after
+    // the source-file path is durable. Without this bounded replay,
+    // incremental ingestion can disagree with a fresh rebuild.
+    rematerialize_observed_children(&transaction, &state.owner_id)?;
     transaction.commit()?;
 
     Ok(FileReport {
@@ -1668,8 +2188,14 @@ fn project_record(
 
     if state.forked && !state.native_started {
         if outer_type == "event_msg" && payload_type == Some("task_started") {
-            let turn_id = payload.get("turn_id").and_then(Value::as_str).unwrap_or("");
-            if is_owner_native_turn(&state.owner_id, turn_id) {
+            let turn_id = normalized_relational_identifier(
+                payload.get("turn_id").and_then(Value::as_str),
+                "turn id",
+            )?;
+            if turn_id
+                .as_deref()
+                .is_some_and(|turn_id| is_owner_native_turn(&state.owner_id, turn_id))
+            {
                 state.native_started = true;
             }
         }
@@ -1693,11 +2219,11 @@ fn project_record(
 
     match outer_type {
         "turn_context" => {
-            state.current_turn = payload
-                .get("turn_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| state.current_turn.clone());
+            state.current_turn = normalized_relational_identifier(
+                payload.get("turn_id").and_then(Value::as_str),
+                "turn id",
+            )?
+            .or_else(|| state.current_turn.clone());
             state.turn_context_seen = true;
             state.current_model = payload
                 .get("model")
@@ -1785,10 +2311,13 @@ fn project_response_item(
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let explicit_turn_id = payload
-        .get("internal_chat_message_metadata_passthrough")
-        .and_then(|value| value.get("turn_id"))
-        .and_then(Value::as_str);
+    let explicit_turn_id = normalized_relational_identifier(
+        payload
+            .get("internal_chat_message_metadata_passthrough")
+            .and_then(|value| value.get("turn_id"))
+            .and_then(Value::as_str),
+        "turn id",
+    )?;
     if matches!(
         kind,
         "message"
@@ -1802,7 +2331,7 @@ fn project_response_item(
             | "tool_search_output"
             | "web_search_call"
             | "image_generation_call"
-    ) && let Some(turn_id) = explicit_turn_id
+    ) && let Some(turn_id) = explicit_turn_id.as_deref()
     {
         state.current_turn = Some(turn_id.to_owned());
     }
@@ -1882,10 +2411,17 @@ fn project_response_item(
                     }
                 }
                 ensure_turn(tx, state, timestamp)?;
-                let id = payload
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
+                // Source message IDs are not globally unique. Validate the
+                // source value at the boundary, then scope its projected
+                // identity to the owning rollout. The paired Activity event
+                // applies the same transform to its call identity below.
+                let source_id = normalized_relational_identifier(
+                    payload.get("id").and_then(Value::as_str),
+                    "message id",
+                )?;
+                let id = source_id
+                    .as_deref()
+                    .map(|source_id| projected_message_id(&state.owner_id, source_id))
                     .unwrap_or_else(|| event_id(state, line));
                 tx.execute(
                     "INSERT OR IGNORE INTO messages(
@@ -1977,12 +2513,14 @@ fn project_response_item(
         }
         "function_call" | "custom_tool_call" | "tool_search_call" => {
             ensure_turn(tx, state, timestamp)?;
-            let call_id = payload
-                .get("call_id")
-                .or_else(|| payload.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("line-{line}"));
+            let call_id = normalized_relational_identifier(
+                payload
+                    .get("call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(Value::as_str),
+                "tool call id",
+            )?
+            .unwrap_or_else(|| format!("line-{line}"));
             let name = payload.get("name").and_then(Value::as_str).unwrap_or(kind);
             let namespace = payload.get("namespace").and_then(Value::as_str);
             upsert_tool_call(tx, state, timestamp, &call_id, name, namespace, payload)?;
@@ -2003,12 +2541,15 @@ fn project_response_item(
         }
         "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
             ensure_turn(tx, state, timestamp)?;
-            let call_id = payload
-                .get("call_id")
-                .or_else(|| payload.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            complete_tool_call(tx, state, timestamp, call_id, None, None, None)?;
+            let call_id = normalized_relational_identifier(
+                payload
+                    .get("call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(Value::as_str),
+                "tool call id",
+            )?
+            .unwrap_or_else(|| "unknown".to_owned());
+            complete_tool_call(tx, state, timestamp, &call_id, None, None, None)?;
             insert_event(
                 tx,
                 state,
@@ -2026,12 +2567,14 @@ fn project_response_item(
         }
         "web_search_call" | "image_generation_call" => {
             ensure_turn(tx, state, timestamp)?;
-            let call_id = payload
-                .get("id")
-                .or_else(|| payload.get("call_id"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("line-{line}"));
+            let call_id = normalized_relational_identifier(
+                payload
+                    .get("id")
+                    .or_else(|| payload.get("call_id"))
+                    .and_then(Value::as_str),
+                "tool call id",
+            )?
+            .unwrap_or_else(|| format!("line-{line}"));
             upsert_tool_call(tx, state, timestamp, &call_id, kind, None, payload)?;
             let status = payload.get("status").and_then(Value::as_str);
             if status == Some("completed") {
@@ -2084,9 +2627,12 @@ fn project_event_message(
         .unwrap_or("unknown");
     match kind {
         "task_started" => {
-            if let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) {
+            if let Some(turn_id) = normalized_relational_identifier(
+                payload.get("turn_id").and_then(Value::as_str),
+                "turn id",
+            )? {
                 if let Some(previous_turn) = state.current_turn.as_deref()
-                    && previous_turn != turn_id
+                    && previous_turn != turn_id.as_str()
                     && turn_has_open_native_lifecycle(tx, previous_turn)
                 {
                     tx.execute(
@@ -2095,8 +2641,9 @@ fn project_event_message(
                          WHERE id=?2 AND status='running'",
                         params![timestamp, previous_turn],
                     )?;
+                    record_implicit_turn_interruption(tx, state, line, previous_turn, timestamp)?;
                 }
-                state.current_turn = Some(turn_id.to_owned());
+                state.current_turn = Some(turn_id);
             }
             state.turn_context_seen = false;
             ensure_turn(tx, state, timestamp)?;
@@ -2120,8 +2667,11 @@ fn project_event_message(
             )?;
         }
         "task_complete" => {
-            if let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) {
-                state.current_turn = Some(turn_id.to_owned());
+            if let Some(turn_id) = normalized_relational_identifier(
+                payload.get("turn_id").and_then(Value::as_str),
+                "turn id",
+            )? {
+                state.current_turn = Some(turn_id);
             }
             ensure_turn(tx, state, timestamp)?;
             let last_agent_message = payload
@@ -2134,7 +2684,7 @@ fn project_event_message(
                 params![
                     timestamp,
                     last_agent_message.as_deref(),
-                    payload.get("duration_ms").and_then(Value::as_i64),
+                    raw_duration_ms(payload.get("duration_ms")),
                     payload
                         .get("time_to_first_token_ms")
                         .and_then(Value::as_i64),
@@ -2156,7 +2706,7 @@ fn project_event_message(
                 last_agent_message.as_deref(),
                 Some("completed"),
                 None,
-                payload.get("duration_ms").and_then(Value::as_i64),
+                raw_duration_ms(payload.get("duration_ms")),
                 payload,
             )?;
         }
@@ -2182,7 +2732,7 @@ fn project_event_message(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(redact_data_urls)
+                .map(|value| redact_and_bound(value, PROJECTED_SESSION_TITLE_CHARS))
             {
                 let duplicate: i64 = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM events
@@ -2279,6 +2829,10 @@ fn project_event_message(
             )?;
         }
         "sub_agent_activity" => {
+            let agent_id = normalized_relational_identifier(
+                payload.get("agent_thread_id").and_then(Value::as_str),
+                "subagent thread id",
+            )?;
             insert_event(
                 tx,
                 state,
@@ -2293,14 +2847,14 @@ fn project_event_message(
                 None,
                 payload,
             )?;
-            if let Some(agent_id) = payload.get("agent_thread_id").and_then(Value::as_str) {
+            if let Some(agent_id) = agent_id {
                 let activity = payload
                     .get("kind")
                     .and_then(Value::as_str)
                     .unwrap_or("running");
                 upsert_observed_agent(
                     tx,
-                    agent_id,
+                    &agent_id,
                     &state.thread_id,
                     &state.owner_id,
                     payload.get("agent_path").and_then(Value::as_str),
@@ -2407,7 +2961,7 @@ fn project_event_message(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(redact_data_urls)
+                .map(|value| redact_and_bound(value, PROJECTED_SESSION_TITLE_CHARS))
             {
                 tx.execute(
                     "UPDATE threads SET title=?1,title_updated_at=?2
@@ -2431,8 +2985,11 @@ fn project_event_message(
             }
         }
         "turn_aborted" => {
-            if let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) {
-                state.current_turn = Some(turn_id.to_owned());
+            if let Some(turn_id) = normalized_relational_identifier(
+                payload.get("turn_id").and_then(Value::as_str),
+                "turn id",
+            )? {
+                state.current_turn = Some(turn_id);
             }
             ensure_turn(tx, state, timestamp)?;
             tx.execute(
@@ -2459,8 +3016,11 @@ fn project_event_message(
             )?;
         }
         "thread_rolled_back" => {
-            if let Some(turn_id) = payload.get("turn_id").and_then(Value::as_str) {
-                state.current_turn = Some(turn_id.to_owned());
+            if let Some(turn_id) = normalized_relational_identifier(
+                payload.get("turn_id").and_then(Value::as_str),
+                "turn id",
+            )? {
+                state.current_turn = Some(turn_id);
             }
             ensure_turn(tx, state, timestamp)?;
             tx.execute(
@@ -2487,9 +3047,12 @@ fn project_event_message(
             )?;
         }
         "exec_command_end" => {
-            if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
+            if let Some(call_id) = normalized_relational_identifier(
+                payload.get("call_id").and_then(Value::as_str),
+                "tool call id",
+            )? {
                 let duration = duration_ms(payload.get("duration"))
-                    .or_else(|| payload.get("duration_ms").and_then(Value::as_i64));
+                    .or_else(|| raw_duration_ms(payload.get("duration_ms")));
                 let failed = payload.get("status").and_then(Value::as_str) == Some("failed")
                     || payload
                         .get("exit_code")
@@ -2501,7 +3064,7 @@ fn project_event_message(
                     tx,
                     state,
                     timestamp,
-                    call_id,
+                    &call_id,
                     "exec_command",
                     status,
                     duration,
@@ -2523,9 +3086,12 @@ fn project_event_message(
             }
         }
         "dynamic_tool_call_response" => {
-            if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
+            if let Some(call_id) = normalized_relational_identifier(
+                payload.get("call_id").and_then(Value::as_str),
+                "tool call id",
+            )? {
                 let duration = duration_ms(payload.get("duration"))
-                    .or_else(|| payload.get("duration_ms").and_then(Value::as_i64));
+                    .or_else(|| raw_duration_ms(payload.get("duration_ms")));
                 let failed = payload.get("success").and_then(Value::as_bool) == Some(false)
                     || payload.get("error").is_some_and(|value| !value.is_null());
                 let status = if failed { "failed" } else { "completed" };
@@ -2533,7 +3099,7 @@ fn project_event_message(
                     tx,
                     state,
                     timestamp,
-                    call_id,
+                    &call_id,
                     payload
                         .get("tool")
                         .and_then(Value::as_str)
@@ -2558,11 +3124,11 @@ fn project_event_message(
             }
         }
         "mcp_tool_call_end" | "patch_apply_end" | "web_search_end" | "image_generation_end" => {
-            let mut call_id = payload
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
+            let mut call_id = normalized_relational_identifier(
+                payload.get("call_id").and_then(Value::as_str),
+                "tool call id",
+            )?
+            .unwrap_or_default();
             let invocation = payload.get("invocation");
             let invocation_tool = invocation
                 .and_then(|value| value.get("tool"))
@@ -2602,7 +3168,7 @@ fn project_event_message(
                 matched_existing = true;
             }
             let duration = duration_ms(payload.get("duration"))
-                .or_else(|| payload.get("duration_ms").and_then(Value::as_i64));
+                .or_else(|| raw_duration_ms(payload.get("duration_ms")));
             let failed = payload.get("success").and_then(Value::as_bool) == Some(false)
                 || matches!(
                     payload.get("status").and_then(Value::as_str),
@@ -2671,6 +3237,35 @@ fn project_event_message(
             payload,
         )?,
     }
+    Ok(())
+}
+
+fn record_implicit_turn_interruption(
+    tx: &Transaction<'_>,
+    state: &CursorState,
+    line: u64,
+    turn_id: &str,
+    timestamp: &str,
+) -> Result<()> {
+    // A new native task is durable evidence that the previous open task was
+    // interrupted. Store that evidence alongside the direct turn update so a
+    // later lifecycle rematerialization cannot resurrect the old task merely
+    // because its last source event was `turn_started`.
+    tx.execute(
+        "INSERT OR IGNORE INTO events(
+            id,thread_id,rollout_id,turn_id,agent_run_id,timestamp,source_line,
+            kind,label,status,native
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,'state','Turn interrupted','interrupted',1)",
+        params![
+            format!("{}:{line}:implicit-interrupt", state.owner_id),
+            state.thread_id,
+            state.owner_id,
+            turn_id,
+            state.owner_id,
+            timestamp,
+            line as i64,
+        ],
+    )?;
     Ok(())
 }
 
@@ -2804,15 +3399,28 @@ fn insert_event(
     duration_ms: Option<i64>,
     payload: &Value,
 ) -> Result<()> {
+    let duration_ms = bounded_duration_ms(duration_ms);
     let compact_metadata_kind = matches!(kind, "subagent" | "goal" | "plan" | "state");
-    let call_id = (!compact_metadata_kind)
+    let message_payload = payload.get("type").and_then(Value::as_str) == Some("message");
+    let raw_call_id = (!compact_metadata_kind)
         .then(|| {
-            payload
-                .get("call_id")
-                .or_else(|| payload.get("id"))
-                .and_then(Value::as_str)
+            if message_payload {
+                payload.get("id").and_then(Value::as_str)
+            } else {
+                payload
+                    .get("call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(Value::as_str)
+            }
         })
         .flatten();
+    let call_id = normalized_relational_identifier(raw_call_id, "event call id")?.map(|call_id| {
+        if message_payload {
+            projected_message_id(&state.owner_id, &call_id)
+        } else {
+            call_id
+        }
+    });
     // Compaction replacement history is already durable in the source JSONL
     // and can be hundreds of megabytes. The projection needs only the visible
     // boundary/summary and a few identifiers, so enforce that invariant here
@@ -2850,6 +3458,10 @@ fn insert_event(
         }
     });
     let redacted_tool_name = tool_name.map(redact_data_urls);
+    let compact_metadata = compact_metadata_kind
+        .then(|| compact_projected_metadata(kind, payload))
+        .transpose()?
+        .flatten();
     let payload_json = if let Some((_, metadata)) = compaction.as_ref() {
         Some(serialize_redacted_json(metadata)?)
     } else if kind == "system" {
@@ -2857,11 +3469,8 @@ fn insert_event(
             .as_ref()
             .map(serialize_redacted_json)
             .transpose()?
-    } else if compact_metadata_kind {
-        compact_projected_metadata(kind, payload)
-            .as_ref()
-            .map(serialize_redacted_json)
-            .transpose()?
+    } else if let Some(metadata) = compact_metadata.as_ref() {
+        Some(serialize_redacted_json(metadata)?)
     } else {
         None
     };
@@ -2894,15 +3503,20 @@ fn insert_event(
     Ok(())
 }
 
-fn compact_projected_metadata(kind: &str, payload: &Value) -> Option<Value> {
+fn compact_projected_metadata(kind: &str, payload: &Value) -> Result<Option<Value>> {
     if kind != "subagent" {
-        return None;
+        return Ok(None);
     }
-    let agent_thread_id = payload
-        .get("agent_thread_id")
-        .and_then(Value::as_str)
-        .map(|value| redact_and_bound(value, PROJECTED_IDENTIFIER_CHARS))?;
-    Some(serde_json::json!({"agent_thread_id": agent_thread_id}))
+    let Some(agent_thread_id) = normalized_relational_identifier(
+        payload.get("agent_thread_id").and_then(Value::as_str),
+        "subagent thread id",
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        serde_json::json!({"agent_thread_id": agent_thread_id}),
+    ))
 }
 
 fn redact_and_bound(value: &str, max_chars: usize) -> String {
@@ -2913,6 +3527,70 @@ fn redact_and_bound(value: &str, max_chars: usize) -> String {
         bounded.push('…');
     }
     bounded
+}
+
+fn normalized_metadata_value(value: Option<&str>, max_chars: usize) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| redact_and_bound(value, max_chars))
+}
+
+fn normalized_relational_identifier(value: Option<&str>, label: &str) -> Result<Option<String>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > PROJECTED_IDENTIFIER_CHARS {
+        return Err(anyhow!(
+            "{label} exceeds the {PROJECTED_IDENTIFIER_CHARS}-character identifier limit"
+        ));
+    }
+    if value.chars().any(char::is_control) || redact_data_urls(value) != value {
+        return Err(anyhow!("{label} contains invalid identifier content"));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn required_metadata_identifier(value: Option<&str>, label: &str) -> Result<String> {
+    normalized_relational_identifier(value, label)?
+        .ok_or_else(|| anyhow!("first session_meta has no {label}"))
+}
+
+fn normalized_session_metadata(payload: &Value) -> SessionMetadata {
+    let cwd = normalized_metadata_value(
+        payload.get("cwd").and_then(Value::as_str),
+        PROJECTED_SESSION_PATH_CHARS,
+    );
+    let project = cwd
+        .as_deref()
+        .and_then(|value| Path::new(value).file_name()?.to_str())
+        .and_then(|value| normalized_metadata_value(Some(value), PROJECTED_EVENT_LABEL_CHARS));
+    let git = payload.get("git").unwrap_or(&Value::Null);
+    let subagent = payload
+        .get("source")
+        .and_then(|value| value.get("subagent"));
+    let source = normalized_metadata_value(
+        payload.get("source").and_then(Value::as_str),
+        PROJECTED_IDENTIFIER_CHARS,
+    )
+    .or_else(|| subagent.map(|_| "subagent".to_owned()));
+    SessionMetadata {
+        cwd,
+        project,
+        repository_url: normalized_metadata_value(
+            git.get("repository_url").and_then(Value::as_str),
+            PROJECTED_SESSION_PATH_CHARS,
+        ),
+        branch: normalized_metadata_value(
+            git.get("branch").and_then(Value::as_str),
+            PROJECTED_IDENTIFIER_CHARS,
+        ),
+        source,
+        thread_source: normalized_metadata_value(
+            payload.get("thread_source").and_then(Value::as_str),
+            PROJECTED_IDENTIFIER_CHARS,
+        ),
+    }
 }
 
 fn compact_unknown_metadata(payload: &Value) -> Option<Value> {
@@ -3043,6 +3721,7 @@ fn complete_tool_call(
     duration_ms: Option<i64>,
     tool_name_hint: Option<&str>,
 ) -> Result<()> {
+    let duration_ms = bounded_duration_ms(duration_ms);
     let completion_status = status.unwrap_or("completed");
     let tool_name = redact_data_urls(tool_name_hint.unwrap_or("unknown"));
     tx.execute(
@@ -3090,6 +3769,7 @@ fn enrich_tool_call(
     status: &str,
     duration_ms: Option<i64>,
 ) -> Result<()> {
+    let duration_ms = bounded_duration_ms(duration_ms);
     let name = redact_data_urls(name);
     tx.execute(
         "INSERT INTO tool_calls(
@@ -3141,9 +3821,7 @@ fn update_owner_metadata(
     timestamp: &str,
 ) -> Result<()> {
     let is_root = state.owner_id == state.thread_id;
-    let cwd = payload.get("cwd").and_then(Value::as_str);
-    let project = cwd.and_then(|value| Path::new(value).file_name()?.to_str());
-    let git = payload.get("git").unwrap_or(&Value::Null);
+    let metadata = normalized_session_metadata(payload);
     tx.execute(
         "UPDATE threads SET
             cwd=CASE WHEN ?1=1 THEN ?2
@@ -3155,15 +3833,22 @@ fn update_owner_metadata(
                                 ELSE repository_url END,
             branch=CASE WHEN ?1=1 THEN ?5
                         WHEN root_metadata_seen=0 THEN COALESCE(branch,?5) ELSE branch END,
+            source=CASE WHEN ?1=1 THEN ?6
+                        WHEN root_metadata_seen=0 THEN COALESCE(source,?6) ELSE source END,
+            thread_source=CASE WHEN ?1=1 THEN ?7
+                               WHEN root_metadata_seen=0 THEN COALESCE(thread_source,?7)
+                               ELSE thread_source END,
             root_metadata_seen=MAX(root_metadata_seen,?1),
-            last_event_at=MAX(last_event_at,?6)
-         WHERE id=?7",
+            last_event_at=MAX(last_event_at,?8)
+         WHERE id=?9",
         params![
             is_root as i64,
-            cwd,
-            project,
-            git.get("repository_url").and_then(Value::as_str),
-            git.get("branch").and_then(Value::as_str),
+            metadata.cwd,
+            metadata.project,
+            metadata.repository_url,
+            metadata.branch,
+            metadata.source,
+            metadata.thread_source,
             timestamp,
             state.thread_id,
         ],
@@ -3174,7 +3859,7 @@ fn update_owner_metadata(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(redact_data_urls)
+            .map(|value| redact_and_bound(value, PROJECTED_SESSION_TITLE_CHARS))
     {
         tx.execute(
             "UPDATE threads SET title=?1,title_updated_at=?2
@@ -3262,7 +3947,19 @@ fn upsert_owner(tx: &Transaction<'_>, owner: &OwnerMeta, archived: bool) -> Resu
          ON CONFLICT(id) DO UPDATE SET
             thread_id=excluded.thread_id,rollout_id=excluded.rollout_id,
             parent_rollout_id=excluded.parent_rollout_id,
-            agent_path=excluded.agent_path,nickname=excluded.nickname",
+            agent_path=excluded.agent_path,nickname=excluded.nickname,
+            status=CASE
+                WHEN agent_runs.rollout_id IS NULL
+                 AND agent_runs.completed_at IS NOT NULL
+                 AND excluded.started_at>agent_runs.completed_at
+                THEN 'running'
+                ELSE agent_runs.status END,
+            completed_at=CASE
+                WHEN agent_runs.rollout_id IS NULL
+                 AND agent_runs.completed_at IS NOT NULL
+                 AND excluded.started_at>agent_runs.completed_at
+                THEN NULL
+                ELSE agent_runs.completed_at END",
         params![
             owner.owner_id,
             owner.thread_id,
@@ -3288,27 +3985,146 @@ fn upsert_observed_agent(
     timestamp: &str,
     activity: &str,
 ) -> Result<()> {
-    let status = if activity == "completed" {
-        "completed"
-    } else {
-        "running"
+    let Some(agent_id) = normalized_relational_identifier(Some(agent_id), "agent thread id")?
+    else {
+        return Ok(());
     };
+    let Some(thread_id) = normalized_relational_identifier(Some(thread_id), "thread id")? else {
+        return Ok(());
+    };
+    let Some(parent_rollout_id) =
+        normalized_relational_identifier(Some(parent_rollout_id), "parent rollout id")?
+    else {
+        return Ok(());
+    };
+    let agent_path = normalized_metadata_value(agent_path, PROJECTED_SESSION_PATH_CHARS);
+    let status = match activity {
+        "completed" => "completed",
+        "interrupted" => "interrupted",
+        "rolled_back" => "rolled_back",
+        _ => "running",
+    };
+    let completed_at =
+        matches!(status, "completed" | "interrupted" | "rolled_back").then_some(timestamp);
+    let existing = tx
+        .query_row(
+            "SELECT rollout_id,status,started_at
+             FROM agent_runs WHERE id=?1",
+            [&agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((rollout_id, current_status, started_at)) = existing else {
+        tx.execute(
+            "INSERT INTO agent_runs(
+                id,thread_id,rollout_id,parent_rollout_id,agent_path,started_at,status,completed_at
+             ) VALUES(?1,?2,NULL,?3,?4,?5,?6,?7)",
+            params![
+                agent_id,
+                thread_id,
+                parent_rollout_id,
+                agent_path,
+                timestamp,
+                status,
+                completed_at,
+            ],
+        )?;
+        return Ok(());
+    };
+
+    if let Some(rollout_id) = rollout_id {
+        let parent_terminal_is_authoritative = completed_at.is_some()
+            && current_status == "running"
+            && timestamp >= started_at.as_str()
+            && tx.query_row(
+                "SELECT COALESCE(
+                        (SELECT MAX(timestamp) FROM events WHERE rollout_id=?1),
+                        ?2
+                    )<=?3",
+                params![rollout_id, started_at, timestamp],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+        tx.execute(
+            "UPDATE agent_runs SET
+                agent_path=COALESCE(?1,agent_path),
+                status=CASE WHEN ?2=1 THEN ?3 ELSE status END,
+                completed_at=CASE WHEN ?2=1 THEN ?4 ELSE completed_at END
+             WHERE id=?5",
+            params![
+                agent_path,
+                parent_terminal_is_authoritative as i64,
+                status,
+                completed_at,
+                agent_id,
+            ],
+        )?;
+        if parent_terminal_is_authoritative {
+            tx.execute(
+                "UPDATE turns
+                 SET status=?1,completed_at=?2
+                 WHERE rollout_id=?3
+                   AND agent_run_id=?4
+                   AND status='running'
+                   AND started_at<=?2
+                   AND EXISTS(
+                       SELECT 1 FROM events e
+                       WHERE e.turn_id=turns.id AND e.kind='turn_started'
+                   )
+                   AND NOT EXISTS(
+                       SELECT 1 FROM events e
+                       WHERE e.turn_id=turns.id
+                         AND (
+                           e.kind='turn_completed'
+                           OR (
+                             e.kind='state'
+                             AND e.status IN ('interrupted','rolled_back')
+                           )
+                         )
+                   )
+                   AND COALESCE(
+                       (SELECT MAX(e.timestamp) FROM events e WHERE e.turn_id=turns.id),
+                       turns.started_at
+                   )<=?2",
+                params![status, timestamp, rollout_id, agent_id],
+            )?;
+        }
+        return Ok(());
+    }
+
+    let is_latest_observation = tx.query_row(
+        "SELECT NOT EXISTS(
+            SELECT 1 FROM events
+            WHERE kind='subagent'
+              AND json_extract(payload_json,'$.agent_thread_id')=?1
+              AND timestamp>?2
+         )",
+        params![agent_id, timestamp],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
     tx.execute(
-        "INSERT INTO agent_runs(
-            id,thread_id,rollout_id,parent_rollout_id,agent_path,started_at,status,completed_at
-         ) VALUES(?1,?2,NULL,?3,?4,?5,?6,?7)
-         ON CONFLICT(id) DO UPDATE SET
-            agent_path=COALESCE(excluded.agent_path,agent_runs.agent_path),
-            status=excluded.status,
-            completed_at=COALESCE(excluded.completed_at,agent_runs.completed_at)",
+        "UPDATE agent_runs SET
+            started_at=MIN(started_at,?1),
+            agent_path=COALESCE(?2,agent_path),
+            thread_id=CASE WHEN ?3=1 THEN ?4 ELSE thread_id END,
+            parent_rollout_id=CASE WHEN ?3=1 THEN ?5 ELSE parent_rollout_id END,
+            status=CASE WHEN ?3=1 THEN ?6 ELSE status END,
+            completed_at=CASE WHEN ?3=1 THEN ?7 ELSE completed_at END
+         WHERE id=?8",
         params![
-            agent_id,
+            timestamp,
+            agent_path,
+            is_latest_observation as i64,
             thread_id,
             parent_rollout_id,
-            agent_path,
-            timestamp,
             status,
-            (status == "completed").then_some(timestamp),
+            completed_at,
+            agent_id,
         ],
     )?;
     Ok(())
@@ -3322,6 +4138,23 @@ fn clear_rollout(tx: &Transaction<'_>, rollout_id: &str) -> Result<Option<String
             |row| row.get::<_, String>(0),
         )
         .optional()?;
+    let mut affected_agent_ids = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT json_extract(payload_json,'$.agent_thread_id')
+             FROM events
+             WHERE rollout_id=?1 AND kind='subagent'
+               AND json_extract(payload_json,'$.agent_thread_id') IS NOT NULL",
+        )?;
+        statement
+            .query_map([rollout_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if !affected_agent_ids
+        .iter()
+        .any(|agent_id| agent_id == rollout_id)
+    {
+        affected_agent_ids.push(rollout_id.to_owned());
+    }
     tx.execute("DELETE FROM usage_facts WHERE rollout_id=?1", [rollout_id])?;
     tx.execute("DELETE FROM events WHERE rollout_id=?1", [rollout_id])?;
     tx.execute("DELETE FROM messages WHERE rollout_id=?1", [rollout_id])?;
@@ -3338,7 +4171,11 @@ fn clear_rollout(tx: &Transaction<'_>, rollout_id: &str) -> Result<Option<String
     )?;
     tx.execute("DELETE FROM agent_runs WHERE rollout_id=?1", [rollout_id])?;
     tx.execute("DELETE FROM rollouts WHERE id=?1", [rollout_id])?;
-    rematerialize_surviving_agent_observation(tx, rollout_id)?;
+    affected_agent_ids.sort();
+    affected_agent_ids.dedup();
+    for agent_id in affected_agent_ids {
+        rematerialize_surviving_agent_observation(tx, &agent_id)?;
+    }
     tx.execute(
         "DELETE FROM app_meta WHERE key=?1",
         [pending_source_shrink_key(rollout_id)],
@@ -3353,6 +4190,17 @@ fn clear_rollout(tx: &Transaction<'_>, rollout_id: &str) -> Result<Option<String
 }
 
 fn rematerialize_surviving_agent_observation(tx: &Transaction<'_>, agent_id: &str) -> Result<()> {
+    // A synthetic row is wholly derived from parent observations. Rebuild it
+    // from zero before replaying the surviving evidence: merging into the old
+    // row with MIN(started_at, ...) cannot move its start later when the
+    // removed parent supplied the earliest observation but was not the latest
+    // (and therefore not the row's current parent). Promoted rows keep their
+    // native rollout identity and are reset through the native lifecycle path.
+    tx.execute(
+        "DELETE FROM agent_runs WHERE id=?1 AND rollout_id IS NULL",
+        [agent_id],
+    )?;
+    restore_promoted_agent_native_state(tx, agent_id)?;
     let observations = {
         let mut statement = tx.prepare(
             "SELECT e.thread_id,e.rollout_id,e.body,e.timestamp,COALESCE(e.status,'running')
@@ -3360,7 +4208,7 @@ fn rematerialize_surviving_agent_observation(tx: &Transaction<'_>, agent_id: &st
              LEFT JOIN source_files sf ON sf.rollout_id=e.rollout_id
              WHERE e.kind='subagent'
                AND json_extract(e.payload_json,'$.agent_thread_id')=?1
-             ORDER BY COALESCE(sf.path,''),e.source_line,e.id",
+             ORDER BY e.timestamp,COALESCE(sf.path,''),e.source_line,e.id",
         )?;
         statement
             .query_map([agent_id], |row| {
@@ -3385,6 +4233,142 @@ fn rematerialize_surviving_agent_observation(tx: &Transaction<'_>, agent_id: &st
             &activity,
         )?;
     }
+    Ok(())
+}
+
+fn rematerialize_observed_children(tx: &Transaction<'_>, rollout_id: &str) -> Result<()> {
+    let agent_ids = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT json_extract(payload_json,'$.agent_thread_id')
+             FROM events
+             WHERE rollout_id=?1 AND kind='subagent'
+               AND json_extract(payload_json,'$.agent_thread_id') IS NOT NULL
+             ORDER BY 1",
+        )?;
+        statement
+            .query_map([rollout_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for agent_id in agent_ids {
+        rematerialize_surviving_agent_observation(tx, &agent_id)?;
+    }
+    Ok(())
+}
+
+fn restore_promoted_agent_native_state(tx: &Transaction<'_>, agent_id: &str) -> Result<()> {
+    let native = tx
+        .query_row(
+            "SELECT
+                r.id,r.thread_id,r.parent_rollout_id,r.agent_path,r.agent_nickname,r.started_at
+             FROM agent_runs a
+             JOIN rollouts r ON r.id=a.rollout_id
+             WHERE a.id=?1 AND a.rollout_id IS NOT NULL",
+            [agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((rollout_id, thread_id, parent_rollout_id, agent_path, nickname, started_at)) = native
+    else {
+        return Ok(());
+    };
+    // Parent observations may have created the row before the native rollout
+    // was discovered, or overwritten its path afterward. Reset every native
+    // metadata field from the durable rollout before replaying any surviving
+    // parent evidence so removed observations cannot remain as high-water
+    // marks in the promoted row.
+    tx.execute(
+        "UPDATE agent_runs SET
+            thread_id=?1,parent_rollout_id=?2,agent_path=?3,nickname=?4,started_at=?5
+         WHERE id=?6 AND rollout_id=?7",
+        params![
+            thread_id,
+            parent_rollout_id,
+            agent_path,
+            nickname,
+            started_at,
+            agent_id,
+            rollout_id,
+        ],
+    )?;
+    let turn_lifecycles = {
+        let mut statement = tx.prepare(
+            "SELECT
+                t.id,
+                CASE
+                    WHEN e.kind='turn_started' THEN 'running'
+                    WHEN e.kind='turn_completed' THEN 'completed'
+                    ELSE e.status
+                END,
+                CASE WHEN e.kind='turn_started' THEN NULL ELSE e.timestamp END
+             FROM turns t
+             JOIN events e ON e.id=(
+                 SELECT e2.id
+                 FROM events e2
+                 WHERE e2.turn_id=t.id
+                   AND (
+                     e2.kind IN ('turn_started','turn_completed')
+                     OR (
+                       e2.kind='state'
+                       AND e2.status IN ('interrupted','rolled_back')
+                     )
+                   )
+                 ORDER BY e2.timestamp DESC,e2.source_line DESC,e2.id DESC
+                 LIMIT 1
+             )
+             WHERE t.rollout_id=?1 AND t.agent_run_id=?2",
+        )?;
+        statement
+            .query_map(params![rollout_id, agent_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (turn_id, status, completed_at) in turn_lifecycles {
+        tx.execute(
+            "UPDATE turns SET status=?1,completed_at=?2 WHERE id=?3",
+            params![status, completed_at, turn_id],
+        )?;
+    }
+    let lifecycle = tx
+        .query_row(
+            "SELECT
+                CASE
+                    WHEN kind='turn_started' THEN 'running'
+                    WHEN kind='turn_completed' THEN 'completed'
+                    ELSE status
+                END,
+                CASE WHEN kind='turn_started' THEN NULL ELSE timestamp END
+             FROM events INDEXED BY idx_events_activity_owner
+             WHERE thread_id=?1 AND rollout_id=?2
+               AND (
+                    kind IN ('turn_started','turn_completed')
+                    OR (kind='state' AND status IN ('interrupted','rolled_back'))
+               )
+             ORDER BY timestamp DESC,source_line DESC,id DESC
+             LIMIT 1",
+            params![thread_id, rollout_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+        .unwrap_or_else(|| ("running".into(), None));
+    tx.execute(
+        "UPDATE agent_runs SET status=?1,completed_at=?2
+         WHERE id=?3 AND rollout_id=?4",
+        params![lifecycle.0, lifecycle.1, agent_id, rollout_id],
+    )?;
     Ok(())
 }
 
@@ -3609,23 +4593,22 @@ fn peek_owner_from_file(file: &mut File, path: &Path) -> Result<OwnerMeta> {
             continue;
         }
         let payload = value.get("payload").unwrap_or(&value);
-        let owner_id = payload
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("first session_meta has no rollout id"))?
-            .to_owned();
+        let owner_id =
+            required_metadata_identifier(payload.get("id").and_then(Value::as_str), "rollout id")?;
         let subagent = payload
             .get("source")
             .and_then(|value| value.get("subagent"));
         let spawn = subagent.and_then(|value| value.get("thread_spawn"));
-        let explicit_thread_id = payload
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let spawn_parent_thread_id = spawn
-            .and_then(|value| value.get("parent_thread_id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let explicit_thread_id = normalized_relational_identifier(
+            payload.get("session_id").and_then(Value::as_str),
+            "session thread id",
+        )?;
+        let spawn_parent_thread_id = normalized_relational_identifier(
+            spawn
+                .and_then(|value| value.get("parent_thread_id"))
+                .and_then(Value::as_str),
+            "parent thread id",
+        )?;
         // Older child rollouts omit session_id. Their parent thread is the
         // only top-level ownership signal and must not become a fake session.
         let thread_id = explicit_thread_id
@@ -3634,49 +4617,36 @@ fn peek_owner_from_file(file: &mut File, path: &Path) -> Result<OwnerMeta> {
             .unwrap_or_else(|| owner_id.clone());
         let parent_thread_id =
             spawn_parent_thread_id.or_else(|| (owner_id != thread_id).then(|| thread_id.clone()));
-        let parent_rollout_id = payload
-            .get("forked_from_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                spawn
-                    .and_then(|value| value.get("parent_rollout_id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
+        let forked_from_id = normalized_relational_identifier(
+            payload.get("forked_from_id").and_then(Value::as_str),
+            "fork parent rollout id",
+        )?;
+        let spawn_parent_rollout_id = normalized_relational_identifier(
+            spawn
+                .and_then(|value| value.get("parent_rollout_id"))
+                .and_then(Value::as_str),
+            "spawn parent rollout id",
+        )?;
+        let parent_rollout_id = forked_from_id
+            .or(spawn_parent_rollout_id)
             .or_else(|| parent_thread_id.clone());
         let agent_path = spawn
             .and_then(|value| value.get("agent_path"))
             .and_then(Value::as_str)
-            .map(str::to_owned);
+            .and_then(|value| normalized_metadata_value(Some(value), PROJECTED_SESSION_PATH_CHARS));
         let agent_nickname = spawn
             .and_then(|value| value.get("agent_nickname"))
             .and_then(Value::as_str)
-            .map(str::to_owned)
+            .and_then(|value| normalized_metadata_value(Some(value), PROJECTED_EVENT_LABEL_CHARS))
             .or_else(|| {
                 subagent
                     .and_then(|value| value.get("other"))
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
+                    .and_then(|value| {
+                        normalized_metadata_value(Some(value), PROJECTED_EVENT_LABEL_CHARS)
+                    })
             });
-        let cwd = payload
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let project = cwd
-            .as_deref()
-            .and_then(|value| Path::new(value).file_name()?.to_str())
-            .map(str::to_owned);
-        let git = payload.get("git").unwrap_or(&Value::Null);
-        let source_value = payload.get("source");
-        let source = source_value
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| subagent.map(|_| "subagent".to_owned()));
-        let thread_source = payload
-            .get("thread_source")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let metadata = normalized_session_metadata(payload);
         // Source topology and authored labels are projected into dedicated
         // columns above. The raw source object also carries transport context
         // and can contain arbitrarily large embedded payloads, so it has no
@@ -3702,15 +4672,12 @@ fn peek_owner_from_file(file: &mut File, path: &Path) -> Result<OwnerMeta> {
             is_subagent,
             forked,
             timestamp: canonical_source_timestamp(timestamp)?,
-            cwd,
-            project,
-            repository_url: git
-                .get("repository_url")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            branch: git.get("branch").and_then(Value::as_str).map(str::to_owned),
-            source,
-            thread_source,
+            cwd: metadata.cwd,
+            project: metadata.project,
+            repository_url: metadata.repository_url,
+            branch: metadata.branch,
+            source: metadata.source,
+            thread_source: metadata.thread_source,
             source_json,
         });
     }
@@ -4166,10 +5133,23 @@ fn duration_ms(value: Option<&Value>) -> Option<i64> {
             let fractional = nanos.max(0).saturating_add(999_999) / 1_000_000;
             Some(whole.saturating_add(fractional))
         })
+        .and_then(|value| bounded_duration_ms(Some(value)))
+}
+
+fn raw_duration_ms(value: Option<&Value>) -> Option<i64> {
+    bounded_duration_ms(value.and_then(Value::as_i64))
+}
+
+fn bounded_duration_ms(value: Option<i64>) -> Option<i64> {
+    value.filter(|value| (0..=MAX_STORED_DURATION_MS).contains(value))
 }
 
 fn event_id(state: &CursorState, line: u64) -> String {
     format!("{}:{line}", state.owner_id)
+}
+
+fn projected_message_id(rollout_id: &str, source_id: &str) -> String {
+    format!("message:{}", serde_json::json!([rollout_id, source_id]))
 }
 
 fn is_owner_native_turn(owner_id: &str, turn_id: &str) -> bool {
@@ -4427,7 +5407,9 @@ fn reconcile_missing(
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
-    let transaction = connection.transaction()?;
+    // `clear_rollout` reads before deleting. Reserve writer ownership first so
+    // a concurrent pricing commit cannot stale that snapshot mid-reconcile.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     for (rollout_id, path, thread_id) in sources {
         if observed.contains(&path) || pending_owners.contains(&rollout_id) {
             continue;
@@ -4459,7 +5441,24 @@ fn reconcile_missing(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::{cell::RefCell, io::Write};
+
+    thread_local! {
+        static TRACED_PROMOTED_AGENT_LIFECYCLE_SQL: RefCell<Option<String>> =
+            const { RefCell::new(None) };
+    }
+
+    fn capture_promoted_agent_lifecycle_sql(sql: &str) {
+        if sql.contains("FROM events")
+            && !sql.contains("FROM turns")
+            && sql.contains("kind='turn_started'")
+            && sql.contains("ORDER BY timestamp DESC")
+        {
+            TRACED_PROMOTED_AGENT_LIFECYCLE_SQL.with(|captured| {
+                *captured.borrow_mut() = Some(sql.to_owned());
+            });
+        }
+    }
 
     fn write_fixture(path: &Path, lines: &[Value]) {
         let mut file = File::create(path).unwrap();
@@ -4517,6 +5516,324 @@ mod tests {
                 "last_token_usage":{"input_tokens":input,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":input+1}
             }
         }})
+    }
+
+    #[test]
+    fn parent_observations_preserve_promoted_agent_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let mut connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,started_at,last_event_at)
+                 VALUES('thread','2026-07-01T00:00:00Z','2026-07-01T01:00:00Z');
+                 INSERT INTO rollouts(id,thread_id,started_at,last_event_at) VALUES
+                    ('parent','thread','2026-07-01T00:00:00Z','2026-07-01T01:00:00Z'),
+                    ('child','thread','2026-07-01T00:10:00Z','2026-07-01T00:20:00Z');
+                 INSERT INTO agent_runs(
+                    id,thread_id,rollout_id,parent_rollout_id,started_at,completed_at,status
+                 ) VALUES(
+                    'child','thread','child','parent','2026-07-01T00:10:00Z',
+                    '2026-07-01T00:20:00Z','completed'
+                 );",
+            )
+            .unwrap();
+
+        let transaction = connection.transaction().unwrap();
+        upsert_observed_agent(
+            &transaction,
+            "child",
+            "thread",
+            "parent",
+            Some("/root/promoted"),
+            "2026-07-01T00:30:00Z",
+            "interrupted",
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        let lifecycle: (String, Option<String>, Option<String>, String) = connection
+            .query_row(
+                "SELECT status,completed_at,agent_path,rollout_id
+                 FROM agent_runs WHERE id='child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle.0, "completed");
+        assert_eq!(lifecycle.1.as_deref(), Some("2026-07-01T00:20:00Z"));
+        assert_eq!(lifecycle.2.as_deref(), Some("/root/promoted"));
+        assert_eq!(lifecycle.3, "child");
+    }
+
+    #[test]
+    fn promoted_agent_lifecycle_lookup_uses_activity_owner_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let mut connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,started_at,last_event_at)
+                 VALUES('thread','2026-07-01T00:00:00Z','2026-07-01T01:00:00Z');
+                 INSERT INTO rollouts(
+                    id,thread_id,parent_rollout_id,started_at,last_event_at
+                 ) VALUES(
+                    'child','thread','parent','2026-07-01T00:10:00Z',
+                    '2026-07-01T00:20:00Z'
+                 );
+                 INSERT INTO agent_runs(
+                    id,thread_id,rollout_id,parent_rollout_id,started_at,status
+                 ) VALUES(
+                    'child','thread','child','parent','2026-07-01T00:10:00Z','running'
+                 );",
+            )
+            .unwrap();
+
+        TRACED_PROMOTED_AGENT_LIFECYCLE_SQL.with(|captured| {
+            *captured.borrow_mut() = None;
+        });
+        connection.trace(Some(capture_promoted_agent_lifecycle_sql));
+        let transaction = connection.transaction().unwrap();
+        restore_promoted_agent_native_state(&transaction, "child").unwrap();
+        transaction.commit().unwrap();
+        connection.trace(None);
+
+        let sql = TRACED_PROMOTED_AGENT_LIFECYCLE_SQL
+            .with(|captured| captured.borrow_mut().take())
+            .expect("promoted-agent lifecycle query was not traced");
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let plan = connection
+            .prepare(&explain)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let plan_text = plan.join("\n");
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("SEARCH events USING INDEX idx_events_activity_owner")
+            }),
+            "promoted-agent lifecycle lookup did not use the activity-owner index:\n{plan_text}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("SCAN events")),
+            "promoted-agent lifecycle lookup full-scanned events:\n{plan_text}"
+        );
+    }
+
+    #[test]
+    fn synthetic_agent_observations_map_lifecycle_states_consistently() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let mut connection = db.connect().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO threads(id,started_at,last_event_at)
+                 VALUES('thread','2026-07-01T00:00:00Z','2026-07-01T01:00:00Z');",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        upsert_observed_agent(
+            &transaction,
+            "interrupted-child",
+            "thread",
+            "parent",
+            None,
+            "2026-07-01T00:10:00Z",
+            "started",
+        )
+        .unwrap();
+        upsert_observed_agent(
+            &transaction,
+            "interrupted-child",
+            "thread",
+            "parent",
+            None,
+            "2026-07-01T00:20:00Z",
+            "interrupted",
+        )
+        .unwrap();
+        upsert_observed_agent(
+            &transaction,
+            "completed-child",
+            "thread",
+            "parent",
+            None,
+            "2026-07-01T00:40:00Z",
+            "completed",
+        )
+        .unwrap();
+        upsert_observed_agent(
+            &transaction,
+            "rolled-back-child",
+            "thread",
+            "parent",
+            None,
+            "2026-07-01T00:50:00Z",
+            "rolled_back",
+        )
+        .unwrap();
+        upsert_observed_agent(
+            &transaction,
+            "running-child",
+            "thread",
+            "parent",
+            None,
+            "2026-07-01T00:55:00Z",
+            "interrupted",
+        )
+        .unwrap();
+        upsert_observed_agent(
+            &transaction,
+            "running-child",
+            "thread",
+            "parent",
+            None,
+            "2026-07-01T01:00:00Z",
+            "interacted",
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        let states = connection
+            .prepare(
+                "SELECT id,status,completed_at FROM agent_runs
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                (
+                    "completed-child".into(),
+                    "completed".into(),
+                    Some("2026-07-01T00:40:00Z".into()),
+                ),
+                (
+                    "interrupted-child".into(),
+                    "interrupted".into(),
+                    Some("2026-07-01T00:20:00Z".into()),
+                ),
+                (
+                    "rolled-back-child".into(),
+                    "rolled_back".into(),
+                    Some("2026-07-01T00:50:00Z".into()),
+                ),
+                ("running-child".into(), "running".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn projected_durations_are_bounded_at_parse_and_schema_boundaries() {
+        assert_eq!(
+            duration_ms(Some(&serde_json::json!(MAX_STORED_DURATION_MS))),
+            Some(MAX_STORED_DURATION_MS)
+        );
+        assert_eq!(
+            duration_ms(Some(&serde_json::json!(MAX_STORED_DURATION_MS + 1))),
+            None
+        );
+        assert_eq!(raw_duration_ms(Some(&serde_json::json!(-1))), None);
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let owner = "019f64aa-0000-7000-8000-000000000012";
+        let turn = "019f64ab-0000-7000-8000-000000000012";
+        write_fixture(
+            &sessions.join("duration.jsonl"),
+            &[
+                meta("2026-07-15T09:00:00Z", owner, owner, false),
+                task("2026-07-15T09:00:01Z", turn),
+                serde_json::json!({
+                    "timestamp":"2026-07-15T09:00:02Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"task_complete","turn_id":turn,
+                        "duration_ms":MAX_STORED_DURATION_MS + 1
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp":"2026-07-15T09:00:03Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"exec_command_end","call_id":"oversized-call",
+                        "duration_ms":MAX_STORED_DURATION_MS + 1,"exit_code":0
+                    }
+                }),
+            ],
+        );
+        scan_once(
+            &db,
+            &IngestRoots {
+                active: Some(sessions),
+                archive: None,
+            },
+        )
+        .unwrap();
+
+        let connection = db.connect().unwrap();
+        let stored: (Option<i64>, Option<i64>, Option<i64>) = connection
+            .query_row(
+                "SELECT
+                    (SELECT duration_ms FROM turns WHERE id=?1),
+                    (SELECT duration_ms FROM events
+                     WHERE rollout_id=?2 AND kind='tool_completed'),
+                    (SELECT duration_ms FROM tool_calls
+                     WHERE rollout_id=?2 AND call_id='oversized-call')",
+                params![turn, owner],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (None, None, None));
+
+        let oversized = MAX_STORED_DURATION_MS + 1;
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO turns(
+                        id,thread_id,rollout_id,started_at,status,duration_ms
+                     ) VALUES('oversized-turn',?1,?1,?2,'completed',?3)",
+                    params![owner, "2026-07-15T09:00:04Z", oversized],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO events(
+                        id,thread_id,rollout_id,timestamp,source_line,kind,duration_ms
+                     ) VALUES('oversized-event',?1,?1,?2,99,'tool_completed',?3)",
+                    params![owner, "2026-07-15T09:00:04Z", oversized],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO tool_calls(
+                        id,call_id,thread_id,rollout_id,started_at,name,status,duration_ms
+                     ) VALUES(
+                        'oversized-tool','oversized-tool',?1,?1,?2,
+                        'exec_command','completed',?3
+                     )",
+                    params![owner, "2026-07-15T09:00:04Z", oversized],
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -5280,6 +6597,250 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retained_data_urls, 0);
+    }
+
+    #[test]
+    fn session_metadata_is_normalized_at_discovery_and_update_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let owner = "019f64aa-0000-7000-8000-000000000096";
+        let embedded = "data:image/png;base64,METADATA_SENTINEL";
+        let long_path = format!(
+            "/tmp/{embedded} {}",
+            "p".repeat(PROJECTED_SESSION_PATH_CHARS + 1_000)
+        );
+        let long_repository = format!(
+            "{embedded} {}",
+            "r".repeat(PROJECTED_SESSION_PATH_CHARS + 1_000)
+        );
+        let long_branch = format!(
+            "{embedded} {}",
+            "b".repeat(PROJECTED_IDENTIFIER_CHARS + 1_000)
+        );
+        let long_source = format!(
+            "{embedded} {}",
+            "s".repeat(PROJECTED_IDENTIFIER_CHARS + 1_000)
+        );
+        let long_thread_source = format!(
+            "{embedded} {}",
+            "t".repeat(PROJECTED_IDENTIFIER_CHARS + 1_000)
+        );
+        let long_title = format!(
+            "{embedded} {}",
+            "n".repeat(PROJECTED_SESSION_TITLE_CHARS + 1_000)
+        );
+        write_fixture(
+            &sessions.join("metadata.jsonl"),
+            &[
+                serde_json::json!({
+                    "timestamp":"2026-07-15T09:00:00Z",
+                    "type":"session_meta",
+                    "payload":{
+                        "id":owner,
+                        "session_id":owner,
+                        "cwd":"/tmp/initial",
+                        "source":"vscode",
+                        "thread_source":"user",
+                        "git":{
+                            "repository_url":"https://example.test/initial",
+                            "branch":"initial"
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp":"2026-07-15T09:00:01Z",
+                    "type":"session_meta",
+                    "payload":{
+                        "id":owner,
+                        "session_id":owner,
+                        "thread_name":long_title,
+                        "cwd":long_path,
+                        "source":long_source,
+                        "thread_source":long_thread_source,
+                        "git":{
+                            "repository_url":long_repository,
+                            "branch":long_branch
+                        }
+                    }
+                }),
+            ],
+        );
+
+        scan_once(
+            &db,
+            &IngestRoots {
+                active: Some(sessions),
+                archive: None,
+            },
+        )
+        .unwrap();
+
+        let connection = db.connect().unwrap();
+        let metadata: (String, String, String, String, String, String, String) = connection
+            .query_row(
+                "SELECT title,cwd,project,repository_url,branch,source,thread_source
+                 FROM threads WHERE id=?1",
+                [owner],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(metadata.0.chars().count() <= PROJECTED_SESSION_TITLE_CHARS + 1);
+        assert!(metadata.1.chars().count() <= PROJECTED_SESSION_PATH_CHARS + 1);
+        assert!(metadata.2.chars().count() <= PROJECTED_EVENT_LABEL_CHARS + 1);
+        assert!(metadata.3.chars().count() <= PROJECTED_SESSION_PATH_CHARS + 1);
+        assert!(metadata.4.chars().count() <= PROJECTED_IDENTIFIER_CHARS + 1);
+        assert!(metadata.5.chars().count() <= PROJECTED_IDENTIFIER_CHARS + 1);
+        assert!(metadata.6.chars().count() <= PROJECTED_IDENTIFIER_CHARS + 1);
+        for value in [
+            &metadata.0,
+            &metadata.1,
+            &metadata.2,
+            &metadata.3,
+            &metadata.4,
+            &metadata.5,
+            &metadata.6,
+        ] {
+            assert!(!value.to_ascii_lowercase().contains("data:image"));
+            assert!(!value.contains("METADATA_SENTINEL"));
+        }
+
+        let oversized_id = format!("{}{}", "i".repeat(PROJECTED_IDENTIFIER_CHARS), embedded);
+        let owner_path = temp.path().join("owner-only.jsonl");
+        write_fixture(
+            &owner_path,
+            &[serde_json::json!({
+                "timestamp":"2026-07-15T09:00:00Z",
+                "type":"session_meta",
+                "payload":{
+                    "id":oversized_id.clone(),
+                    "session_id":oversized_id,
+                    "cwd":"/tmp/project",
+                    "source":{
+                        "subagent":{
+                            "thread_spawn":{
+                                "parent_thread_id":format!("parent-{embedded}"),
+                                "parent_rollout_id":format!("rollout-{embedded}"),
+                                "agent_path":format!("/root/{embedded}"),
+                                "agent_nickname":format!("nickname-{embedded}")
+                            }
+                        }
+                    }
+                }
+            })],
+        );
+        let error = peek_owner(&owner_path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the 256-character identifier limit"),
+            "unexpected identifier error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn oversized_relational_identifiers_are_rejected_instead_of_colliding() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let shared_prefix = "i".repeat(PROJECTED_IDENTIFIER_CHARS);
+        for (name, suffix) in [("a.jsonl", "-first"), ("b.jsonl", "-second")] {
+            let owner = format!("{shared_prefix}{suffix}");
+            write_fixture(
+                &sessions.join(name),
+                &[serde_json::json!({
+                    "timestamp":"2026-07-15T09:00:00Z",
+                    "type":"session_meta",
+                    "payload":{
+                        "id":owner,
+                        "session_id":owner,
+                        "cwd":"/tmp/project",
+                        "source":"vscode"
+                    }
+                })],
+            );
+        }
+
+        let error = scan_once(
+            &db,
+            &IngestRoots {
+                active: Some(sessions),
+                archive: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("exceeds the 256-character identifier limit"),
+            "unexpected identifier error: {error:#}"
+        );
+        let connection = db.connect().unwrap();
+        let projection: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM threads),
+                    (SELECT COUNT(*) FROM rollouts),
+                    (SELECT COUNT(*) FROM source_files)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(projection, (0, 0, 0));
+    }
+
+    #[test]
+    fn oversized_turn_identifier_rolls_back_its_relational_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let owner = "019f64aa-0000-7000-8000-0000000000f6";
+        let turn = format!("{}-turn", "t".repeat(PROJECTED_IDENTIFIER_CHARS));
+        write_fixture(
+            &sessions.join("oversized-turn.jsonl"),
+            &[
+                meta("2026-07-15T09:00:00Z", owner, owner, false),
+                task("2026-07-15T09:00:01Z", &turn),
+            ],
+        );
+
+        let error = scan_once(
+            &db,
+            &IngestRoots {
+                active: Some(sessions),
+                archive: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("turn id exceeds the 256-character identifier limit"),
+            "unexpected identifier error: {error:#}"
+        );
+        let projection: (i64, i64, i64, i64) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM rollouts),
+                    (SELECT COUNT(*) FROM turns),
+                    (SELECT COUNT(*) FROM events),
+                    (SELECT COUNT(*) FROM source_files)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(projection, (0, 0, 0, 0));
     }
 
     #[test]
@@ -6604,6 +8165,660 @@ Trace the real first prompt."#;
         assert_eq!(after_confirmation, (1, 1, owner_b.into()));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn long_lived_scanners_cannot_alternate_different_root_configurations() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions_a = temp.path().join("sessions-a");
+        let sessions_b = temp.path().join("sessions-b");
+        std::fs::create_dir(&sessions_a).unwrap();
+        std::fs::create_dir(&sessions_b).unwrap();
+        let owner_a = "019f64aa-0000-7000-8000-000000000020";
+        let owner_b = "019f64aa-0000-7000-8000-000000000021";
+        write_fixture(
+            &sessions_a.join("a.jsonl"),
+            &[meta("2026-07-15T09:00:00Z", owner_a, owner_a, false)],
+        );
+        write_fixture(
+            &sessions_b.join("b.jsonl"),
+            &[meta("2026-07-15T10:00:00Z", owner_b, owner_b, false)],
+        );
+        let roots_a = IngestRoots {
+            active: Some(sessions_a),
+            archive: None,
+        };
+        let roots_b = IngestRoots {
+            active: Some(sessions_b),
+            archive: None,
+        };
+
+        let scanner_a = spawn_scanner(db.clone(), roots_a, Duration::from_millis(250)).unwrap();
+        let first_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let first_ready = db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM source_files WHERE rollout_id=?1),
+                            (SELECT value FROM app_meta WHERE key='ingest_root_signature')",
+                    [owner_a],
+                    |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
+                )
+                .ok();
+            if first_ready.as_ref().is_some_and(|(ready, _)| *ready) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < first_deadline,
+                "the first long-lived scanner did not finish its initial scan"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let signature_a: String = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM app_meta WHERE key='ingest_root_signature'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let conflict = match spawn_scanner(db.clone(), roots_b, Duration::from_millis(250)) {
+            Ok(scanner_b) => {
+                scanner_b.shutdown();
+                scanner_a.shutdown();
+                panic!("a second long-lived scanner unexpectedly acquired the database")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            format!("{conflict:#}").contains("failed to claim live ingest scanner ownership"),
+            "unexpected scanner conflict error: {conflict:#}"
+        );
+        let connection = db.connect().unwrap();
+        let (source_count, signature): (i64, String) = connection
+            .query_row(
+                "SELECT COUNT(*),
+                        (SELECT value FROM app_meta WHERE key='ingest_root_signature')
+                 FROM source_files",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(source_count, 1);
+        assert_eq!(signature, signature_a);
+        drop(connection);
+        scanner_a.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_lived_scanner_publishes_completed_projector_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let owner = "019f64aa-0000-7000-8000-000000000025";
+        write_fixture(
+            &sessions.join("root.jsonl"),
+            &[meta("2026-07-15T09:00:00Z", owner, owner, false)],
+        );
+        let roots = IngestRoots {
+            active: Some(sessions),
+            archive: None,
+        };
+
+        let scanner = spawn_scanner(db.clone(), roots, Duration::from_secs(60)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (source_exists, generation): (bool, Option<String>) = db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM source_files WHERE rollout_id=?1),
+                            (SELECT value FROM app_meta WHERE key=?2)",
+                    params![owner, PROJECTOR_GENERATION_KEY],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            if source_exists && generation == Some(PROJECTOR_GENERATION.to_string()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live scanner ingested without publishing its projector generation"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(projector_generation_is_current(&db).unwrap());
+        scanner.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preclaimed_scanner_lease_survives_background_worker_handoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let owner = "019f64aa-0000-7000-8000-000000000024";
+        write_fixture(
+            &sessions.join("root.jsonl"),
+            &[meta("2026-07-15T09:00:00Z", owner, owner, false)],
+        );
+        let roots = IngestRoots {
+            active: Some(sessions),
+            archive: None,
+        };
+
+        let lease = IngestScannerLease::acquire(&db).unwrap();
+        let before_handoff = scan_one_shot(&db, &roots).unwrap_err();
+        assert!(format!("{before_handoff:#}").contains("live ingest scanner"));
+
+        let scanner =
+            spawn_scanner_with_lease(db.clone(), roots.clone(), Duration::from_secs(60), lease)
+                .unwrap();
+        let after_handoff = scan_one_shot(&db, &roots).unwrap_err();
+        assert!(format!("{after_handoff:#}").contains("live ingest scanner"));
+        scanner.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_rejects_conflicting_roots_while_live_scanner_owns_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions_a = temp.path().join("sessions-a");
+        let sessions_b = temp.path().join("sessions-b");
+        std::fs::create_dir(&sessions_a).unwrap();
+        std::fs::create_dir(&sessions_b).unwrap();
+        let owner_a = "019f64aa-0000-7000-8000-000000000022";
+        let owner_b = "019f64aa-0000-7000-8000-000000000023";
+        write_fixture(
+            &sessions_a.join("a.jsonl"),
+            &[meta("2026-07-15T09:00:00Z", owner_a, owner_a, false)],
+        );
+        write_fixture(
+            &sessions_b.join("b.jsonl"),
+            &[meta("2026-07-15T10:00:00Z", owner_b, owner_b, false)],
+        );
+        let roots_a = IngestRoots {
+            active: Some(sessions_a),
+            archive: None,
+        };
+        let roots_b = IngestRoots {
+            active: Some(sessions_b),
+            archive: None,
+        };
+
+        let scanner = spawn_scanner(db.clone(), roots_a, Duration::from_secs(60)).unwrap();
+        let first_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let ready = db
+                .connect()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM source_files WHERE rollout_id=?1)",
+                    [owner_a],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                != 0;
+            if ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < first_deadline,
+                "the live scanner did not finish its initial scan"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let attempt = scan_one_shot(&db, &roots_b);
+        scanner.shutdown();
+        let error = attempt.expect_err("one-shot ingestion displaced a live scanner");
+        assert!(
+            format!("{error:#}").contains("live ingest scanner"),
+            "unexpected one-shot conflict error: {error:#}"
+        );
+        let projection: (i64, i64, i64) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*),
+                        EXISTS(SELECT 1 FROM source_files WHERE rollout_id=?1),
+                        EXISTS(SELECT 1 FROM source_files WHERE rollout_id=?2)
+                 FROM source_files",
+                params![owner_a, owner_b],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(projection, (1, 1, 0));
+    }
+
+    #[test]
+    fn one_shot_scan_confirms_changed_root_and_reports_both_passes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions_a = temp.path().join("sessions-a");
+        let sessions_b = temp.path().join("sessions-b");
+        std::fs::create_dir(&sessions_a).unwrap();
+        std::fs::create_dir(&sessions_b).unwrap();
+        let owner_a = "019f64aa-0000-7000-8000-000000000010";
+        let owner_b = "019f64aa-0000-7000-8000-000000000011";
+        write_fixture(
+            &sessions_a.join("a.jsonl"),
+            &[meta("2026-07-15T09:00:00Z", owner_a, owner_a, false)],
+        );
+        write_fixture(
+            &sessions_b.join("b.jsonl"),
+            &[meta("2026-07-15T10:00:00Z", owner_b, owner_b, false)],
+        );
+        let roots_a = IngestRoots {
+            active: Some(sessions_a),
+            archive: None,
+        };
+        let roots_b = IngestRoots {
+            active: Some(sessions_b),
+            archive: None,
+        };
+
+        let initial = scan_one_shot(&db, &roots_a).unwrap();
+        assert_eq!(initial.files_seen, 2);
+        assert_eq!(initial.files_ingested, 1);
+        assert_eq!(initial.files_unchanged, 1);
+
+        let changed = scan_one_shot(&db, &roots_b).unwrap();
+        assert_eq!(changed.files_seen, 2);
+        assert_eq!(changed.files_ingested, 1);
+        assert_eq!(changed.files_unchanged, 1);
+        let projection: (i64, i64, String) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM source_files),
+                        (SELECT COUNT(*) FROM threads),
+                        (SELECT rollout_id FROM source_files)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(projection, (1, 1, owner_b.into()));
+
+        let unchanged = scan_one_shot(&db, &roots_b).unwrap();
+        assert_eq!(unchanged.files_seen, 1);
+        assert_eq!(unchanged.files_unchanged, 1);
+        assert_eq!(unchanged.files_ingested, 0);
+    }
+
+    #[test]
+    fn one_shot_confirmation_start_failure_is_finalized_as_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions_a = temp.path().join("sessions-a");
+        let sessions_b = temp.path().join("sessions-b");
+        std::fs::create_dir(&sessions_a).unwrap();
+        std::fs::create_dir(&sessions_b).unwrap();
+        let owner_a = "019f64aa-0000-7000-8000-000000000012";
+        let owner_b = "019f64aa-0000-7000-8000-000000000013";
+        write_fixture(
+            &sessions_a.join("a.jsonl"),
+            &[meta("2026-07-15T09:00:00Z", owner_a, owner_a, false)],
+        );
+        write_fixture(
+            &sessions_b.join("b.jsonl"),
+            &[meta("2026-07-15T10:00:00Z", owner_b, owner_b, false)],
+        );
+        scan_one_shot(
+            &db,
+            &IngestRoots {
+                active: Some(sessions_a),
+                archive: None,
+            },
+        )
+        .unwrap();
+
+        let error = scan_one_shot_with_between_pass(
+            &db,
+            &IngestRoots {
+                active: Some(sessions_b),
+                archive: None,
+            },
+            || {
+                db.connect()
+                    .unwrap()
+                    .execute_batch(
+                        "CREATE TRIGGER reject_confirmation_scan_start
+                         BEFORE UPDATE ON app_meta
+                         WHEN OLD.key='ingest_state' AND NEW.value='scanning'
+                         BEGIN
+                           SELECT RAISE(ABORT,'injected confirmation start failure');
+                         END;",
+                    )
+                    .unwrap();
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected confirmation start failure"),
+            "unexpected error: {error:#}"
+        );
+
+        let metadata: (String, String, String) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    (SELECT value FROM app_meta WHERE key='ingest_state'),
+                    (SELECT value FROM app_meta WHERE key='last_ingest_error'),
+                    (SELECT value FROM app_meta WHERE key='last_scan_report')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(metadata.0, "error");
+        assert!(metadata.1.contains("injected confirmation start failure"));
+        let report: ScanReport = serde_json::from_str(&metadata.2).unwrap();
+        assert_eq!(report.files_seen, 1);
+        assert_eq!(report.files_ingested, 1);
+        assert_eq!(
+            db.connect()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM source_files", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2,
+            "the failed confirmation has not yet reconciled the adopted roots"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_holds_ingest_lock_across_confirmation_pass() {
+        use std::sync::mpsc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let owner = "019f64aa-0000-7000-8000-000000000099";
+        write_fixture(
+            &sessions.join("root.jsonl"),
+            &[meta("2026-07-15T09:00:00Z", owner, owner, false)],
+        );
+        let roots = IngestRoots {
+            active: Some(sessions),
+            archive: None,
+        };
+        let (started_tx, started_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let mut worker = None;
+
+        scan_one_shot_with_between_pass(&db, &roots, || {
+            let contender_db = db.clone();
+            let contender_roots = roots.clone();
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                completed_tx
+                    .send(scan_once(&contender_db, &contender_roots))
+                    .unwrap();
+            }));
+            started_rx.recv().unwrap();
+            assert!(
+                completed_rx
+                    .recv_timeout(Duration::from_millis(100))
+                    .is_err(),
+                "a competing scan interleaved between one-shot passes"
+            );
+        })
+        .unwrap();
+
+        completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn genuinely_empty_projection_is_vacuously_current() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+
+        assert!(projector_generation_is_current(&db).unwrap());
+        let marker_count: i64 = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM app_meta WHERE key=?1",
+                [PROJECTOR_GENERATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            marker_count, 0,
+            "a read-only freshness check must not mutate state"
+        );
+    }
+
+    #[test]
+    fn stale_projector_generation_replays_unchanged_and_appended_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let file = sessions.join("root.jsonl");
+        let owner = "019f64aa-0000-7000-8000-000000000090";
+        let turn = "019f64ab-0000-7000-8000-000000000090";
+        let source_message_id = "explicit-source-message";
+        let scoped_message_id = projected_message_id(owner, source_message_id);
+        write_fixture(
+            &file,
+            &[
+                meta("2026-07-15T09:00:00Z", owner, owner, false),
+                task("2026-07-15T09:00:01Z", turn),
+                context("2026-07-15T09:00:01Z", turn, "gpt-5.5"),
+                serde_json::json!({
+                    "timestamp":"2026-07-15T09:00:01.500Z",
+                    "type":"response_item",
+                    "payload":{
+                        "type":"message",
+                        "id":source_message_id,
+                        "role":"user",
+                        "content":[{"type":"input_text","text":"Replay this message."}]
+                    }
+                }),
+                usage("2026-07-15T09:00:02Z", 100),
+            ],
+        );
+        let roots = IngestRoots {
+            active: Some(sessions),
+            archive: None,
+        };
+        scan_one_shot(&db, &roots).unwrap();
+        assert!(projector_generation_is_current(&db).unwrap());
+
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "DELETE FROM app_meta WHERE key=?1",
+                [PROJECTOR_GENERATION_KEY],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(
+            !projector_generation_is_current(&db).unwrap(),
+            "a nonempty projection without its completed-generation marker is stale"
+        );
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO app_meta(key,value) VALUES(?1,?2)",
+                params![PROJECTOR_GENERATION_KEY, PROJECTOR_GENERATION.to_string()],
+            )
+            .unwrap();
+        assert!(projector_generation_is_current(&db).unwrap());
+        connection
+            .execute(
+                "UPDATE source_files
+                 SET parse_state_json=json_remove(parse_state_json,'$.projector_generation')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET id=?1 WHERE id=?2",
+                params![source_message_id, scoped_message_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE events SET call_id=?1 WHERE call_id=?2",
+                params![source_message_id, scoped_message_id],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(!projector_generation_is_current(&db).unwrap());
+
+        let replay = scan_one_shot(&db, &roots).unwrap();
+        assert_eq!(replay.files_ingested, 1);
+        assert_eq!(replay.files_unchanged, 0);
+        assert_eq!(replay.records_read, 5);
+        assert!(projector_generation_is_current(&db).unwrap());
+        let message_identity: (i64, i64) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    EXISTS(SELECT 1 FROM messages WHERE id=?1),
+                    EXISTS(SELECT 1 FROM messages WHERE id=?2)",
+                params![source_message_id, scoped_message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            message_identity,
+            (0, 1),
+            "generation replay must replace legacy unscoped message IDs"
+        );
+
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE source_files
+                 SET parse_state_json=json_remove(parse_state_json,'$.projector_generation')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE app_meta SET value='0' WHERE key='projector_generation'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let mut append = File::options().append(true).open(&file).unwrap();
+        writeln!(
+            append,
+            "{}",
+            serde_json::to_string(&usage("2026-07-15T09:00:03Z", 200)).unwrap()
+        )
+        .unwrap();
+        drop(append);
+
+        let replay_with_append = scan_one_shot(&db, &roots).unwrap();
+        assert_eq!(replay_with_append.files_ingested, 1);
+        assert_eq!(replay_with_append.files_unchanged, 0);
+        assert_eq!(replay_with_append.records_read, 6);
+        assert!(projector_generation_is_current(&db).unwrap());
+    }
+
+    #[test]
+    fn interrupted_generation_replay_resumes_before_advancing_global_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let owner_a = "019f64aa-0000-7000-8000-000000000091";
+        let owner_b = "019f64aa-0000-7000-8000-000000000092";
+        write_fixture(
+            &sessions.join("a.jsonl"),
+            &[meta("2026-07-15T09:00:00Z", owner_a, owner_a, false)],
+        );
+        write_fixture(
+            &sessions.join("b.jsonl"),
+            &[meta("2026-07-15T10:00:00Z", owner_b, owner_b, false)],
+        );
+        let roots = IngestRoots {
+            active: Some(sessions),
+            archive: None,
+        };
+        scan_one_shot(&db, &roots).unwrap();
+
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE source_files
+                 SET parse_state_json=json_remove(parse_state_json,'$.projector_generation')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE app_meta SET value='0' WHERE key='projector_generation'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_second_generation_replay
+                 BEFORE INSERT ON rollouts
+                 WHEN NEW.id='{owner_b}'
+                 BEGIN
+                   SELECT RAISE(ABORT,'injected generation replay failure');
+                 END;"
+            ))
+            .unwrap();
+        drop(connection);
+
+        let error = scan_one_shot(&db, &roots).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected generation replay failure"),
+            "unexpected replay error: {error:#}"
+        );
+        assert!(!projector_generation_is_current(&db).unwrap());
+        let generations: (i64, i64) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    COALESCE(CAST(json_extract(
+                        (SELECT parse_state_json FROM source_files WHERE rollout_id=?1),
+                        '$.projector_generation'
+                    ) AS INTEGER),0),
+                    COALESCE(CAST(json_extract(
+                        (SELECT parse_state_json FROM source_files WHERE rollout_id=?2),
+                        '$.projector_generation'
+                    ) AS INTEGER),0)",
+                params![owner_a, owner_b],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(generations, (PROJECTOR_GENERATION as i64, 0));
+
+        db.connect()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_second_generation_replay")
+            .unwrap();
+        let resumed = scan_one_shot(&db, &roots).unwrap();
+        assert_eq!(resumed.files_unchanged, 1);
+        assert_eq!(resumed.files_ingested, 1);
+        assert!(projector_generation_is_current(&db).unwrap());
+    }
+
     #[test]
     fn unchanged_scan_is_idempotent_and_partial_line_waits() {
         let temp = tempfile::tempdir().unwrap();
@@ -6749,6 +8964,47 @@ Trace the real first prompt."#;
             .query_row("SELECT COUNT(*) FROM usage_facts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(final_count, 2);
+    }
+
+    #[test]
+    fn file_projection_claims_writer_before_read_snapshot_can_go_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let file = sessions.join("writer-race.jsonl");
+        let owner = "019f64aa-0000-7000-8000-000000000150";
+        write_fixture(&file, &[meta("2026-07-15T09:00:00Z", owner, owner, false)]);
+        let competing_db = db.clone();
+        let competing_write_committed = Arc::new(AtomicBool::new(false));
+        let committed_for_hook = competing_write_committed.clone();
+        set_process_file_after_transaction_read_hook(move || {
+            let connection = competing_db.connect().unwrap();
+            connection.busy_timeout(Duration::ZERO).unwrap();
+            if connection
+                .execute(
+                    "INSERT INTO app_meta(key,value) VALUES('pricing-race-probe','committed')",
+                    [],
+                )
+                .is_ok()
+            {
+                committed_for_hook.store(true, Ordering::Release);
+            }
+        });
+
+        let report = scan_once(
+            &db,
+            &IngestRoots {
+                active: Some(sessions),
+                archive: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.files_ingested, 1);
+        assert!(
+            !competing_write_committed.load(Ordering::Acquire),
+            "a competing writer committed after the projection read snapshot"
+        );
     }
 
     #[cfg(unix)]
@@ -7415,8 +9671,8 @@ Trace the real first prompt."#;
         let connection = db.connect().unwrap();
         let content: String = connection
             .query_row(
-                "SELECT content FROM messages WHERE id='large-message'",
-                [],
+                "SELECT content FROM messages WHERE id=?1",
+                [projected_message_id(owner, "large-message")],
                 |row| row.get(0),
             )
             .unwrap();
@@ -9152,6 +11408,88 @@ Trace the real first prompt."#;
         assert_eq!(recovered.0, "error");
         assert!(recovered.1.contains("exited before completing"));
         assert!(!recover_interrupted_scan(&db).unwrap());
+    }
+
+    #[test]
+    fn unexpected_scan_error_is_finalized_after_scanning_begins() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        set_scan_after_start_hook(|_| Err(anyhow!("injected post-start scan failure")));
+
+        let error = scan_once(
+            &db,
+            &IngestRoots {
+                active: None,
+                archive: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected post-start scan failure"),
+            "unexpected error: {error:#}"
+        );
+
+        let metadata: (String, String, String, String) = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    (SELECT value FROM app_meta WHERE key='ingest_state'),
+                    (SELECT value FROM app_meta WHERE key='last_ingest_error'),
+                    (SELECT value FROM app_meta WHERE key='last_ingest_attempt_at'),
+                    (SELECT value FROM app_meta WHERE key='last_scan_report')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(metadata.0, "error");
+        assert!(metadata.1.contains("injected post-start scan failure"));
+        assert!(!metadata.2.is_empty());
+        let report: ScanReport = serde_json::from_str(&metadata.3).unwrap();
+        assert_eq!(report.files_seen, 0);
+        assert_eq!(report.files_failed, 0);
+    }
+
+    #[test]
+    fn scan_finalizer_failure_does_not_replace_the_original_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        set_scan_after_start_hook(|db| {
+            db.connect()?.execute_batch(
+                "CREATE TRIGGER reject_scan_finalizer
+                 BEFORE UPDATE ON app_meta
+                 WHEN OLD.key='ingest_state' AND NEW.value<>'scanning'
+                 BEGIN
+                   SELECT RAISE(ABORT,'injected finalizer failure');
+                 END;",
+            )?;
+            Err(anyhow!("original post-start scan failure"))
+        });
+
+        let error = scan_once(
+            &db,
+            &IngestRoots {
+                active: None,
+                archive: None,
+            },
+        )
+        .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("original post-start scan failure"));
+        assert!(!detail.contains("injected finalizer failure"));
+
+        let connection = db.connect().unwrap();
+        let state: String = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key='ingest_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "scanning");
+        connection
+            .execute_batch("DROP TRIGGER reject_scan_finalizer")
+            .unwrap();
     }
 
     #[test]

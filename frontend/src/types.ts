@@ -219,6 +219,13 @@ export interface PriceRow {
 }
 
 export interface PriceAlias { observedModelId: string; canonicalModelId: string }
+export interface AliasesResponse {
+  items: PriceAlias[]
+  page: number
+  pageSize: number
+  total: number
+  totalPages: number
+}
 export interface UnknownModel {
   modelId: string
   usageCount: number
@@ -238,8 +245,6 @@ export interface PricesResponse {
   source: string | null
 }
 export interface PriceMetadataResponse {
-  aliases: PriceAlias[]
-  aliasesTotal: number
   observedUnknown: UnknownModel[]
   observedUnknownTotal: number
 }
