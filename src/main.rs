@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, bail};
 use codex_usage::{
-    api::{self, ApiState},
+    analytics,
+    app::AppDependencies,
     config::{Command, parse_cli, require_repository_root},
-    db::Db,
-    db_executor::DbExecutor,
     ingest::{self, IngestRoots},
-    pricing::PricingSync,
+    pricing::{ManualPricingStore, PricingSync},
+    storage::{DatabaseLocation, Db, StorageExecutor},
+    web::server,
 };
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -38,13 +39,12 @@ async fn run() -> Result<()> {
     match cli.command.expect("the parser always supplies a command") {
         Command::Ingest(args) => {
             let common = args.common.resolved();
-            // Opening SQLite performs migrations, seed writes, and manual
-            // pricing hydration. Claim ownership from the canonical storage
-            // path before any of those shared-state mutations can occur.
+            // Claim scanner ownership before any database or pricing-state
+            // mutation can occur.
             let scanner_lease = ingest::IngestScannerLease::acquire_path(&common.db)?;
-            let db = open_configured_db(&common)?;
+            let (db, _manual_pricing) = open_configured_db(&common)?;
             ingest::recover_interrupted_scan(&db)?;
-            PricingSync::new(DbExecutor::default())
+            PricingSync::new(StorageExecutor::default())
                 .sync_if_needed(&db, &common.pricing())
                 .await?;
             let report = ingest::scan_one_shot_with_lease(
@@ -75,7 +75,7 @@ async fn run() -> Result<()> {
             let scanner_lease = (!args.no_ingest)
                 .then(|| ingest::IngestScannerLease::acquire_path(&common.db))
                 .transpose()?;
-            let db = open_configured_db(&common)?;
+            let (db, manual_pricing) = open_configured_db(&common)?;
             ingest::recover_interrupted_scan(&db)?;
             let pricing_config = common.pricing();
             let roots = IngestRoots {
@@ -101,13 +101,10 @@ async fn run() -> Result<()> {
                 )
                 .context("failed to rebuild stale SQLite projection")?;
             }
-            api::prewarm_current_year_analytics(&db)?;
-            let state = ApiState::new(
-                db.clone(),
-                roots.clone(),
-                args.frontend,
-                pricing_config.clone(),
-            );
+            analytics::prewarm_current_year_analytics(&db)?;
+            let frontend = args.frontend.clone();
+            let executor = StorageExecutor::default();
+            let pricing_sync = PricingSync::new(executor.clone());
             let scanner = scanner_lease
                 .map(|lease| {
                     ingest::spawn_scanner_with_lease(
@@ -118,8 +115,19 @@ async fn run() -> Result<()> {
                     )
                 })
                 .transpose()?;
-            let pricing_refresher = state.pricing_sync.spawn_refresher(db, pricing_config);
-            let serve_result = api::serve(state, listener).await;
+            let pricing_refresher =
+                pricing_sync.spawn_refresher(db.clone(), pricing_config.clone());
+            let app = AppDependencies::new(
+                db,
+                roots,
+                frontend,
+                pricing_config,
+                executor,
+                pricing_sync,
+                manual_pricing,
+            )
+            .build();
+            let serve_result = server::serve(app, listener).await;
             if let Some(scanner) = scanner {
                 scanner.shutdown();
             }
@@ -130,11 +138,18 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-fn open_configured_db(common: &codex_usage::config::CommonArgs) -> Result<Db> {
-    match common.pricing_config.as_ref() {
-        Some(path) => Db::open_with_pricing_config(&common.db, path),
-        None => Db::open(&common.db),
-    }
+fn open_configured_db(
+    common: &codex_usage::config::CommonArgs,
+) -> Result<(Db, ManualPricingStore)> {
+    let location = DatabaseLocation::prepare(&common.db)?;
+    let pricing_path = common
+        .pricing_config
+        .clone()
+        .unwrap_or_else(|| location.path().with_extension("pricing.json"));
+    let manual_pricing = ManualPricingStore::new(pricing_path)?;
+    let db = location.open()?;
+    manual_pricing.hydrate(&db)?;
+    Ok((db, manual_pricing))
 }
 
 #[cfg(unix)]

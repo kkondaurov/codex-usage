@@ -37,6 +37,11 @@ interface SurfaceTiming {
   apiMs: number
 }
 
+interface ActivityTiming {
+  page: SurfaceTiming
+  firstExpansion: SurfaceTiming
+}
+
 async function withColdBrowserContext<T>(browser: Browser, run: (page: Page) => Promise<T>) {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1_000 },
@@ -164,6 +169,45 @@ async function measureColdCostSortedSessions(page: Page, baseUrl: string): Promi
   return { renderMs, apiMs }
 }
 
+async function measureColdActivity(page: Page, baseUrl: string): Promise<ActivityTiming> {
+  const threadId = 'scale-thread-07-001'
+  const turnId = 'scale-turn-07-001'
+  const pageResponse = page.waitForResponse(candidate => {
+    const url = new URL(candidate.url())
+    return url.pathname === `/api/v1/sessions/${threadId}/activity`
+  }, { timeout: SURFACE_WAIT_TIMEOUT_MS })
+  const pageStartedAt = performance.now()
+  const pageApiTime = coldApiTime(pageResponse, pageStartedAt)
+  const rootRow = page.locator('.activity-table .activity-event.expandable').first()
+  const pageRenderTime = coldRenderTime(rootRow, pageStartedAt)
+  const [, pageRenderMs, pageApiMs] = await Promise.all([
+    page.goto(`${baseUrl}/sessions/${threadId}?tab=activity`),
+    pageRenderTime,
+    pageApiTime,
+  ])
+
+  const detailResponse = page.waitForResponse(candidate => {
+    const url = new URL(candidate.url())
+    return url.pathname === `/api/v1/sessions/${threadId}/activity/${turnId}`
+  }, { timeout: SURFACE_WAIT_TIMEOUT_MS })
+  const detailStartedAt = performance.now()
+  const detailApiTime = coldApiTime(detailResponse, detailStartedAt)
+  const detailRenderTime = coldRenderTime(
+    page.locator('.activity-event-details .activity-child-list').first(),
+    detailStartedAt,
+  )
+  const [, detailRenderMs, detailApiMs] = await Promise.all([
+    rootRow.getByRole('button').click(),
+    detailRenderTime,
+    detailApiTime,
+  ])
+
+  return {
+    page: { renderMs: pageRenderMs, apiMs: pageApiMs },
+    firstExpansion: { renderMs: detailRenderMs, apiMs: detailApiMs },
+  }
+}
+
 function summarize(samples: number[]) {
   const sorted = [...samples].sort((left, right) => left - right)
   const percentile = (fraction: number) => sorted[Math.ceil(sorted.length * fraction) - 1]
@@ -178,11 +222,12 @@ function summarize(samples: number[]) {
 test.describe('cold analytical performance', () => {
   test.describe.configure({ retries: 0, timeout: 180_000 })
 
-  test(`Overview and every Stats range stay below ${PRODUCT_TARGET_MS}ms with median headroom`, async ({ browser, app }, testInfo) => {
+  test(`cold analytical and Activity surfaces stay below ${PRODUCT_TARGET_MS}ms with median headroom`, async ({ browser, app }, testInfo) => {
     const overview: OverviewTiming[] = []
     const stats = Object.fromEntries(STATS_RANGES.map(range => [range, [] as SurfaceTiming[]])) as Record<StatsRange, SurfaceTiming[]>
     const overviewToStats: SurfaceTiming[] = []
     const costSortedSessions: SurfaceTiming[] = []
+    const activity: ActivityTiming[] = []
 
     for (let sample = 0; sample < COLD_SAMPLE_COUNT; sample += 1) {
       overview.push(await withColdBrowserContext(browser, page => measureColdOverview(page, app.baseUrl)))
@@ -191,6 +236,7 @@ test.describe('cold analytical performance', () => {
       }
       overviewToStats.push(await withColdBrowserContext(browser, page => measureColdOverviewToStats(page, app.baseUrl)))
       costSortedSessions.push(await withColdBrowserContext(browser, page => measureColdCostSortedSessions(page, app.baseUrl)))
+      activity.push(await withColdBrowserContext(browser, page => measureColdActivity(page, app.baseUrl)))
     }
 
     const renderSamples: Record<string, number[]> = Object.fromEntries(
@@ -211,6 +257,10 @@ test.describe('cold analytical performance', () => {
     apiSamples['Overview to Stats API'] = overviewToStats.map(sample => sample.apiMs)
     renderSamples['Sessions sorted by cost'] = costSortedSessions.map(sample => sample.renderMs)
     apiSamples['Sessions sorted by cost API'] = costSortedSessions.map(sample => sample.apiMs)
+    renderSamples['Activity root page'] = activity.map(sample => sample.page.renderMs)
+    apiSamples['Activity root page API'] = activity.map(sample => sample.page.apiMs)
+    renderSamples['Activity first expansion'] = activity.map(sample => sample.firstExpansion.renderMs)
+    apiSamples['Activity first expansion API'] = activity.map(sample => sample.firstExpansion.apiMs)
 
     const report = {
       productTargetMs: PRODUCT_TARGET_MS,
@@ -227,7 +277,7 @@ test.describe('cold analytical performance', () => {
         usageGroups: 12 * (overviewScaleThreadsPerMonth + overviewScaleAdditionalGroupsPerMonth),
         activityPairs: 12 * (overviewScaleThreadsPerMonth + overviewScaleAdditionalGroupsPerMonth),
       },
-      raw: { overview, stats, overviewToStats, costSortedSessions },
+      raw: { overview, stats, overviewToStats, costSortedSessions, activity },
       summaries: {
         render: Object.fromEntries(Object.entries(renderSamples).map(([surface, samples]) => [surface, summarize(samples)])),
         api: Object.fromEntries(Object.entries(apiSamples).map(([surface, samples]) => [surface, summarize(samples)])),

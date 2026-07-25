@@ -1,6 +1,6 @@
 use codex_usage::{
-    db::Db,
     ingest::{IngestRoots, scan_once},
+    storage::Db,
 };
 use rusqlite::Connection;
 use serde_json::{Value, json};

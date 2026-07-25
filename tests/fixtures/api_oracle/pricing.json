@@ -1,0 +1,48 @@
+{
+  "aliases": {
+    "items": [],
+    "page": 1,
+    "pageSize": 10,
+    "total": 0,
+    "totalPages": 0
+  },
+  "metadata": {
+    "observedUnknown": [
+      {
+        "lastSeenAt": "2026-07-15T04:52:31.529000000Z",
+        "modelId": "codex-auto-review",
+        "totalTokens": 25607,
+        "usageCount": 1
+      }
+    ],
+    "observedUnknownTotal": 1
+  },
+  "modelIds": {
+    "items": [
+      "gpt-5.5"
+    ]
+  },
+  "prices": {
+    "items": [
+      {
+        "cachedInputPerMillion": "0.50",
+        "currency": "USD",
+        "effectiveFrom": "1970-01-01T00:00:00Z",
+        "effectiveTo": null,
+        "inputPerMillion": "5.00",
+        "modelId": "gpt-5.5",
+        "outputPerMillion": "30.00",
+        "source": "fixture"
+      }
+    ],
+    "lastRefreshAt": null,
+    "lastRefreshErrorAt": null,
+    "page": 1,
+    "pageSize": 10,
+    "refreshError": null,
+    "refreshErrorKind": null,
+    "source": null,
+    "total": 1,
+    "totalPages": 1
+  }
+}

@@ -5,10 +5,11 @@ use axum::{
 };
 use chrono::Utc;
 use codex_usage::{
-    api::{ApiState, router},
+    app::AppDependencies,
     config::PricingConfig,
-    db::Db,
     ingest::{IngestRoots, scan_once},
+    pricing::{ManualPricingStore, PricingSync},
+    storage::{Db, StorageExecutor},
 };
 use serde_json::{Value, json};
 use std::{
@@ -96,7 +97,11 @@ fn projected_message_id(source_id: &str) -> String {
 }
 
 fn api(db: Db, roots: IngestRoots, frontend: PathBuf) -> Router {
-    router(ApiState::new(
+    let executor = StorageExecutor::default();
+    let pricing_sync = PricingSync::new(executor.clone());
+    let manual_pricing = ManualPricingStore::new(db.path().with_extension("pricing.json")).unwrap();
+    manual_pricing.hydrate(&db).unwrap();
+    AppDependencies::new(
         db,
         roots,
         frontend,
@@ -105,7 +110,11 @@ fn api(db: Db, roots: IngestRoots, frontend: PathBuf) -> Router {
             refresh_interval_hours: 24,
             timeout_seconds: 1,
         },
-    ))
+        executor,
+        pricing_sync,
+        manual_pricing,
+    )
+    .build()
 }
 
 async fn status_json(app: &Router) -> Value {

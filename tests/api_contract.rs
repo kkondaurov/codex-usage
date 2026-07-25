@@ -9,10 +9,11 @@ use chrono::{
     DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, SecondsFormat, TimeZone, Utc,
 };
 use codex_usage::{
-    api::{ApiState, router},
+    app::AppDependencies,
     config::PricingConfig,
-    db::Db,
     ingest::{IngestRoots, scan_once},
+    pricing::{ManualPricingStore, PricingSync},
+    storage::{Db, StorageExecutor},
 };
 use serde_json::{Value, json};
 use std::{
@@ -116,6 +117,8 @@ fn harness_with_pricing_url(pricing_url: String) -> ApiHarness {
     fs::write(frontend.join("assets/app.js"), "window.fixtureApp = true").unwrap();
 
     let db = Db::open(temp.path().join("data/codex-usage.db")).unwrap();
+    let manual_pricing = ManualPricingStore::new(db.path().with_extension("pricing.json")).unwrap();
+    manual_pricing.hydrate(&db).unwrap();
     exact_fixture_prices(&db);
     let roots = IngestRoots {
         active: Some(active),
@@ -124,7 +127,9 @@ fn harness_with_pricing_url(pricing_url: String) -> ApiHarness {
     let report = scan_once(&db, &roots).unwrap();
     assert_eq!(report.files_seen, 9);
     assert_eq!(report.files_failed, 0);
-    let app = router(ApiState::new(
+    let executor = StorageExecutor::default();
+    let pricing_sync = PricingSync::new(executor.clone());
+    let app = AppDependencies::new(
         db.clone(),
         roots.clone(),
         frontend,
@@ -133,7 +138,11 @@ fn harness_with_pricing_url(pricing_url: String) -> ApiHarness {
             refresh_interval_hours: 24,
             timeout_seconds: 2,
         },
-    ));
+        executor,
+        pricing_sync,
+        manual_pricing,
+    )
+    .build();
     ApiHarness {
         _temp: temp,
         app,
@@ -247,6 +256,311 @@ async fn get_json(app: &Router, uri: &str) -> Value {
         Some("application/json")
     );
     serde_json::from_slice(&body).unwrap()
+}
+
+fn json_object_subset(value: &Value, keys: &[&str]) -> Value {
+    Value::Object(
+        keys.iter()
+            .map(|key| ((*key).to_owned(), value[*key].clone()))
+            .collect(),
+    )
+}
+
+fn assert_exact_json_keys(value: &Value, expected: &[&str]) {
+    let object = value.as_object().expect("expected a JSON object");
+    let actual = object.keys().map(String::as_str).collect::<HashSet<_>>();
+    let expected = expected.iter().copied().collect::<HashSet<_>>();
+    assert_eq!(actual, expected);
+    assert_eq!(object.len(), expected.len());
+}
+
+fn canonical_totals(value: &Value) -> Value {
+    json_object_subset(
+        value,
+        &[
+            "inputTokens",
+            "cachedInputTokens",
+            "outputTokens",
+            "reasoningTokens",
+            "blendedTokens",
+            "totalTokens",
+            "costUsd",
+            "unpricedTokens",
+            "pricingComplete",
+        ],
+    )
+}
+
+fn canonical_usage_summary(value: &Value) -> Value {
+    json_object_subset(
+        value,
+        &[
+            "totalTokens",
+            "costUsd",
+            "unpricedTokens",
+            "pricingComplete",
+        ],
+    )
+}
+
+fn canonical_session_row(value: &Value) -> Value {
+    json_object_subset(
+        value,
+        &[
+            "id",
+            "rootThreadId",
+            "startedAt",
+            "lastEventAt",
+            "title",
+            "project",
+            "branch",
+            "status",
+            "messageCount",
+            "turnCount",
+            "agentCount",
+            "toolCount",
+            "totalTokens",
+            "costUsd",
+            "unpricedTokens",
+            "lifetimeCostUsd",
+            "lifetimeUnpricedTokens",
+        ],
+    )
+}
+
+fn canonical_session_listing_row(value: &Value) -> Value {
+    json_object_subset(
+        value,
+        &[
+            "id",
+            "lastEventAt",
+            "messageCount",
+            "totalTokens",
+            "costUsd",
+            "unpricedTokens",
+        ],
+    )
+}
+
+fn canonical_session_page(value: &Value) -> Value {
+    json!({
+        "page": value["page"],
+        "pageSize": value["pageSize"],
+        "total": value["total"],
+        "totalPages": value["totalPages"],
+        "items": value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(canonical_session_listing_row)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn canonical_activity_item(value: &Value) -> Value {
+    let mut item = serde_json::Map::new();
+    for key in [
+        "id",
+        "turnId",
+        "agentLabel",
+        "timestamp",
+        "kind",
+        "role",
+        "label",
+        "body",
+        "status",
+        "toolName",
+        "durationMs",
+        "model",
+        "hasDetails",
+        "childPage",
+        "childPageSize",
+        "childTotal",
+        "childHasMore",
+        "childNextCursor",
+        "counts",
+    ] {
+        if !value[key].is_null() {
+            item.insert(key.to_owned(), value[key].clone());
+        }
+    }
+    if !value["usage"].is_null() {
+        item.insert("usage".to_owned(), canonical_usage_summary(&value["usage"]));
+    }
+    if let Some(children) = value["children"].as_array()
+        && !children.is_empty()
+    {
+        item.insert(
+            "children".to_owned(),
+            Value::Array(children.iter().map(canonical_activity_item).collect()),
+        );
+    }
+    Value::Object(item)
+}
+
+fn canonical_activity_page(value: &Value) -> Value {
+    json!({
+        "page": value["page"],
+        "pageSize": value["pageSize"],
+        "total": value["total"],
+        "totalPages": value["totalPages"],
+        "days": value["days"].as_array().unwrap().iter().map(|day| json!({
+            "date": day["date"],
+            "durationMs": day["durationMs"],
+            "totals": canonical_usage_summary(&day["totals"]),
+        })).collect::<Vec<_>>(),
+        "items": value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(canonical_activity_item)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn assert_activity_item_wire_keys(value: &Value, pagination_keys: &[&str]) {
+    let mut keys = vec![
+        "id",
+        "turnId",
+        "rolloutId",
+        "agentRunId",
+        "agentLabel",
+        "timestamp",
+        "kind",
+        "role",
+        "label",
+        "body",
+        "status",
+        "toolName",
+        "durationMs",
+        "model",
+        "effort",
+        "hasDetails",
+        "children",
+        "usage",
+        "counts",
+    ];
+    keys.extend_from_slice(pagination_keys);
+    assert_exact_json_keys(value, &keys);
+    assert!(value["children"].is_array());
+    if !value["usage"].is_null() {
+        assert_exact_json_keys(
+            &value["usage"],
+            &[
+                "inputTokens",
+                "cachedInputTokens",
+                "outputTokens",
+                "reasoningTokens",
+                "blendedTokens",
+                "totalTokens",
+                "costUsd",
+                "unpricedTokens",
+                "pricingComplete",
+            ],
+        );
+    }
+    if !value["counts"].is_null() {
+        assert_exact_json_keys(
+            &value["counts"],
+            &[
+                "modelCalls",
+                "toolCalls",
+                "agentRuns",
+                "reviews",
+                "followUps",
+            ],
+        );
+    }
+}
+
+fn canonical_stats_row(value: &Value, range: &str) -> Value {
+    let bucket = if range == "day" {
+        DateTime::parse_from_rfc3339(value["periodStart"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Utc)
+            .format("%H:%MZ")
+            .to_string()
+    } else {
+        value["label"].as_str().unwrap().to_owned()
+    };
+    json!({
+        "bucket": bucket,
+        "sessionCount": value["sessionCount"],
+        "totals": canonical_usage_summary(value),
+    })
+}
+
+fn canonical_stats(value: &Value) -> Value {
+    let range = value["range"].as_str().unwrap();
+    let rows = value["rows"].as_array().unwrap();
+    let active_rows = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row["sessionCount"].as_u64().unwrap() > 0 || row["totalTokens"].as_u64().unwrap() > 0
+        })
+        .map(|(index, row)| {
+            json!({
+                "row": canonical_stats_row(row, range),
+                "trend": value["trend"][index],
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut snapshot = json!({
+        "range": value["range"],
+        "anchor": value["anchor"],
+        "label": value["label"],
+        "totals": canonical_totals(&value["totals"]),
+        "rowCount": rows.len(),
+        "activeRows": active_rows,
+        "trendCount": value["trend"].as_array().unwrap().len(),
+    });
+    if value["range"] == "all" {
+        snapshot["anchor"] = json!("$TODAY");
+        snapshot["rowCount"] = json!("$DATA_THROUGH_CURRENT_YEAR");
+        snapshot["trendCount"] = json!("$MATCHES_ROW_COUNT");
+    }
+    snapshot
+}
+
+fn query_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+fn canonical_overview_contract(value: &Value) -> Value {
+    let periods = ["today", "week", "month"]
+        .into_iter()
+        .map(|period| {
+            let value = &value["periods"][period];
+            (
+                period.to_owned(),
+                json!({
+                    "label": value["label"],
+                    "startIsTimestamp": DateTime::parse_from_rfc3339(value["start"].as_str().unwrap()).is_ok(),
+                    "endIsTimestamp": DateTime::parse_from_rfc3339(value["end"].as_str().unwrap()).is_ok(),
+                    "sessionCountIsNumber": value["sessionCount"].is_number(),
+                    "messageCountIsNumber": value["messageCount"].is_number(),
+                    "totalsKeys": value["totals"].as_object().unwrap().keys().collect::<Vec<_>>(),
+                    "deltaCostIsNullableUsd": value["deltaCostUsd"].is_null() || value["deltaCostUsd"].is_string(),
+                    "deltaPercentIsNullableNumber": value["deltaPercent"].is_null() || value["deltaPercent"].is_number(),
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "updatedAtIsTimestamp": value["updatedAt"]
+            .as_str()
+            .is_some_and(|timestamp| DateTime::parse_from_rfc3339(timestamp).is_ok()),
+        "periods": periods,
+    })
 }
 
 fn assert_number(value: &Value, key: &str) {
@@ -371,6 +685,293 @@ fn local_transition_day(year: i32) -> NaiveDate {
 }
 
 #[tokio::test]
+async fn api_surface_matches_the_reviewed_characterization_oracle() {
+    let harness = harness();
+
+    let status = get_json(&harness.app, "/api/v1/status").await;
+    let overview = get_json(&harness.app, "/api/v1/overview").await;
+    let overview_year = get_json(&harness.app, "/api/v1/overview/year?year=2026").await;
+    let active_heatmap = overview_year["heatmap"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|day| {
+            day["sessionCount"].as_u64().unwrap() > 0
+                || day["messageCount"].as_u64().unwrap() > 0
+                || day["totalTokens"].as_u64().unwrap() > 0
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut stats = serde_json::Map::new();
+    for (range, anchor) in [
+        ("day", "2026-07-15"),
+        ("week", "2026-07-15"),
+        ("month", "2026-07-15"),
+        ("year", "2026-07-15"),
+    ] {
+        let response = get_json(
+            &harness.app,
+            &format!("/api/v1/stats?range={range}&anchor={anchor}"),
+        )
+        .await;
+        stats.insert(range.to_owned(), canonical_stats(&response));
+    }
+    let stats_all = get_json(&harness.app, "/api/v1/stats?range=all").await;
+    stats.insert("all".to_owned(), canonical_stats(&stats_all));
+
+    let recent_first = get_json(
+        &harness.app,
+        "/api/v1/sessions?sort=recent&page=1&pageSize=2",
+    )
+    .await;
+    let recent_second = get_json(
+        &harness.app,
+        "/api/v1/sessions?sort=recent&page=2&pageSize=2",
+    )
+    .await;
+    let cost_first = get_json(&harness.app, "/api/v1/sessions?sort=cost&page=1&pageSize=3").await;
+    let searched = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions?q={RICH_SESSION}&pageSize=50"),
+    )
+    .await;
+    let project = get_json(
+        &harness.app,
+        "/api/v1/sessions?project=codex-dashboard&pageSize=50",
+    )
+    .await;
+    let date = get_json(&harness.app, "/api/v1/sessions?date=2026-07-15&pageSize=50").await;
+    let bounded = get_json(
+        &harness.app,
+        "/api/v1/sessions?start=2026-07-15T20%3A13%3A30Z&end=2026-07-15T20%3A13%3A35Z&pageSize=50",
+    )
+    .await;
+    let projects = get_json(&harness.app, "/api/v1/projects").await;
+
+    let summary = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{RICH_SESSION}/summary"),
+    )
+    .await;
+
+    let activity = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{RICH_SESSION}/activity?page=1&pageSize=25"),
+    )
+    .await;
+    let activity_id = activity["items"][0]["id"].as_str().unwrap();
+    let detail_first = get_json(
+        &harness.app,
+        &format!(
+            "/api/v1/sessions/{RICH_SESSION}/activity/{activity_id}?childPage=1&childPageSize=3"
+        ),
+    )
+    .await;
+    let child_cursor = detail_first["childNextCursor"]
+        .as_str()
+        .expect("the rich fixture must exercise Activity cursor pagination");
+    let detail_cursor = get_json(
+        &harness.app,
+        &format!(
+            "/api/v1/sessions/{RICH_SESSION}/activity/{activity_id}?childPageSize=3&childCursor={}",
+            query_component(child_cursor)
+        ),
+    )
+    .await;
+
+    let replay_activity = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{JULY_REPLAY_SESSION}/activity?page=1&pageSize=25"),
+    )
+    .await;
+    let replay_id = replay_activity["items"][0]["id"].as_str().unwrap();
+    let replay_detail = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{JULY_REPLAY_SESSION}/activity/{replay_id}"),
+    )
+    .await;
+    let group = replay_detail["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.ends_with("_group"))
+        })
+        .expect("the replay fixture must expose a synthetic Activity group");
+    let group_detail = get_json(
+        &harness.app,
+        &format!(
+            "/api/v1/sessions/{JULY_REPLAY_SESSION}/activity/{}?childPage=1&childPageSize=1",
+            group["id"].as_str().unwrap()
+        ),
+    )
+    .await;
+
+    let settings = get_json(&harness.app, "/api/v1/settings").await;
+    let prices = get_json(&harness.app, "/api/v1/prices?q=gpt-5.5&page=1&pageSize=10").await;
+    let price_metadata = get_json(&harness.app, "/api/v1/prices/metadata?unknownLimit=10").await;
+    let model_ids = get_json(&harness.app, "/api/v1/prices/model-ids?q=gpt-5.5&limit=10").await;
+    let aliases = get_json(&harness.app, "/api/v1/aliases?page=1&pageSize=10").await;
+
+    let (missing_status, missing_headers, missing_body) = raw_request(
+        &harness.app,
+        Method::GET,
+        "/api/v1/sessions/missing/summary",
+        None,
+    )
+    .await;
+    let (unknown_status, unknown_headers, unknown_body) =
+        raw_request(&harness.app, Method::GET, "/api/v1/not-a-route", None).await;
+    let (method_status, method_headers, method_body) =
+        raw_request(&harness.app, Method::POST, "/api/v1/status", None).await;
+    let (query_status, query_headers, query_body) = raw_request(
+        &harness.app,
+        Method::GET,
+        "/api/v1/stats?range=quarter",
+        None,
+    )
+    .await;
+
+    let route_contract = |status: StatusCode, headers: HeaderMap, body: Bytes| {
+        json!({
+            "status": status.as_u16(),
+            "contentType": headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap()),
+            "allow": headers.get("allow").and_then(|value| value.to_str().ok()),
+            "body": serde_json::from_slice::<Value>(&body).unwrap(),
+        })
+    };
+
+    let actual = json!({
+        "system": {
+            "status": {
+                "state": status["state"],
+                "filesScanned": status["filesScanned"],
+                "filesFailed": status["filesFailed"],
+                "lastIngestAtIsTimestamp": status["lastIngestAt"]
+                    .as_str()
+                    .is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok()),
+                "lastIngestAttemptAtIsTimestamp": status["lastIngestAttemptAt"]
+                    .as_str()
+                    .is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok()),
+                "lastEventAt": status["lastEventAt"],
+            },
+            "settings": {
+                "databasePath": "$DATABASE",
+                "activeRoot": "$ACTIVE_ROOT",
+                "archiveRoot": "$ARCHIVE_ROOT",
+                "timezoneIsNonempty": settings["timezone"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "lastIngestAtIsTimestamp": settings["lastIngestAt"]
+                    .as_str()
+                    .is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok()),
+                "sessionCount": settings["sessionCount"],
+                "databaseBytesIsPositive": settings["databaseBytes"].as_u64().unwrap() > 0,
+                "pricing": settings["pricing"],
+            },
+        },
+        "routes": {
+            "missingSession": route_contract(missing_status, missing_headers, missing_body),
+            "unknownApi": route_contract(unknown_status, unknown_headers, unknown_body),
+            "wrongMethod": route_contract(method_status, method_headers, method_body),
+            "invalidQuery": route_contract(query_status, query_headers, query_body),
+        },
+        "analytics": {
+            "overviewContract": canonical_overview_contract(&overview),
+            "year": {
+                "year": overview_year["year"],
+                "heatmapCount": overview_year["heatmap"].as_array().unwrap().len(),
+                "activeHeatmap": active_heatmap,
+                "topProjects": overview_year["topProjects"],
+                "topSessions": overview_year["topSessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(canonical_session_listing_row)
+                    .collect::<Vec<_>>(),
+            },
+            "stats": stats,
+        },
+        "sessions": {
+            "projects": projects,
+            "recentFirst": canonical_session_page(&recent_first),
+            "recentSecond": canonical_session_page(&recent_second),
+            "costFirst": canonical_session_page(&cost_first),
+            "search": canonical_session_page(&searched),
+            "project": canonical_session_page(&project),
+            "date": canonical_session_page(&date),
+            "bounded": canonical_session_page(&bounded),
+            "summary": {
+                "session": canonical_session_row(&summary["session"]),
+                "cwd": summary["session"]["cwd"],
+                "source": summary["session"]["source"],
+                "firstPrompt": summary["session"]["firstPrompt"],
+                "latestResult": summary["session"]["latestResult"],
+                "completedAt": summary["session"]["completedAt"],
+                "totals": canonical_totals(&summary["totals"]),
+                "models": summary["models"],
+                "agents": summary["agents"],
+                "toolSummary": summary["toolSummary"],
+            },
+        },
+        "activity": {
+            "root": canonical_activity_page(&activity),
+            "detailFirst": canonical_activity_item(&detail_first),
+            "detailCursor": canonical_activity_item(&detail_cursor),
+            "group": canonical_activity_item(&group_detail),
+        },
+        "pricing": {
+            "prices": prices,
+            "metadata": price_metadata,
+            "modelIds": model_ids,
+            "aliases": aliases,
+        },
+    });
+
+    let domains = [
+        (
+            "api_surface",
+            json!({"system": actual["system"], "routes": actual["routes"]}),
+            include_str!("fixtures/api_oracle/api_surface.json"),
+        ),
+        (
+            "analytics",
+            actual["analytics"].clone(),
+            include_str!("fixtures/api_oracle/analytics.json"),
+        ),
+        (
+            "sessions",
+            actual["sessions"].clone(),
+            include_str!("fixtures/api_oracle/sessions.json"),
+        ),
+        (
+            "activity",
+            actual["activity"].clone(),
+            include_str!("fixtures/api_oracle/activity.json"),
+        ),
+        (
+            "pricing",
+            actual["pricing"].clone(),
+            include_str!("fixtures/api_oracle/pricing.json"),
+        ),
+    ];
+
+    for (name, actual, expected) in domains {
+        let expected: Value = serde_json::from_str(expected).unwrap();
+        assert_eq!(
+            actual, expected,
+            "the {name} API changed; review the diff rather than blindly regenerating the oracle"
+        );
+    }
+}
+
+#[tokio::test]
 async fn top_level_endpoints_match_the_frontend_contract_and_real_fixture_totals() {
     let harness = harness();
 
@@ -379,6 +980,7 @@ async fn top_level_endpoints_match_the_frontend_contract_and_real_fixture_totals
     assert_eq!(status["filesScanned"], 9);
     assert_eq!(status["filesFailed"], 0);
     assert!(status["lastIngestAt"].is_string());
+    assert!(status["lastIngestAttemptAt"].is_string());
     assert!(status["lastEventAt"].is_string());
 
     let overview = get_json(&harness.app, "/api/v1/overview").await;
@@ -528,6 +1130,73 @@ async fn top_level_endpoints_match_the_frontend_contract_and_real_fixture_totals
     let _ = usd_units(&settings["pricing"]["knownCostUsd"]);
     assert_eq!(settings["pricing"]["complete"], false);
     assert_eq!(settings["pricing"]["unpricedTokens"], 25_607);
+}
+
+#[tokio::test]
+async fn status_prefers_a_complete_last_scan_report_over_source_file_counts() {
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "UPDATE source_files SET last_error='stored source error'",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO app_meta(key,value) VALUES('last_scan_report',?1)",
+            [json!({
+                "filesSeen": 123,
+                "filesIngested": 80,
+                "filesUnchanged": 40,
+                "filesFailed": 3,
+                "recordsRead": 456,
+                "inheritedRecordsSkipped": 7,
+            })
+            .to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let status = get_json(&harness.app, "/api/v1/status").await;
+
+    assert_eq!(status["filesScanned"], 123);
+    assert_eq!(status["filesFailed"], 3);
+}
+
+#[tokio::test]
+async fn status_falls_back_to_source_files_for_malformed_or_incomplete_scan_reports() {
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute("UPDATE source_files SET last_error=NULL", [])
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE source_files SET last_error='stored source error'
+             WHERE rowid=(SELECT rowid FROM source_files ORDER BY path LIMIT 1)",
+            [],
+        )
+        .unwrap();
+    let source_file_count: u64 = connection
+        .query_row("SELECT COUNT(*) FROM source_files", [], |row| row.get(0))
+        .unwrap();
+
+    for report in [
+        "{".to_owned(),
+        json!({"filesSeen": 50, "filesFailed": 9}).to_string(),
+    ] {
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO app_meta(key,value) VALUES('last_scan_report',?1)",
+                [&report],
+            )
+            .unwrap();
+
+        let status = get_json(&harness.app, "/api/v1/status").await;
+        assert_eq!(status["filesScanned"], source_file_count);
+        assert_eq!(status["filesFailed"], 1);
+    }
 }
 
 #[tokio::test]
@@ -703,6 +1372,236 @@ async fn overview_top_sessions_use_period_activity_for_cross_year_threads() {
 }
 
 #[tokio::test]
+async fn overview_top_session_keeps_its_independent_sixteen_field_contract() {
+    const THREAD: &str = "analytics-top-shape";
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(&format!(
+            r#"
+            INSERT INTO threads(id,title,project,branch,started_at,last_event_at)
+            VALUES(
+                '{THREAD}','Analytics top shape','stage-three','feature/top-session',
+                '2042-01-01T10:00:00Z','2042-12-31T23:59:59Z'
+            );
+            INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+            VALUES(
+                '{THREAD}','{THREAD}','2042-01-01T10:00:00Z',
+                '2042-01-01T10:05:00Z',0
+            );
+            INSERT INTO turns(id,thread_id,rollout_id,started_at,status)
+            VALUES(
+                'analytics-top-turn','{THREAD}','{THREAD}',
+                '2042-01-01T10:00:00Z','completed'
+            );
+            INSERT INTO messages(
+                id,thread_id,rollout_id,turn_id,timestamp,role,content,source_line
+            ) VALUES
+                ('analytics-top-message-1','{THREAD}','{THREAD}','analytics-top-turn',
+                 '2042-01-01T10:01:00Z','user','First',1),
+                ('analytics-top-message-2','{THREAD}','{THREAD}','analytics-top-turn',
+                 '2042-01-01T10:02:00Z','assistant','Second',2);
+            INSERT INTO events(
+                id,thread_id,rollout_id,turn_id,timestamp,source_line,kind,native
+            ) VALUES(
+                'analytics-top-event','{THREAD}','{THREAD}','analytics-top-turn',
+                '2042-01-01T10:03:00Z',3,'state',1
+            );
+            INSERT INTO agent_runs(id,thread_id,rollout_id,started_at,status)
+            VALUES(
+                'analytics-top-agent','{THREAD}','{THREAD}',
+                '2042-01-01T10:03:30Z','completed'
+            );
+            INSERT INTO tool_calls(
+                id,call_id,thread_id,rollout_id,turn_id,started_at,name,status,duration_ms
+            ) VALUES(
+                'analytics-top-tool','analytics-top-call','{THREAD}','{THREAD}',
+                'analytics-top-turn','2042-01-01T10:04:00Z','exec','completed',10
+            );
+            INSERT INTO usage_facts(
+                id,thread_id,rollout_id,turn_id,timestamp,source_line,model,
+                input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,
+                total_tokens,native
+            ) VALUES(
+                'analytics-top-usage','{THREAD}','{THREAD}','analytics-top-turn',
+                '2042-01-01T10:05:00Z',4,'stage-three-unpriced',100,20,23,5,123,1
+            );
+            "#
+        ))
+        .unwrap();
+    drop(connection);
+
+    let response = get_json(&harness.app, "/api/v1/overview/year?year=2042").await;
+    let sessions = response["topSessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    let row = &sessions[0];
+    assert_eq!(row.as_object().unwrap().len(), 16);
+    assert_eq!(
+        row,
+        &json!({
+            "id": THREAD,
+            "rootThreadId": THREAD,
+            "startedAt": "2042-01-01T10:00:00Z",
+            "lastEventAt": "2042-01-01T10:05:00Z",
+            "title": "Analytics top shape",
+            "project": "stage-three",
+            "branch": "feature/top-session",
+            "messageCount": 2,
+            "turnCount": 1,
+            "agentCount": 1,
+            "toolCount": 1,
+            "totalTokens": 123,
+            "costUsd": null,
+            "unpricedTokens": 123,
+            "lifetimeCostUsd": null,
+            "lifetimeUnpricedTokens": 123
+        })
+    );
+}
+
+#[tokio::test]
+async fn sessions_catalog_visibility_projects_and_summary_share_one_contract() {
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO threads(id,title,project,started_at,last_event_at) VALUES
+                ('catalog-event','Event only','zuluCatalog','2045-01-01T00:00:00Z','2045-01-01T00:01:00Z'),
+                ('catalog-message','Message only','alphaCatalog','2045-01-01T00:00:00Z','2045-01-01T00:02:00Z'),
+                ('catalog-usage','Usage only','BetaCatalog','2045-01-01T00:00:00Z','2045-01-01T00:03:00Z'),
+                ('catalog-empty','Empty','hiddenEmptyCatalog','2045-01-01T00:00:00Z','2045-01-01T00:04:00Z'),
+                ('catalog-tool','Tool only','hiddenToolCatalog','2045-01-01T00:00:00Z','2045-01-01T00:05:00Z'),
+                ('catalog-turn','Turn only','hiddenTurnCatalog','2045-01-01T00:00:00Z','2045-01-01T00:06:00Z'),
+                ('catalog-blank-project','Blank project','','2045-01-01T00:00:00Z','2045-01-01T00:07:00Z'),
+                ('catalog-null-project','Null project',NULL,'2045-01-01T00:00:00Z','2045-01-01T00:08:00Z');
+            INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived) VALUES
+                ('catalog-event','catalog-event','2045-01-01T00:00:00Z','2045-01-01T00:01:00Z',0),
+                ('catalog-message','catalog-message','2045-01-01T00:00:00Z','2045-01-01T00:02:00Z',0),
+                ('catalog-usage','catalog-usage','2045-01-01T00:00:00Z','2045-01-01T00:03:00Z',0),
+                ('catalog-empty','catalog-empty','2045-01-01T00:00:00Z','2045-01-01T00:04:00Z',0),
+                ('catalog-tool','catalog-tool','2045-01-01T00:00:00Z','2045-01-01T00:05:00Z',0),
+                ('catalog-turn','catalog-turn','2045-01-01T00:00:00Z','2045-01-01T00:06:00Z',0),
+                ('catalog-blank-project','catalog-blank-project','2045-01-01T00:00:00Z','2045-01-01T00:07:00Z',0),
+                ('catalog-null-project','catalog-null-project','2045-01-01T00:00:00Z','2045-01-01T00:08:00Z',0);
+            INSERT INTO events(
+                id,thread_id,rollout_id,timestamp,source_line,kind,body,native
+            ) VALUES
+                ('catalog-event-row','catalog-event','catalog-event',
+                 '2045-01-01T00:01:00Z',1,'state','visible',1),
+                ('catalog-blank-project-row','catalog-blank-project','catalog-blank-project',
+                 '2045-01-01T00:07:00Z',1,'state','visible',1);
+            INSERT INTO messages(
+                id,thread_id,rollout_id,timestamp,role,content,source_line
+            ) VALUES
+                ('catalog-message-row','catalog-message','catalog-message',
+                 '2045-01-01T00:02:00Z','user','visible',1),
+                ('catalog-null-project-row','catalog-null-project','catalog-null-project',
+                 '2045-01-01T00:08:00Z','user','visible',1);
+            INSERT INTO usage_facts(
+                id,thread_id,rollout_id,timestamp,source_line,model,
+                input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens,native
+            ) VALUES(
+                'catalog-usage-row','catalog-usage','catalog-usage',
+                '2045-01-01T00:03:00Z',1,'catalog-unpriced',1,0,0,0,1,1
+            );
+            INSERT INTO tool_calls(
+                id,call_id,thread_id,rollout_id,started_at,name,status
+            ) VALUES(
+                'catalog-tool-row','catalog-tool-call','catalog-tool','catalog-tool',
+                '2045-01-01T00:05:00Z','exec','completed'
+            );
+            INSERT INTO turns(id,thread_id,rollout_id,started_at,status)
+            VALUES(
+                'catalog-turn-row','catalog-turn','catalog-turn',
+                '2045-01-01T00:06:00Z','completed'
+            );
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let sessions = get_json(&harness.app, "/api/v1/sessions?page=1&pageSize=200").await;
+    let injected_rows = sessions["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["id"].as_str().unwrap().starts_with("catalog-"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        injected_rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "catalog-blank-project",
+            "catalog-event",
+            "catalog-message",
+            "catalog-null-project",
+            "catalog-usage",
+        ]
+        .into_iter()
+        .collect()
+    );
+    for row in injected_rows {
+        assert_session_row(row);
+        assert_eq!(
+            row.as_object().unwrap().len(),
+            16,
+            "row shape drifted: {row}"
+        );
+    }
+
+    let projects = get_json(&harness.app, "/api/v1/projects").await;
+    let injected_projects = projects["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|project| project.to_ascii_lowercase().contains("catalog"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        injected_projects,
+        vec!["alphaCatalog", "BetaCatalog", "zuluCatalog"]
+    );
+    assert!(!projects["items"].as_array().unwrap().contains(&json!("")));
+
+    for visible_id in ["catalog-event", "catalog-message", "catalog-usage"] {
+        let (status, _, body) = raw_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/sessions/{visible_id}/summary"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "visible summary {visible_id} failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let summary: Value = serde_json::from_slice(&body).unwrap();
+        assert_session_row(&summary["session"]);
+        assert_eq!(summary["session"]["id"], visible_id);
+    }
+
+    for hidden_id in ["catalog-empty", "catalog-tool", "catalog-turn"] {
+        let (status, _, body) = raw_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/sessions/{hidden_id}/summary"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{hidden_id} became visible");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"error": "session not found"})
+        );
+    }
+}
+
+#[tokio::test]
 async fn sessions_support_search_project_sort_pagination_and_exact_date_drilldown() {
     let harness = harness();
 
@@ -860,6 +1759,235 @@ async fn sessions_support_search_project_sort_pagination_and_exact_date_drilldow
 }
 
 #[tokio::test]
+async fn session_boundaries_preserve_offset_and_bare_date_semantics() {
+    let harness = harness();
+    let utc = get_json(
+        &harness.app,
+        &format!(
+            "/api/v1/sessions?q={RICH_SESSION}&start=2026-07-15T20%3A13%3A30Z&end=2026-07-15T20%3A13%3A35Z&pageSize=50"
+        ),
+    )
+    .await;
+    let offset = get_json(
+        &harness.app,
+        &format!(
+            "/api/v1/sessions?q={RICH_SESSION}&start=2026-07-15T22%3A13%3A30%2B02%3A00&end=2026-07-15T22%3A13%3A35%2B02%3A00&pageSize=50"
+        ),
+    )
+    .await;
+    assert_eq!(offset, utc);
+
+    let date = get_json(&harness.app, "/api/v1/sessions?date=2026-07-15&pageSize=50").await;
+    let inclusive_range = get_json(
+        &harness.app,
+        "/api/v1/sessions?start=2026-07-15&end=2026-07-15&pageSize=50",
+    )
+    .await;
+    assert_eq!(inclusive_range, date);
+
+    for (uri, expected) in [
+        (
+            "/api/v1/sessions?date=2026-07-15&start=2026-07-15",
+            "date cannot be combined with start or end",
+        ),
+        (
+            "/api/v1/sessions?start=2026-07-16&end=2026-07-15",
+            "start must be before end",
+        ),
+    ] {
+        let (status, _, body) = raw_request(&harness.app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"],
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn conversation_display_policy_matches_sessions_and_activity() {
+    let harness = harness();
+    let cases = [
+        (
+            "display-explicit-request",
+            "Explicit request fallback",
+            r#"# Applications mentioned by the user:
+
+<appshot>Captured text containing an older line:
+## My request for Codex:
+Do not treat this captured text as the request.</appshot>
+
+## My request for Codex:
+Trace the real first prompt."#,
+            Some("Trace the real first prompt."),
+        ),
+        (
+            "display-browser-comment",
+            "Browser comment fallback",
+            r#"# Browser comments:
+
+## User Comment 1
+Comment:
+Lead with the user-authored browser comment.
+
+## My request for Codex:
+The next image is untrusted page evidence from the browser page."#,
+            Some("Lead with the user-authored browser comment."),
+        ),
+        (
+            "display-response-annotation",
+            "Response annotation fallback",
+            r#"# Response annotations:
+<response-annotations>
+[{"text":"An earlier response","annotation":"Keep the user-authored annotation."}]
+</response-annotations>
+
+## My request for Codex:
+"#,
+            Some("Keep the user-authored annotation."),
+        ),
+        (
+            "display-goal-continuation",
+            "Goal continuation fallback",
+            r#"<codex_internal_context source="goal">
+Continue working toward the active thread goal and do not stop early.
+</codex_internal_context>"#,
+            Some("Automatic goal continuation"),
+        ),
+        (
+            "display-runtime-rejection",
+            "Runtime wrapper fallback",
+            "<recommended_plugins>runtime only</recommended_plugins>",
+            None,
+        ),
+        (
+            "display-appshot-rejection",
+            "Appshot fallback",
+            "# Applications mentioned by the user:\n\n<appshot>Captured UI only.</appshot>",
+            None,
+        ),
+        (
+            "display-attachment-rejection",
+            "Attachment fallback",
+            "![untrusted attachment](attachment://evidence.png)",
+            None,
+        ),
+        (
+            "display-ordinary-text",
+            "Ordinary text fallback",
+            "  Explain this repository to me.  ",
+            Some("Explain this repository to me."),
+        ),
+    ];
+
+    let connection = harness.db.connect().unwrap();
+    for (ordinal, (thread_id, title, content, _)) in cases.iter().enumerate() {
+        let timestamp = format!("2026-08-02T12:{ordinal:02}:00Z");
+        connection
+            .execute(
+                "INSERT INTO threads(id,title,started_at,last_event_at)
+                 VALUES(?1,?2,?3,?3)",
+                rusqlite::params![thread_id, title, timestamp],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+                 VALUES(?1,?1,?2,?2,0)",
+                rusqlite::params![thread_id, timestamp],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages(
+                    id,thread_id,rollout_id,timestamp,role,content,source_line
+                 ) VALUES(?1 || ':message',?1,?1,?2,'user',?3,1)",
+                rusqlite::params![thread_id, timestamp, content],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    for (thread_id, title, _, expected) in cases {
+        let summary = get_json(
+            &harness.app,
+            &format!("/api/v1/sessions/{thread_id}/summary"),
+        )
+        .await;
+        assert_eq!(
+            summary["session"]["firstPrompt"].as_str(),
+            expected,
+            "Sessions summary display drifted for {thread_id}"
+        );
+
+        let activity = get_json(
+            &harness.app,
+            &format!("/api/v1/sessions/{thread_id}/activity?page=1&pageSize=25"),
+        )
+        .await;
+        let expected_label = expected.unwrap_or(title);
+        assert_eq!(
+            activity["items"][0]["label"], expected_label,
+            "Activity root display drifted for {thread_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn conversation_tool_names_normalize_and_merge_in_session_summary() {
+    const THREAD: &str = "conversation-tool-summary";
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(&format!(
+            r#"
+            INSERT INTO threads(id,title,started_at,last_event_at)
+            VALUES('{THREAD}','Tool summary','2026-08-02T13:00:00Z','2026-08-02T13:05:00Z');
+            INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+            VALUES('{THREAD}','{THREAD}','2026-08-02T13:00:00Z','2026-08-02T13:05:00Z',0);
+            INSERT INTO messages(
+                id,thread_id,rollout_id,timestamp,role,content,source_line
+            ) VALUES(
+                '{THREAD}:message','{THREAD}','{THREAD}',
+                '2026-08-02T13:00:00Z','user','Summarize the tools.',1
+            );
+            INSERT INTO tool_calls(
+                id,call_id,thread_id,rollout_id,started_at,name,namespace,status,duration_ms
+            ) VALUES
+                ('tool-normalized-a','call-normalized-a','{THREAD}','{THREAD}',
+                 '2026-08-02T13:01:00Z','js','mcp__node_repl','completed',10),
+                ('tool-normalized-b','call-normalized-b','{THREAD}','{THREAD}',
+                 '2026-08-02T13:02:00Z','js','mcp__node_repl__','failed',20),
+                ('tool-nested','call-nested','{THREAD}','{THREAD}',
+                 '2026-08-02T13:03:00Z','_search_emails','mcp__codex_apps__gmail','completed',30),
+                ('tool-unknown','call-unknown','{THREAD}','{THREAD}',
+                 '2026-08-02T13:04:00Z','unknown',NULL,'completed',40),
+                ('tool-web','call-web','{THREAD}','{THREAD}',
+                 '2026-08-02T13:05:00Z','web_search_call',NULL,'completed',50);
+            "#
+        ))
+        .unwrap();
+    drop(connection);
+
+    let summary = get_json(&harness.app, &format!("/api/v1/sessions/{THREAD}/summary")).await;
+    let tools = summary["toolSummary"].as_array().unwrap();
+    let normalized = tools
+        .iter()
+        .find(|row| row["tool"] == "node_repl.js")
+        .expect("namespace variants must merge under one display name");
+    assert_eq!(normalized["count"], 2);
+    assert_eq!(normalized["failedCount"], 1);
+    assert_eq!(normalized["totalDurationMs"], 30);
+    assert!(
+        tools
+            .iter()
+            .any(|row| row["tool"] == "codex_apps.gmail._search_emails")
+    );
+    assert!(tools.iter().any(|row| row["tool"] == "tool"));
+    assert!(tools.iter().any(|row| row["tool"] == "web_search"));
+}
+
+#[tokio::test]
 async fn session_search_is_unicode_normalized_and_treats_like_metacharacters_literally() {
     let harness = harness();
     let connection = harness.db.connect().unwrap();
@@ -975,6 +2103,7 @@ async fn pagination_never_echoes_an_integer_javascript_cannot_represent_exactly(
     for uri in [
         format!("/api/v1/sessions?page={}&pageSize=1", maximum_safe + 1),
         format!("/api/v1/prices?page={}&pageSize=1", maximum_safe + 1),
+        format!("/api/v1/aliases?page={}&pageSize=1", maximum_safe + 1),
         format!(
             "/api/v1/sessions/{RICH_SESSION}/activity?page={}&pageSize=1",
             maximum_safe + 1
@@ -992,6 +2121,60 @@ async fn pagination_never_echoes_an_integer_javascript_cannot_represent_exactly(
             String::from_utf8_lossy(&body)
         );
         assert!(String::from_utf8_lossy(&body).contains("page must not exceed"));
+    }
+}
+
+#[tokio::test]
+async fn pagination_defaults_and_clamps_each_transport_surface() {
+    let harness = harness();
+
+    let sessions_default = get_json(&harness.app, "/api/v1/sessions").await;
+    assert_eq!(sessions_default["page"], 1);
+    assert_eq!(sessions_default["pageSize"], 50);
+    let sessions_minimum = get_json(&harness.app, "/api/v1/sessions?page=0&pageSize=0").await;
+    assert_eq!(sessions_minimum["page"], 1);
+    assert_eq!(sessions_minimum["pageSize"], 1);
+    let sessions_maximum = get_json(&harness.app, "/api/v1/sessions?pageSize=9999").await;
+    assert_eq!(sessions_maximum["pageSize"], 200);
+
+    let activity_path = format!("/api/v1/sessions/{RICH_SESSION}/activity");
+    let activity_default = get_json(&harness.app, &activity_path).await;
+    assert_eq!(activity_default["page"], 1);
+    assert_eq!(activity_default["pageSize"], 25);
+    let activity_minimum =
+        get_json(&harness.app, &format!("{activity_path}?page=0&pageSize=0")).await;
+    assert_eq!(activity_minimum["page"], 1);
+    assert_eq!(activity_minimum["pageSize"], 1);
+    let activity_maximum = get_json(&harness.app, &format!("{activity_path}?pageSize=9999")).await;
+    assert_eq!(activity_maximum["pageSize"], 100);
+
+    let detail_id = activity_default["items"][0]["id"]
+        .as_str()
+        .expect("the rich fixture must expose an Activity detail")
+        .to_owned();
+    let detail_path = format!("/api/v1/sessions/{RICH_SESSION}/activity/{detail_id}");
+    let detail_default = get_json(&harness.app, &detail_path).await;
+    assert_eq!(detail_default["childPage"], 1);
+    assert_eq!(detail_default["childPageSize"], 250);
+    let detail_minimum = get_json(
+        &harness.app,
+        &format!("{detail_path}?childPage=0&childPageSize=0"),
+    )
+    .await;
+    assert_eq!(detail_minimum["childPage"], 1);
+    assert_eq!(detail_minimum["childPageSize"], 1);
+    let detail_maximum = get_json(&harness.app, &format!("{detail_path}?childPageSize=9999")).await;
+    assert_eq!(detail_maximum["childPageSize"], 500);
+
+    for route in ["prices", "aliases"] {
+        let default = get_json(&harness.app, &format!("/api/v1/{route}")).await;
+        assert_eq!(default["page"], 1);
+        assert_eq!(default["pageSize"], 25);
+        let minimum = get_json(&harness.app, &format!("/api/v1/{route}?page=0&pageSize=0")).await;
+        assert_eq!(minimum["page"], 1);
+        assert_eq!(minimum["pageSize"], 1);
+        let maximum = get_json(&harness.app, &format!("/api/v1/{route}?pageSize=9999")).await;
+        assert_eq!(maximum["pageSize"], 100);
     }
 }
 
@@ -1048,6 +2231,106 @@ async fn bounded_cost_sort_uses_period_cost_instead_of_lifetime_cost() {
             > usd_units(&sorted["items"][0]["lifetimeCostUsd"]),
         "lifetime order is deliberately inverted so it cannot drive bounded sorting"
     );
+}
+
+#[tokio::test]
+async fn raw_activity_wire_shape_preserves_nulls_and_optional_paging_fields() {
+    let harness = harness();
+
+    let page = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{RICH_SESSION}/activity?page=1&pageSize=25"),
+    )
+    .await;
+    assert_exact_json_keys(
+        &page,
+        &["items", "days", "page", "pageSize", "total", "totalPages"],
+    );
+    for day in page["days"].as_array().unwrap() {
+        assert_exact_json_keys(day, &["date", "durationMs", "totals"]);
+        assert_exact_json_keys(
+            &day["totals"],
+            &[
+                "inputTokens",
+                "cachedInputTokens",
+                "outputTokens",
+                "reasoningTokens",
+                "blendedTokens",
+                "totalTokens",
+                "costUsd",
+                "unpricedTokens",
+                "pricingComplete",
+            ],
+        );
+    }
+    let root = &page["items"][0];
+    assert_activity_item_wire_keys(root, &[]);
+    assert!(root["children"].as_array().unwrap().is_empty());
+    assert!(root.get("childPage").is_none());
+
+    let root_id = root["id"].as_str().unwrap();
+    let detail = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{RICH_SESSION}/activity/{root_id}?childPage=1&childPageSize=1"),
+    )
+    .await;
+    assert_activity_item_wire_keys(
+        &detail,
+        &[
+            "childPage",
+            "childPageSize",
+            "childTotal",
+            "childHasMore",
+            "childNextCursor",
+        ],
+    );
+    assert_eq!(detail["childPage"], 1);
+    assert_eq!(detail["childPageSize"], 1);
+    assert!(detail["childNextCursor"].is_string());
+
+    let replay_page = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{JULY_REPLAY_SESSION}/activity"),
+    )
+    .await;
+    let replay_root_id = replay_page["items"][0]["id"].as_str().unwrap();
+    let replay_detail = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{JULY_REPLAY_SESSION}/activity/{replay_root_id}"),
+    )
+    .await;
+    let group = replay_detail["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.ends_with("_group"))
+        })
+        .expect("the replay fixture must expose a synthetic group");
+    assert_activity_item_wire_keys(
+        group,
+        &["childPage", "childPageSize", "childTotal", "childHasMore"],
+    );
+    assert!(group["body"].is_null() || group["body"].is_string());
+    assert!(group["counts"].is_null());
+    assert!(group.get("childNextCursor").is_none());
+
+    let group_id = group["id"].as_str().unwrap();
+    let group_detail = get_json(
+        &harness.app,
+        &format!(
+            "/api/v1/sessions/{JULY_REPLAY_SESSION}/activity/{group_id}?childPage=1&childPageSize=1"
+        ),
+    )
+    .await;
+    assert_activity_item_wire_keys(
+        &group_detail,
+        &["childPage", "childPageSize", "childTotal", "childHasMore"],
+    );
+    assert!(group_detail.get("childNextCursor").is_none());
+    assert_activity_item_wire_keys(&group_detail["children"][0], &[]);
 }
 
 #[tokio::test]
@@ -1751,6 +3034,278 @@ async fn session_summary_turn_fallback_stays_on_the_root_rollout() {
 }
 
 #[tokio::test]
+async fn session_summary_raw_json_shape_is_exact() {
+    let harness = harness();
+    let summary = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{RICH_SESSION}/summary"),
+    )
+    .await;
+
+    assert_exact_json_keys(
+        &summary,
+        &["session", "totals", "models", "agents", "toolSummary"],
+    );
+    assert_exact_json_keys(
+        &summary["session"],
+        &[
+            "id",
+            "rootThreadId",
+            "startedAt",
+            "lastEventAt",
+            "title",
+            "project",
+            "branch",
+            "messageCount",
+            "turnCount",
+            "agentCount",
+            "toolCount",
+            "totalTokens",
+            "costUsd",
+            "unpricedTokens",
+            "lifetimeCostUsd",
+            "lifetimeUnpricedTokens",
+            "cwd",
+            "source",
+            "firstPrompt",
+            "latestResult",
+            "completedAt",
+            "status",
+        ],
+    );
+    let model = summary["models"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("the rich fixture has model usage");
+    assert_exact_json_keys(
+        model,
+        &[
+            "model",
+            "effort",
+            "inputTokens",
+            "cachedInputTokens",
+            "outputTokens",
+            "reasoningTokens",
+            "totalTokens",
+            "costUsd",
+            "unpricedTokens",
+        ],
+    );
+    let agent = summary["agents"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("the rich fixture has an agent summary");
+    assert_exact_json_keys(
+        agent,
+        &[
+            "id",
+            "label",
+            "path",
+            "nickname",
+            "status",
+            "turnCount",
+            "toolCount",
+            "totalTokens",
+            "costUsd",
+            "unpricedTokens",
+        ],
+    );
+    let tool = summary["toolSummary"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("the rich fixture has a tool summary");
+    assert_exact_json_keys(tool, &["tool", "count", "failedCount", "totalDurationMs"]);
+}
+
+#[tokio::test]
+async fn session_summary_root_rollout_priority_is_stable() {
+    const THREAD: &str = "summary-root-priority";
+    const SELECTED: &str = "summary-root-a-early";
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(&format!(
+            r#"
+            INSERT INTO threads(id,title,started_at,last_event_at)
+            VALUES(
+                '{THREAD}','Root priority','2046-01-01T00:00:00Z',
+                '2046-01-01T00:10:00Z'
+            );
+            INSERT INTO rollouts(
+                id,thread_id,parent_rollout_id,parent_thread_id,started_at,last_event_at,archived
+            ) VALUES
+                ('summary-child-first','{THREAD}','missing-parent','missing-thread',
+                 '2046-01-01T00:00:00Z','2046-01-01T00:00:30Z',0),
+                ('summary-root-z-early','{THREAD}',NULL,NULL,
+                 '2046-01-01T00:01:00Z','2046-01-01T00:02:00Z',0),
+                ('{SELECTED}','{THREAD}',NULL,NULL,
+                 '2046-01-01T00:01:00Z','2046-01-01T00:03:00Z',0),
+                ('summary-root-a-later','{THREAD}',NULL,NULL,
+                 '2046-01-01T00:02:00Z','2046-01-01T00:04:00Z',0);
+            INSERT INTO messages(
+                id,thread_id,rollout_id,timestamp,role,content,source_line
+            ) VALUES
+                ('summary-child-user','{THREAD}','summary-child-first',
+                 '2046-01-01T00:00:10Z','user','WRONG CHILD PROMPT',1),
+                ('summary-child-assistant','{THREAD}','summary-child-first',
+                 '2046-01-01T00:00:20Z','assistant','WRONG CHILD RESULT',2),
+                ('summary-root-z-user','{THREAD}','summary-root-z-early',
+                 '2046-01-01T00:01:10Z','user','WRONG ID-TIE PROMPT',3),
+                ('summary-root-later-user','{THREAD}','summary-root-a-later',
+                 '2046-01-01T00:02:10Z','user','WRONG LATER PROMPT',4),
+                ('summary-selected-user','{THREAD}','{SELECTED}',
+                 '2046-01-01T00:01:20Z','user','Selected parentless prompt',5),
+                ('summary-selected-assistant','{THREAD}','{SELECTED}',
+                 '2046-01-01T00:01:30Z','assistant','Selected parentless result',6);
+            "#
+        ))
+        .unwrap();
+    drop(connection);
+
+    let summary = get_json(&harness.app, &format!("/api/v1/sessions/{THREAD}/summary")).await;
+    assert_eq!(
+        summary["session"]["firstPrompt"],
+        "Selected parentless prompt"
+    );
+    assert_eq!(
+        summary["session"]["latestResult"],
+        "Selected parentless result"
+    );
+}
+
+#[tokio::test]
+async fn session_summary_breakdowns_preserve_ordering_labels_and_caps() {
+    const THREAD: &str = "summary-breakdowns";
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(&format!(
+            r#"
+            INSERT INTO threads(id,title,started_at,last_event_at)
+            VALUES(
+                '{THREAD}','Summary breakdowns','2046-02-01T00:00:00Z',
+                '2046-02-01T01:00:00Z'
+            );
+            INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+            VALUES(
+                '{THREAD}','{THREAD}','2046-02-01T00:00:00Z',
+                '2046-02-01T01:00:00Z',0
+            );
+            INSERT INTO agent_runs(
+                id,thread_id,rollout_id,agent_path,nickname,started_at,status
+            ) VALUES
+                ('summary-agent-default','{THREAD}','{THREAD}',NULL,NULL,
+                 '2046-02-01T00:01:00Z','completed'),
+                ('summary-agent-path','{THREAD}','{THREAD}','/agents/path-label',NULL,
+                 '2046-02-01T00:02:00Z','running'),
+                ('summary-agent-nickname','{THREAD}','{THREAD}','/agents/unused-path','Nick label',
+                 '2046-02-01T00:03:00Z','interrupted');
+            "#
+        ))
+        .unwrap();
+
+    for (index, (id, model, effort, total_tokens)) in [
+        ("summary-usage-z", "model-z", Some("low"), 500_i64),
+        ("summary-usage-a-high", "model-a", Some("high"), 400),
+        ("summary-usage-a-low", "model-a", Some("low"), 400),
+        ("summary-usage-b", "model-b", None, 400),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        connection
+            .execute(
+                "INSERT INTO usage_facts(
+                    id,thread_id,rollout_id,timestamp,source_line,model,effort,
+                    input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,
+                    total_tokens,native
+                 ) VALUES(?1,?2,?2,'2046-02-01T00:10:00Z',?3,?4,?5,?6,0,0,0,?6,1)",
+                rusqlite::params![id, THREAD, 100 + index as i64, model, effort, total_tokens],
+            )
+            .unwrap();
+    }
+
+    for (name, count) in [("aaa-high", 3), ("aaa-tie", 2), ("bbb-tie", 2)] {
+        for ordinal in 0..count {
+            connection
+                .execute(
+                    "INSERT INTO tool_calls(
+                        id,call_id,thread_id,rollout_id,started_at,name,status,duration_ms
+                     ) VALUES(?1,?1,?2,?2,'2046-02-01T00:20:00Z',?3,'completed',1)",
+                    rusqlite::params![format!("summary-tool-{name}-{ordinal}"), THREAD, name],
+                )
+                .unwrap();
+        }
+    }
+    for ordinal in 0..99 {
+        let name = format!("tool-{ordinal:03}");
+        connection
+            .execute(
+                "INSERT INTO tool_calls(
+                    id,call_id,thread_id,rollout_id,started_at,name,status,duration_ms
+                 ) VALUES(?1,?1,?2,?2,'2046-02-01T00:30:00Z',?3,'completed',1)",
+                rusqlite::params![format!("summary-tool-single-{ordinal:03}"), THREAD, name],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let summary = get_json(&harness.app, &format!("/api/v1/sessions/{THREAD}/summary")).await;
+    let models = summary["models"].as_array().unwrap();
+    assert_eq!(models.len(), 4, "effort is part of model summary identity");
+    assert_eq!(
+        models
+            .iter()
+            .map(|row| (
+                row["model"].as_str().unwrap(),
+                row["effort"].as_str(),
+                row["totalTokens"].as_u64().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("model-z", Some("low"), 500),
+            ("model-a", Some("high"), 400),
+            ("model-a", Some("low"), 400),
+            ("model-b", None, 400),
+        ]
+    );
+
+    let agents = summary["agents"].as_array().unwrap();
+    assert_eq!(
+        agents
+            .iter()
+            .map(|row| (row["id"].as_str().unwrap(), row["label"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("summary-agent-default", "Primary agent"),
+            ("summary-agent-path", "/agents/path-label"),
+            ("summary-agent-nickname", "Nick label"),
+        ]
+    );
+
+    let tools = summary["toolSummary"].as_array().unwrap();
+    assert_eq!(tools.len(), 100, "tool summary is bounded before transport");
+    assert_eq!(
+        tools
+            .iter()
+            .take(3)
+            .map(|row| (
+                row["tool"].as_str().unwrap(),
+                row["count"].as_u64().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("aaa-high", 3), ("aaa-tie", 2), ("bbb-tie", 2)]
+    );
+    assert_eq!(tools[3]["tool"], "tool-000");
+    assert_eq!(tools[99]["tool"], "tool-096");
+    assert!(tools.iter().all(|row| row["tool"] != "tool-097"));
+    assert!(tools.iter().all(|row| row["tool"] != "tool-098"));
+}
+
+#[tokio::test]
 async fn deep_session_breakdowns_never_follow_cross_thread_relation_ids() {
     let harness = harness();
     let summary_uri = format!("/api/v1/sessions/{RICH_SESSION}/summary");
@@ -1803,6 +3358,255 @@ async fn deep_session_breakdowns_never_follow_cross_thread_relation_ids() {
     assert_eq!(summary_after["totals"], summary_before["totals"]);
     assert_eq!(summary_after["models"], summary_before["models"]);
     assert_eq!(activity_after["items"], activity_before["items"]);
+}
+
+#[tokio::test]
+async fn activity_visibility_requires_an_event_message_or_usage_fact() {
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO threads(id,title,started_at,last_event_at) VALUES
+                ('visibility-event','Event only','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z'),
+                ('visibility-message','Message only','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z'),
+                ('visibility-usage','Usage only','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z'),
+                ('visibility-empty','Empty','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z'),
+                ('visibility-tool','Tool only','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z'),
+                ('visibility-turn','Turn only','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z');
+            INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived) VALUES
+                ('visibility-event','visibility-event','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z',0),
+                ('visibility-message','visibility-message','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z',0),
+                ('visibility-usage','visibility-usage','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z',0),
+                ('visibility-empty','visibility-empty','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z',0),
+                ('visibility-tool','visibility-tool','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z',0),
+                ('visibility-turn','visibility-turn','2043-01-01T00:00:00Z','2043-01-01T00:01:00Z',0);
+            INSERT INTO events(
+                id,thread_id,rollout_id,timestamp,source_line,kind,body,native
+            ) VALUES(
+                'visibility-event-row','visibility-event','visibility-event',
+                '2043-01-01T00:01:00Z',1,'state','visible',1
+            );
+            INSERT INTO messages(
+                id,thread_id,rollout_id,timestamp,role,content,source_line
+            ) VALUES(
+                'visibility-message-row','visibility-message','visibility-message',
+                '2043-01-01T00:01:00Z','user','visible',1
+            );
+            INSERT INTO usage_facts(
+                id,thread_id,rollout_id,timestamp,source_line,model,
+                input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens,native
+            ) VALUES(
+                'visibility-usage-row','visibility-usage','visibility-usage',
+                '2043-01-01T00:01:00Z',1,'visibility-unpriced',1,0,0,0,1,1
+            );
+            INSERT INTO tool_calls(
+                id,call_id,thread_id,rollout_id,started_at,name,status
+            ) VALUES(
+                'visibility-tool-row','visibility-tool-call','visibility-tool',
+                'visibility-tool','2043-01-01T00:01:00Z','exec','completed'
+            );
+            INSERT INTO turns(id,thread_id,rollout_id,started_at,status)
+            VALUES(
+                'visibility-turn-row','visibility-turn','visibility-turn',
+                '2043-01-01T00:01:00Z','completed'
+            );
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    for thread_id in ["visibility-event", "visibility-message", "visibility-usage"] {
+        let (status, _, body) = raw_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/sessions/{thread_id}/activity?page=1&pageSize=25"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{thread_id} should be visible: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    for thread_id in ["visibility-empty", "visibility-tool", "visibility-turn"] {
+        let (status, _, body) = raw_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/sessions/{thread_id}/activity?page=1&pageSize=25"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{thread_id} leaked into Activity"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"error": "session not found"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn activity_detail_errors_prefer_transport_then_visibility_then_event_lookup() {
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO threads(id,title,started_at,last_event_at) VALUES
+                ('precedence-visible','Visible','2044-01-01T00:00:00Z','2044-01-01T00:01:00Z'),
+                ('precedence-hidden','Hidden','2044-01-01T00:00:00Z','2044-01-01T00:01:00Z');
+            INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived) VALUES
+                ('precedence-visible','precedence-visible','2044-01-01T00:00:00Z','2044-01-01T00:01:00Z',0),
+                ('precedence-hidden','precedence-hidden','2044-01-01T00:00:00Z','2044-01-01T00:01:00Z',0);
+            INSERT INTO events(
+                id,thread_id,rollout_id,timestamp,source_line,kind,body,native
+            ) VALUES(
+                'precedence-visible-event','precedence-visible','precedence-visible',
+                '2044-01-01T00:01:00Z',1,'state','visible',1
+            );
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    for (uri, expected_status, expected_error) in [
+        (
+            "/api/v1/sessions/precedence-missing/activity/missing-event?childCursor=not-a-cursor",
+            StatusCode::BAD_REQUEST,
+            "invalid Activity cursor",
+        ),
+        (
+            "/api/v1/sessions/precedence-missing/activity/missing-event?childPage=9007199254740992",
+            StatusCode::BAD_REQUEST,
+            "page must not exceed 9007199254740991",
+        ),
+        (
+            "/api/v1/sessions/precedence-missing/activity/missing-event",
+            StatusCode::NOT_FOUND,
+            "session not found",
+        ),
+        (
+            "/api/v1/sessions/precedence-hidden/activity/missing-event",
+            StatusCode::NOT_FOUND,
+            "session not found",
+        ),
+        (
+            "/api/v1/sessions/precedence-visible/activity/missing-event",
+            StatusCode::NOT_FOUND,
+            "activity event not found",
+        ),
+    ] {
+        let (status, _, body) = raw_request(&harness.app, Method::GET, uri, None).await;
+        assert_eq!(status, expected_status, "unexpected status for {uri}");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"error": expected_error}),
+            "unexpected error for {uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn activity_detail_reserves_synthetic_ids_before_turns_and_events() {
+    const THREAD: &str = "dispatch-collision";
+    const ROOT: &str = "collision-root";
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO threads(id,title,started_at,last_event_at)
+            VALUES('dispatch-collision','Dispatch collision',
+                   '2045-01-01T10:00:00Z','2045-01-01T11:00:00Z');
+            INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived) VALUES
+                ('dispatch-collision','dispatch-collision',
+                 '2045-01-01T10:00:00Z','2045-01-01T11:00:00Z',0),
+                ('dispatch-agent','dispatch-collision',
+                 '2045-01-01T10:01:00Z','2045-01-01T10:06:00Z',0),
+                ('dispatch-review','dispatch-collision',
+                 '2045-01-01T10:02:00Z','2045-01-01T10:07:00Z',0);
+            INSERT INTO turns(id,thread_id,rollout_id,started_at,status,model) VALUES
+                ('collision-root','dispatch-collision','dispatch-collision',
+                 '2045-01-01T10:00:00Z','completed','gpt-5.5'),
+                ('dispatch-agent-turn','dispatch-collision','dispatch-agent',
+                 '2045-01-01T10:05:00Z','completed','gpt-5.5'),
+                ('dispatch-review-turn','dispatch-collision','dispatch-review',
+                 '2045-01-01T10:06:00Z','completed','codex-auto-review'),
+                ('legacy:dispatch-collision','dispatch-collision','dispatch-collision',
+                 '2045-01-01T10:10:00Z','completed','gpt-5.5'),
+                ('group:agents:collision-root','dispatch-collision','dispatch-collision',
+                 '2045-01-01T10:20:00Z','completed','gpt-5.5'),
+                ('group:reviews:collision-root','dispatch-collision','dispatch-collision',
+                 '2045-01-01T10:30:00Z','completed','gpt-5.5'),
+                ('ordinary-collision','dispatch-collision','dispatch-collision',
+                 '2045-01-01T10:40:00Z','completed','gpt-5.5');
+            INSERT INTO messages(
+                id,thread_id,rollout_id,turn_id,timestamp,role,content,source_line
+            ) VALUES(
+                'dispatch-legacy-message','dispatch-collision','dispatch-collision',NULL,
+                '2045-01-01T10:50:00Z','assistant','Legacy fallback',50
+            );
+            INSERT INTO events(
+                id,thread_id,rollout_id,turn_id,timestamp,source_line,kind,role,body,native
+            ) VALUES
+                ('dispatch-visible','dispatch-collision','dispatch-collision','collision-root',
+                 '2045-01-01T10:00:00Z',1,'user','user','Visible request',1),
+                ('legacy:dispatch-collision','dispatch-collision','dispatch-collision','collision-root',
+                 '2045-01-01T10:01:00Z',2,'assistant','assistant','Event collision',1),
+                ('group:agents:collision-root','dispatch-collision','dispatch-collision','collision-root',
+                 '2045-01-01T10:02:00Z',3,'assistant','assistant','Event collision',1),
+                ('group:reviews:collision-root','dispatch-collision','dispatch-collision','collision-root',
+                 '2045-01-01T10:03:00Z',4,'assistant','assistant','Event collision',1),
+                ('ordinary-collision','dispatch-collision','dispatch-collision','collision-root',
+                 '2045-01-01T10:04:00Z',5,'assistant','assistant','Event collision',1);
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let legacy = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{THREAD}/activity/legacy:{THREAD}"),
+    )
+    .await;
+    assert_eq!(legacy["id"], format!("legacy:{THREAD}"));
+    assert!(legacy["turnId"].is_null());
+    assert!(legacy.get("childPage").is_some());
+
+    let agents = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{THREAD}/activity/group:agents:{ROOT}"),
+    )
+    .await;
+    assert_eq!(agents["kind"], "agent_group");
+    assert_eq!(agents["turnId"], ROOT);
+    assert_eq!(agents["childTotal"], 1);
+
+    let reviews = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{THREAD}/activity/group:reviews:{ROOT}"),
+    )
+    .await;
+    assert_eq!(reviews["kind"], "review_group");
+    assert_eq!(reviews["turnId"], ROOT);
+    assert_eq!(reviews["childTotal"], 1);
+
+    let ordinary = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{THREAD}/activity/ordinary-collision"),
+    )
+    .await;
+    assert_eq!(ordinary["id"], "ordinary-collision");
+    assert_eq!(ordinary["turnId"], "ordinary-collision");
+    assert_eq!(ordinary["kind"], "exchange");
+    assert!(ordinary["counts"].is_object());
 }
 
 #[tokio::test]
@@ -2304,6 +4108,7 @@ async fn activity_attributes_null_turn_usage_once_across_root_pages() {
     assert_eq!(summary["totals"]["totalTokens"], 315);
 
     let mut exchanges = HashMap::new();
+    let mut expected_days = None;
     for page in 1..=2 {
         let activity = get_json(
             &harness.app,
@@ -2312,9 +4117,30 @@ async fn activity_attributes_null_turn_usage_once_across_root_pages() {
         .await;
         assert_eq!(activity["total"], 2);
         assert_eq!(activity["totalPages"], 2);
+        if let Some(expected) = expected_days.as_ref() {
+            assert_eq!(
+                &activity["days"], expected,
+                "day summaries must not depend on the selected root page"
+            );
+        } else {
+            expected_days = Some(activity["days"].clone());
+        }
         let exchange = activity["items"][0].clone();
         exchanges.insert(exchange["id"].as_str().unwrap().to_owned(), exchange);
     }
+
+    let unpaginated = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{THREAD}/activity?page=1&pageSize=25"),
+    )
+    .await;
+    let expected_days = expected_days.unwrap();
+    assert_eq!(unpaginated["days"], expected_days);
+    assert_eq!(expected_days.as_array().unwrap().len(), 1);
+    assert_eq!(expected_days[0]["date"], "2026-07-27");
+    assert_eq!(expected_days[0]["durationMs"], 120_000);
+    assert_eq!(expected_days[0]["totals"]["totalTokens"], 315);
+    assert_eq!(expected_days[0]["totals"], summary["totals"]);
 
     for (root_id, expected_tokens, expected_model_calls) in
         [("null-root-a", 103, 3), ("null-root-b", 212, 3)]
@@ -2509,6 +4335,272 @@ async fn activity_detail_pages_large_event_streams_and_lazy_groups() {
 }
 
 #[tokio::test]
+async fn activity_review_group_cursor_is_stable_and_totals_ignore_child_pages() {
+    const THREAD: &str = "review-cursor-thread";
+    const ROOT: &str = "review-cursor-root";
+    const GROUP: &str = "group:reviews:review-cursor-root";
+    let harness = harness();
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO threads(id,title,started_at,last_event_at)
+            VALUES('review-cursor-thread','Review cursor',
+                   '2046-01-01T10:00:00Z','2046-01-01T10:10:00Z');
+            INSERT INTO rollouts(id,thread_id,parent_rollout_id,parent_thread_id,
+                                 started_at,last_event_at,archived) VALUES
+                ('review-cursor-thread','review-cursor-thread',NULL,NULL,
+                 '2046-01-01T10:00:00Z','2046-01-01T10:10:00Z',0),
+                ('review-cursor-child','review-cursor-thread','review-cursor-thread',
+                 'review-cursor-thread','2046-01-01T10:01:00Z',
+                 '2046-01-01T10:10:00Z',0);
+            INSERT INTO turns(id,thread_id,rollout_id,started_at,status,model,duration_ms) VALUES
+                ('review-cursor-root','review-cursor-thread','review-cursor-thread',
+                 '2046-01-01T10:00:00Z','completed','gpt-5.5',1000),
+                ('review-000','review-cursor-thread','review-cursor-child',
+                 '2046-01-01T10:05:00Z','completed','codex-auto-review',1000),
+                ('review-001','review-cursor-thread','review-cursor-child',
+                 '2046-01-01T10:05:00Z','completed','codex-auto-review',1000),
+                ('review-002','review-cursor-thread','review-cursor-child',
+                 '2046-01-01T10:05:00Z','completed','codex-auto-review',1000),
+                ('review-003','review-cursor-thread','review-cursor-child',
+                 '2046-01-01T10:05:00Z','completed','codex-auto-review',1000),
+                ('review-004','review-cursor-thread','review-cursor-child',
+                 '2046-01-01T10:05:00Z','completed','codex-auto-review',1000),
+                ('review-005','review-cursor-thread','review-cursor-child',
+                 '2046-01-01T10:05:00Z','completed','codex-auto-review',1000),
+                ('review-agent-000','review-cursor-thread','review-cursor-child',
+                 '2046-01-01T10:04:00Z','completed','gpt-5.5',1000);
+            INSERT INTO events(
+                id,thread_id,rollout_id,turn_id,timestamp,source_line,kind,role,body,native
+            ) VALUES(
+                'review-cursor-visible','review-cursor-thread','review-cursor-thread',
+                'review-cursor-root','2046-01-01T10:00:00Z',1,
+                'user','user','Inspect the reviews',1
+            );
+            INSERT INTO usage_facts(
+                id,thread_id,rollout_id,turn_id,timestamp,source_line,model,
+                input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens,native
+            ) VALUES
+                ('review-usage-000','review-cursor-thread','review-cursor-child','review-000','2046-01-01T10:05:00Z',1,'codex-auto-review',10,0,0,0,10,1),
+                ('review-usage-001','review-cursor-thread','review-cursor-child','review-001','2046-01-01T10:05:00Z',2,'codex-auto-review',10,0,0,0,10,1),
+                ('review-usage-002','review-cursor-thread','review-cursor-child','review-002','2046-01-01T10:05:00Z',3,'codex-auto-review',10,0,0,0,10,1),
+                ('review-usage-003','review-cursor-thread','review-cursor-child','review-003','2046-01-01T10:05:00Z',4,'codex-auto-review',10,0,0,0,10,1),
+                ('review-usage-004','review-cursor-thread','review-cursor-child','review-004','2046-01-01T10:05:00Z',5,'codex-auto-review',10,0,0,0,10,1),
+                ('review-usage-005','review-cursor-thread','review-cursor-child','review-005','2046-01-01T10:05:00Z',6,'codex-auto-review',10,0,0,0,10,1);
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let root = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{THREAD}/activity/{ROOT}?childPageSize=2"),
+    )
+    .await;
+    let placeholder = root["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["kind"] == "review_group")
+        .expect("root detail must expose a lazy review group");
+    assert_eq!(placeholder["childTotal"], 6);
+    assert_eq!(placeholder["childHasMore"], true);
+    assert_eq!(placeholder["children"], json!([]));
+    assert_eq!(placeholder["usage"]["totalTokens"], 60);
+
+    let page_one = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{THREAD}/activity/{GROUP}?childPage=1&childPageSize=2"),
+    )
+    .await;
+    let cursor_one = page_one["childNextCursor"].as_str().unwrap().to_owned();
+    let page_two_numeric = get_json(
+        &harness.app,
+        &format!("/api/v1/sessions/{THREAD}/activity/{GROUP}?childPage=2&childPageSize=2"),
+    )
+    .await;
+    let page_two = get_json(
+        &harness.app,
+        &format!(
+            "/api/v1/sessions/{THREAD}/activity/{GROUP}?childPage=2&childPageSize=2&childCursor={}",
+            query_component(&cursor_one)
+        ),
+    )
+    .await;
+    let cursor_two = page_two["childNextCursor"].as_str().unwrap().to_owned();
+    let page_three = get_json(
+        &harness.app,
+        &format!(
+            "/api/v1/sessions/{THREAD}/activity/{GROUP}?childPage=3&childPageSize=2&childCursor={}",
+            query_component(&cursor_two)
+        ),
+    )
+    .await;
+
+    let child_ids = |page: &Value| {
+        page["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(child_ids(&page_one), ["review-005", "review-004"]);
+    assert_eq!(child_ids(&page_two), ["review-003", "review-002"]);
+    assert_eq!(child_ids(&page_three), ["review-001", "review-000"]);
+    assert_eq!(child_ids(&page_two_numeric), child_ids(&page_two));
+    for page in [&page_one, &page_two_numeric, &page_two, &page_three] {
+        assert!(
+            page["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|child| child["kind"] == "review")
+        );
+        assert_eq!(page["childPageSize"], 2);
+        assert_eq!(page["usage"]["totalTokens"], 60);
+        assert_eq!(page["usage"], page_one["usage"]);
+        assert_eq!(page["status"], "completed");
+        assert_eq!(page["durationMs"], 1000);
+    }
+    assert!(page_three.get("childNextCursor").is_none());
+
+    for (page, number, has_more) in [
+        (&page_one, 1, true),
+        (&page_two, 2, true),
+        (&page_three, 3, false),
+    ] {
+        assert_eq!(page["childPage"], number);
+        assert_eq!(page["childTotal"], 6);
+        assert_eq!(page["childHasMore"], has_more);
+    }
+
+    let connection = harness.db.connect().unwrap();
+    connection
+        .execute(
+            "INSERT INTO turns(id,thread_id,rollout_id,started_at,status,model,duration_ms)
+             VALUES('review-999',?1,'review-cursor-child','2046-01-01T10:05:01Z',
+                    'completed','codex-auto-review',1000)",
+            [THREAD],
+        )
+        .unwrap();
+    drop(connection);
+    let stable_continuation = get_json(
+        &harness.app,
+        &format!(
+            "/api/v1/sessions/{THREAD}/activity/{GROUP}?childPage=2&childPageSize=2&childCursor={}",
+            query_component(&cursor_one)
+        ),
+    )
+    .await;
+    assert_eq!(
+        child_ids(&stable_continuation),
+        ["review-003", "review-002"],
+        "a newer review must not repeat or displace older cursor results"
+    );
+    assert_eq!(stable_continuation["childTotal"], 7);
+
+    let (status, _, body) = raw_request(
+        &harness.app,
+        Method::GET,
+        &format!(
+            "/api/v1/sessions/{THREAD}/activity/group:agents:{ROOT}?childPageSize=2&childCursor={}",
+            query_component(&cursor_one)
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"error": "invalid Activity cursor"})
+    );
+}
+
+#[tokio::test]
+async fn analytics_validation_errors_and_all_time_anchor_ignoring_are_exact() {
+    let harness = harness();
+
+    for (uri, expected_error) in [
+        (
+            "/api/v1/stats?range=quarter",
+            "range must be day, week, month, year, or all",
+        ),
+        (
+            "/api/v1/stats?range=day&anchor=not-a-date",
+            "expected a YYYY-MM-DD date",
+        ),
+        (
+            "/api/v1/stats?range=day&anchor=1969-12-31",
+            "year must be between 1970 and 9998",
+        ),
+        (
+            "/api/v1/stats?range=day&anchor=9999-12-31",
+            "year must be between 1970 and 9998",
+        ),
+        (
+            "/api/v1/stats?range=week&anchor=1970-01-01",
+            "weekly anchor must be on or after 1970-01-05",
+        ),
+        (
+            "/api/v1/overview/year?year=10000",
+            "year must be between 1970 and 9998",
+        ),
+    ] {
+        let (status, headers, body) = raw_request(&harness.app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(
+            headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap()),
+            Some("application/json"),
+            "{uri}"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({ "error": expected_error }),
+            "{uri}"
+        );
+    }
+
+    let (status, headers, body) =
+        raw_request(&harness.app, Method::GET, "/api/v1/stats?range=all", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap()),
+        Some("application/json")
+    );
+    let baseline = serde_json::from_slice::<Value>(&body).unwrap();
+    assert_eq!(baseline["range"], "all");
+
+    for uri in [
+        "/api/v1/stats?range=all&anchor=not-a-date",
+        "/api/v1/stats?range=all&anchor=9999-12-31",
+    ] {
+        let (status, headers, body) = raw_request(&harness.app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(
+            headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap()),
+            Some("application/json"),
+            "{uri}"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            baseline,
+            "all-time anchors must be ignored before validation: {uri}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn stats_cover_every_range_and_rows_drill_down_without_bucket_guessing() {
     let harness = harness();
     for (range, anchor, expected_rows) in [
@@ -2692,6 +4784,48 @@ async fn stats_keep_public_year_bounds_and_fractional_dst_labels() {
         labels.iter().any(|label| label.ends_with(":30")),
         "Lord Howe's half-hour DST transition must remain visible in labels: {labels:?}"
     );
+}
+
+#[tokio::test]
+async fn stats_omit_a_civil_date_skipped_by_the_local_timezone() {
+    const CHILD_MARKER: &str = "CODEX_USAGE_SKIPPED_DATE_CHILD";
+    const TEST_NAME: &str = "stats_omit_a_civil_date_skipped_by_the_local_timezone";
+
+    if std::env::var_os(CHILD_MARKER).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD_MARKER, "1")
+            .env("TZ", "Pacific/Apia")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "timezone-isolated skipped-date regression failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let boundary = DateTime::parse_from_rfc3339("2011-12-30T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Local);
+    assert_eq!(boundary.date_naive().to_string(), "2011-12-31");
+
+    let harness = harness();
+    let skipped = get_json(&harness.app, "/api/v1/stats?range=day&anchor=2011-12-30").await;
+    assert!(skipped["rows"].as_array().unwrap().is_empty());
+    assert_eq!(skipped["totals"]["totalTokens"], 0);
+
+    let month = get_json(&harness.app, "/api/v1/stats?range=month&anchor=2011-12-15").await;
+    let labels = month["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["label"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(labels.len(), 30);
+    assert!(!labels.contains(&"2011-12-30"));
 }
 
 #[tokio::test]

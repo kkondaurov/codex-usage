@@ -1,0 +1,349 @@
+{
+  "overviewContract": {
+    "periods": {
+      "month": {
+        "deltaCostIsNullableUsd": true,
+        "deltaPercentIsNullableNumber": true,
+        "endIsTimestamp": true,
+        "label": "This month",
+        "messageCountIsNumber": true,
+        "sessionCountIsNumber": true,
+        "startIsTimestamp": true,
+        "totalsKeys": [
+          "blendedTokens",
+          "cachedInputTokens",
+          "costUsd",
+          "inputTokens",
+          "outputTokens",
+          "pricingComplete",
+          "reasoningTokens",
+          "totalTokens",
+          "unpricedTokens"
+        ]
+      },
+      "today": {
+        "deltaCostIsNullableUsd": true,
+        "deltaPercentIsNullableNumber": true,
+        "endIsTimestamp": true,
+        "label": "Today",
+        "messageCountIsNumber": true,
+        "sessionCountIsNumber": true,
+        "startIsTimestamp": true,
+        "totalsKeys": [
+          "blendedTokens",
+          "cachedInputTokens",
+          "costUsd",
+          "inputTokens",
+          "outputTokens",
+          "pricingComplete",
+          "reasoningTokens",
+          "totalTokens",
+          "unpricedTokens"
+        ]
+      },
+      "week": {
+        "deltaCostIsNullableUsd": true,
+        "deltaPercentIsNullableNumber": true,
+        "endIsTimestamp": true,
+        "label": "This week",
+        "messageCountIsNumber": true,
+        "sessionCountIsNumber": true,
+        "startIsTimestamp": true,
+        "totalsKeys": [
+          "blendedTokens",
+          "cachedInputTokens",
+          "costUsd",
+          "inputTokens",
+          "outputTokens",
+          "pricingComplete",
+          "reasoningTokens",
+          "totalTokens",
+          "unpricedTokens"
+        ]
+      }
+    },
+    "updatedAtIsTimestamp": true
+  },
+  "stats": {
+    "all": {
+      "activeRows": [
+        {
+          "row": {
+            "bucket": "2025",
+            "sessionCount": 1,
+            "totals": {
+              "costUsd": "0.00",
+              "pricingComplete": true,
+              "totalTokens": 0,
+              "unpricedTokens": 0
+            }
+          },
+          "trend": "0.00"
+        },
+        {
+          "row": {
+            "bucket": "2026",
+            "sessionCount": 5,
+            "totals": {
+              "costUsd": null,
+              "pricingComplete": false,
+              "totalTokens": 415786,
+              "unpricedTokens": 25607
+            }
+          },
+          "trend": null
+        }
+      ],
+      "anchor": "$TODAY",
+      "label": "All time",
+      "range": "all",
+      "rowCount": "$DATA_THROUGH_CURRENT_YEAR",
+      "totals": {
+        "blendedTokens": 278467,
+        "cachedInputTokens": 152576,
+        "costUsd": null,
+        "inputTokens": 412862,
+        "outputTokens": 2924,
+        "pricingComplete": false,
+        "reasoningTokens": 1899,
+        "totalTokens": 415786,
+        "unpricedTokens": 25607
+      },
+      "trendCount": "$MATCHES_ROW_COUNT"
+    },
+    "day": {
+      "activeRows": [
+        {
+          "row": {
+            "bucket": "04:00Z",
+            "sessionCount": 1,
+            "totals": {
+              "costUsd": null,
+              "pricingComplete": false,
+              "totalTokens": 25607,
+              "unpricedTokens": 25607
+            }
+          },
+          "trend": null
+        },
+        {
+          "row": {
+            "bucket": "07:00Z",
+            "sessionCount": 1,
+            "totals": {
+              "costUsd": "1.003",
+              "pricingComplete": true,
+              "totalTokens": 276982,
+              "unpricedTokens": 0
+            }
+          },
+          "trend": "1.003"
+        },
+        {
+          "row": {
+            "bucket": "20:00Z",
+            "sessionCount": 2,
+            "totals": {
+              "costUsd": "0.215899",
+              "pricingComplete": true,
+              "totalTokens": 85119,
+              "unpricedTokens": 0
+            }
+          },
+          "trend": "0.215899"
+        }
+      ],
+      "anchor": "2026-07-15",
+      "label": "Jul 15, 2026",
+      "range": "day",
+      "rowCount": 24,
+      "totals": {
+        "blendedTokens": 253500,
+        "cachedInputTokens": 149120,
+        "costUsd": null,
+        "inputTokens": 385693,
+        "outputTokens": 2015,
+        "pricingComplete": false,
+        "reasoningTokens": 1383,
+        "totalTokens": 387708,
+        "unpricedTokens": 25607
+      },
+      "trendCount": 24
+    },
+    "month": {
+      "activeRows": [
+        {
+          "row": {
+            "bucket": "2026-07-15",
+            "sessionCount": 4,
+            "totals": {
+              "costUsd": null,
+              "pricingComplete": false,
+              "totalTokens": 387708,
+              "unpricedTokens": 25607
+            }
+          },
+          "trend": null
+        }
+      ],
+      "anchor": "2026-07-01",
+      "label": "July 2026",
+      "range": "month",
+      "rowCount": 31,
+      "totals": {
+        "blendedTokens": 253500,
+        "cachedInputTokens": 149120,
+        "costUsd": null,
+        "inputTokens": 385693,
+        "outputTokens": 2015,
+        "pricingComplete": false,
+        "reasoningTokens": 1383,
+        "totalTokens": 387708,
+        "unpricedTokens": 25607
+      },
+      "trendCount": 31
+    },
+    "week": {
+      "activeRows": [
+        {
+          "row": {
+            "bucket": "Wed 15",
+            "sessionCount": 4,
+            "totals": {
+              "costUsd": null,
+              "pricingComplete": false,
+              "totalTokens": 387708,
+              "unpricedTokens": 25607
+            }
+          },
+          "trend": null
+        }
+      ],
+      "anchor": "2026-07-13",
+      "label": "Week of Jul 13, 2026",
+      "range": "week",
+      "rowCount": 7,
+      "totals": {
+        "blendedTokens": 253500,
+        "cachedInputTokens": 149120,
+        "costUsd": null,
+        "inputTokens": 385693,
+        "outputTokens": 2015,
+        "pricingComplete": false,
+        "reasoningTokens": 1383,
+        "totalTokens": 387708,
+        "unpricedTokens": 25607
+      },
+      "trendCount": 7
+    },
+    "year": {
+      "activeRows": [
+        {
+          "row": {
+            "bucket": "May",
+            "sessionCount": 1,
+            "totals": {
+              "costUsd": "0.147563",
+              "pricingComplete": true,
+              "totalTokens": 28078,
+              "unpricedTokens": 0
+            }
+          },
+          "trend": "0.147563"
+        },
+        {
+          "row": {
+            "bucket": "Jul",
+            "sessionCount": 4,
+            "totals": {
+              "costUsd": null,
+              "pricingComplete": false,
+              "totalTokens": 387708,
+              "unpricedTokens": 25607
+            }
+          },
+          "trend": null
+        }
+      ],
+      "anchor": "2026-01-01",
+      "label": "2026",
+      "range": "year",
+      "rowCount": 12,
+      "totals": {
+        "blendedTokens": 278467,
+        "cachedInputTokens": 152576,
+        "costUsd": null,
+        "inputTokens": 412862,
+        "outputTokens": 2924,
+        "pricingComplete": false,
+        "reasoningTokens": 1899,
+        "totalTokens": 415786,
+        "unpricedTokens": 25607
+      },
+      "trendCount": 12
+    }
+  },
+  "year": {
+    "activeHeatmap": [
+      {
+        "costUsd": "0.147563",
+        "date": "2026-05-04",
+        "messageCount": 2,
+        "sessionCount": 1,
+        "totalTokens": 28078
+      },
+      {
+        "costUsd": null,
+        "date": "2026-07-15",
+        "messageCount": 8,
+        "sessionCount": 4,
+        "totalTokens": 387708
+      }
+    ],
+    "heatmapCount": 365,
+    "topProjects": [
+      {
+        "costUsd": "1.150563",
+        "project": "peregrine",
+        "share": 0.8420014607065546
+      },
+      {
+        "costUsd": "0.215899",
+        "project": "codex-dashboard",
+        "share": 0.15799853929344543
+      },
+      {
+        "costUsd": null,
+        "project": "automation-review",
+        "share": null
+      }
+    ],
+    "topSessions": [
+      {
+        "costUsd": "1.003",
+        "id": "019f64aa-21e8-7a41-916f-0fe9b845eede",
+        "lastEventAt": "2026-07-15T07:48:30.000000000Z",
+        "messageCount": 4,
+        "totalTokens": 276982,
+        "unpricedTokens": 0
+      },
+      {
+        "costUsd": "0.215899",
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8",
+        "lastEventAt": "2026-07-15T20:41:26.000000000Z",
+        "messageCount": 3,
+        "totalTokens": 85119,
+        "unpricedTokens": 0
+      },
+      {
+        "costUsd": "0.147563",
+        "id": "019df47e-62a3-7ba3-a57f-d7f8565ec08f",
+        "lastEventAt": "2026-05-04T19:37:18.000000000Z",
+        "messageCount": 2,
+        "totalTokens": 28078,
+        "unpricedTokens": 0
+      }
+    ],
+    "year": 2026
+  }
+}

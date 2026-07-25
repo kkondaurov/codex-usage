@@ -1,0 +1,213 @@
+{
+  "detailCursor": {
+    "body": "The model now keeps the rich trace while the main UI stays quiet.",
+    "childHasMore": true,
+    "childNextCursor": "{\"version\":1,\"thread_id\":\"019f6768-ef84-74d3-ab05-e4b5fb717fa8\",\"turn_id\":\"019f677c-30c2-70e2-9668-ba4fc8ad57c3\",\"timestamp\":\"2026-07-15T20:35:30.758000000Z\",\"source_line\":21,\"event_id\":\"019f6768-ef84-74d3-ab05-e4b5fb717fa8:21\"}",
+    "childPage": 1,
+    "childPageSize": 3,
+    "childTotal": 17,
+    "children": [
+      {
+        "body": "Build a functioning usage application backed by faithful ingestion.",
+        "hasDetails": true,
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8:24",
+        "kind": "goal",
+        "label": "Goal updated",
+        "model": "gpt-5.6-sol",
+        "status": "active",
+        "timestamp": "2026-07-15T20:41:16.000000000Z",
+        "turnId": "019f677c-30c2-70e2-9668-ba4fc8ad57c3"
+      },
+      {
+        "body": "Storage audit: nested session metadata must never change the physical rollout owner.",
+        "hasDetails": true,
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8:23",
+        "kind": "subagent",
+        "label": "/root/storage_audit → /root",
+        "model": "gpt-5.6-sol",
+        "timestamp": "2026-07-15T20:41:15.727000000Z",
+        "turnId": "019f677c-30c2-70e2-9668-ba4fc8ad57c3"
+      },
+      {
+        "body": "/root/storage_audit",
+        "hasDetails": true,
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8:21",
+        "kind": "subagent",
+        "label": "started",
+        "model": "gpt-5.6-sol",
+        "status": "started",
+        "timestamp": "2026-07-15T20:35:30.758000000Z",
+        "turnId": "019f677c-30c2-70e2-9668-ba4fc8ad57c3"
+      }
+    ],
+    "counts": {
+      "agentRuns": 0,
+      "followUps": 0,
+      "modelCalls": 2,
+      "reviews": 0,
+      "toolCalls": 8
+    },
+    "hasDetails": true,
+    "id": "019f677c-30c2-70e2-9668-ba4fc8ad57c3",
+    "kind": "exchange",
+    "label": "Revisit the usage application from ingestion through the browser UI.",
+    "model": "gpt-5.6-sol",
+    "role": "user",
+    "status": "completed",
+    "timestamp": "2026-07-15T20:12:38.120000000Z",
+    "turnId": "019f677c-30c2-70e2-9668-ba4fc8ad57c3",
+    "usage": {
+      "costUsd": "0.215899",
+      "pricingComplete": true,
+      "totalTokens": 85119,
+      "unpricedTokens": 0
+    }
+  },
+  "detailFirst": {
+    "childHasMore": true,
+    "childNextCursor": "{\"version\":1,\"thread_id\":\"019f6768-ef84-74d3-ab05-e4b5fb717fa8\",\"turn_id\":\"019f677c-30c2-70e2-9668-ba4fc8ad57c3\",\"timestamp\":\"2026-07-15T20:41:21.000000000Z\",\"source_line\":26,\"event_id\":\"019f6768-ef84-74d3-ab05-e4b5fb717fa8:26\"}",
+    "childPage": 1,
+    "childPageSize": 3,
+    "childTotal": 17,
+    "children": [
+      {
+        "body": "The model now keeps the rich trace while the main UI stays quiet.",
+        "hasDetails": true,
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8:30",
+        "kind": "final",
+        "model": "gpt-5.6-sol",
+        "role": "assistant",
+        "timestamp": "2026-07-15T20:41:25.001000000Z",
+        "turnId": "019f677c-30c2-70e2-9668-ba4fc8ad57c3"
+      },
+      {
+        "body": "/root/storage_audit",
+        "hasDetails": true,
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8:28",
+        "kind": "subagent",
+        "label": "completed",
+        "model": "gpt-5.6-sol",
+        "status": "completed",
+        "timestamp": "2026-07-15T20:41:22.000000000Z",
+        "turnId": "019f677c-30c2-70e2-9668-ba4fc8ad57c3"
+      },
+      {
+        "body": "Conversation context was compacted.",
+        "hasDetails": true,
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8:26",
+        "kind": "compaction",
+        "label": "Context compacted",
+        "model": "gpt-5.6-sol",
+        "timestamp": "2026-07-15T20:41:21.000000000Z",
+        "turnId": "019f677c-30c2-70e2-9668-ba4fc8ad57c3"
+      }
+    ],
+    "counts": {
+      "agentRuns": 0,
+      "followUps": 0,
+      "modelCalls": 2,
+      "reviews": 0,
+      "toolCalls": 8
+    },
+    "hasDetails": true,
+    "id": "019f677c-30c2-70e2-9668-ba4fc8ad57c3",
+    "kind": "exchange",
+    "label": "Revisit the usage application from ingestion through the browser UI.",
+    "model": "gpt-5.6-sol",
+    "role": "user",
+    "status": "completed",
+    "timestamp": "2026-07-15T20:12:38.120000000Z",
+    "turnId": "019f677c-30c2-70e2-9668-ba4fc8ad57c3",
+    "usage": {
+      "costUsd": "0.215899",
+      "pricingComplete": true,
+      "totalTokens": 85119,
+      "unpricedTokens": 0
+    }
+  },
+  "group": {
+    "body": "Russell",
+    "childHasMore": false,
+    "childPage": 1,
+    "childPageSize": 1,
+    "childTotal": 1,
+    "children": [
+      {
+        "agentLabel": "Russell",
+        "body": "Research sidecar complete.",
+        "hasDetails": true,
+        "id": "019f64be-7517-73a1-bf19-a7d8e6cf5fc4",
+        "kind": "subagent",
+        "label": "Russell",
+        "model": "gpt-5.6-sol",
+        "status": "completed",
+        "timestamp": "2026-07-15T07:47:11.260000000Z",
+        "turnId": "019f64be-7517-73a1-bf19-a7d8e6cf5fc4",
+        "usage": {
+          "costUsd": "0.066605",
+          "pricingComplete": true,
+          "totalTokens": 92678,
+          "unpricedTokens": 0
+        }
+      }
+    ],
+    "hasDetails": true,
+    "id": "group:agents:019f64b1-9bc4-78f1-8799-b421d28439de",
+    "kind": "agent_group",
+    "label": "Agents · 1",
+    "status": "completed",
+    "timestamp": "2026-07-15T07:47:11.260000000Z",
+    "turnId": "019f64b1-9bc4-78f1-8799-b421d28439de",
+    "usage": {
+      "costUsd": "0.066605",
+      "pricingComplete": true,
+      "totalTokens": 92678,
+      "unpricedTokens": 0
+    }
+  },
+  "root": {
+    "days": [
+      {
+        "date": "2026-07-15",
+        "durationMs": 1727880,
+        "totals": {
+          "costUsd": "0.215899",
+          "pricingComplete": true,
+          "totalTokens": 85119,
+          "unpricedTokens": 0
+        }
+      }
+    ],
+    "items": [
+      {
+        "body": "The model now keeps the rich trace while the main UI stays quiet.",
+        "counts": {
+          "agentRuns": 0,
+          "followUps": 0,
+          "modelCalls": 2,
+          "reviews": 0,
+          "toolCalls": 8
+        },
+        "hasDetails": true,
+        "id": "019f677c-30c2-70e2-9668-ba4fc8ad57c3",
+        "kind": "exchange",
+        "label": "Revisit the usage application from ingestion through the browser UI.",
+        "model": "gpt-5.6-sol",
+        "role": "user",
+        "status": "completed",
+        "timestamp": "2026-07-15T20:12:38.120000000Z",
+        "turnId": "019f677c-30c2-70e2-9668-ba4fc8ad57c3",
+        "usage": {
+          "costUsd": "0.215899",
+          "pricingComplete": true,
+          "totalTokens": 85119,
+          "unpricedTokens": 0
+        }
+      }
+    ],
+    "page": 1,
+    "pageSize": 25,
+    "total": 1,
+    "totalPages": 1
+  }
+}

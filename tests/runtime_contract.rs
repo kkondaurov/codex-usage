@@ -1,10 +1,24 @@
-#[cfg(unix)]
-use codex_usage::db::Db;
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+use codex_usage::{
+    app::AppDependencies,
+    config::PricingConfig,
+    ingest::IngestRoots,
+    pricing::{ManualPricingStore, PricingSync},
+    storage::{Db, StorageExecutor, WorkClass},
+};
+use serde_json::Value;
 use std::{
     ffi::OsString,
     net::TcpListener,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 #[cfg(unix)]
 use std::{
@@ -16,6 +30,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use tower::ServiceExt;
 
 #[cfg(unix)]
 struct ChildGuard(Option<Child>);
@@ -85,6 +100,373 @@ fn appended_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+fn runtime_app(db: Db, frontend: PathBuf, executor: StorageExecutor) -> axum::Router {
+    let pricing_sync = PricingSync::new(executor.clone());
+    let manual_pricing = ManualPricingStore::new(db.path().with_extension("pricing.json")).unwrap();
+    manual_pricing.hydrate(&db).unwrap();
+    AppDependencies::new(
+        db,
+        IngestRoots {
+            active: None,
+            archive: None,
+        },
+        frontend,
+        PricingConfig {
+            url: "http://127.0.0.1:9/prices.json".into(),
+            refresh_interval_hours: 24,
+            timeout_seconds: 1,
+        },
+        executor,
+        pricing_sync,
+        manual_pricing,
+    )
+    .build()
+}
+
+async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, Value) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("host", "127.0.0.1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+fn summary_totals_are_consistent(summary: &Value) -> bool {
+    let Some(session_total) = summary["session"]["totalTokens"].as_u64() else {
+        return false;
+    };
+    let Some(response_total) = summary["totals"]["totalTokens"].as_u64() else {
+        return false;
+    };
+    let Some(model_total) = summary["models"][0]["totalTokens"].as_u64() else {
+        return false;
+    };
+    session_total == response_total && response_total == model_total
+}
+
+fn session_project_catalog_is_consistent(response: &Value) -> bool {
+    let Some(items) = response["items"].as_array() else {
+        return false;
+    };
+    let Some(projects) = response["projects"].as_array() else {
+        return false;
+    };
+    let (Some(item), [project]) = (items.first(), projects.as_slice()) else {
+        return false;
+    };
+    item["project"].as_str().is_some_and(|item_project| {
+        project
+            .as_str()
+            .is_some_and(|project| project == item_project)
+    })
+}
+
+#[test]
+fn summary_snapshot_oracle_rejects_a_deliberately_torn_response() {
+    let torn = serde_json::json!({
+        "session": { "totalTokens": 20_100 },
+        "totals": { "totalTokens": 20_200 },
+        "models": [{ "totalTokens": 20_200 }]
+    });
+    assert!(!summary_totals_are_consistent(&torn));
+}
+
+#[test]
+fn session_list_snapshot_oracle_rejects_a_deliberately_torn_response() {
+    let torn = serde_json::json!({
+        "items": [{ "project": "alpha" }],
+        "projects": ["beta"]
+    });
+    assert!(!session_project_catalog_is_consistent(&torn));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_http_route_keeps_its_control_lane_when_regular_work_is_saturated() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Db::open(temp.path().join("usage.sqlite3")).unwrap();
+    let executor = StorageExecutor::new(3, 1);
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut blockers = Vec::new();
+
+    // A three-permit executor has two regular workers and one isolated control
+    // worker. Occupy both regular workers before entering the HTTP router.
+    for _ in 0..2 {
+        let executor = executor.clone();
+        let gate = gate.clone();
+        let started = started_tx.clone();
+        blockers.push(tokio::spawn(async move {
+            executor
+                .run(WorkClass::Light, move || {
+                    started.send(()).unwrap();
+                    let (lock, ready) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                    Ok(())
+                })
+                .await
+        }));
+    }
+    started_rx.recv().await.unwrap();
+    started_rx.recv().await.unwrap();
+
+    // Demonstrate that saturation is real. A route accidentally rewired as
+    // Light or Heavy cannot start until one of these regular workers exits.
+    let mut deliberately_misclassified = {
+        let executor = executor.clone();
+        tokio::spawn(async move { executor.run(WorkClass::Light, || Ok(())).await })
+    };
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            &mut deliberately_misclassified,
+        )
+        .await
+        .is_err(),
+        "the sensitivity probe unexpectedly found spare regular capacity"
+    );
+    deliberately_misclassified.abort();
+    let _ = deliberately_misclassified.await;
+
+    let app = runtime_app(db, temp.path().join("frontend"), executor);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        get_json(app, "/api/v1/status"),
+    )
+    .await;
+
+    // Always release blocking workers before evaluating the result. A
+    // deliberate route-class regression should fail promptly, not strand the
+    // test runtime while its blocking pool waits on this fixture gate.
+    let (lock, ready) = &*gate;
+    *lock.lock().unwrap() = true;
+    ready.notify_all();
+    for blocker in blockers {
+        blocker.await.unwrap().unwrap();
+    }
+    let (status, body) = response.expect("/status used the saturated regular executor lane");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "idle");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_summary_http_response_uses_one_snapshot_during_wal_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Db::open(temp.path().join("usage.sqlite3")).unwrap();
+    let connection = db.connect().unwrap();
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    connection
+        .execute_batch(
+            "INSERT INTO threads(id,title,project,started_at,last_event_at)
+             VALUES('snapshot-thread','Snapshot thread','runtime',
+                    '2026-07-25T10:00:00.000000000Z',
+                    '2026-07-25T10:00:00.000000000Z');
+             INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+             VALUES('snapshot-thread','snapshot-thread',
+                    '2026-07-25T10:00:00.000000000Z',
+                    '2026-07-25T10:00:00.000000000Z',0);
+             INSERT INTO events(
+                 id,thread_id,rollout_id,timestamp,source_line,kind,native
+             ) VALUES(
+                 'snapshot-event','snapshot-thread','snapshot-thread',
+                 '2026-07-25T10:00:00.000000000Z',1,'state',1
+             );
+             WITH RECURSIVE sequence(value) AS (
+                 VALUES(1) UNION ALL SELECT value+1 FROM sequence WHERE value<20000
+             )
+             INSERT INTO usage_facts(
+                 id,thread_id,rollout_id,timestamp,source_line,model,
+                 input_tokens,cached_input_tokens,output_tokens,
+                 reasoning_tokens,total_tokens,native
+             )
+             SELECT printf('stable-%05d',value),'snapshot-thread','snapshot-thread',
+                    '2026-07-25T10:00:00.000000000Z',value+1,'snapshot-model',
+                    1,0,0,0,1,1
+             FROM sequence;
+             INSERT INTO usage_facts(
+                 id,thread_id,rollout_id,timestamp,source_line,model,
+                 input_tokens,cached_input_tokens,output_tokens,
+                 reasoning_tokens,total_tokens,native
+             ) VALUES(
+                 'changing-fact','snapshot-thread','snapshot-thread',
+                 '2026-07-25T10:00:00.000000000Z',20002,'snapshot-model',
+                 100,0,0,0,100,1
+             );",
+        )
+        .unwrap();
+    drop(connection);
+
+    let app = runtime_app(
+        db.clone(),
+        temp.path().join("frontend"),
+        StorageExecutor::default(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let commits = Arc::new(AtomicUsize::new(0));
+    let writer_stop = stop.clone();
+    let writer_commits = commits.clone();
+    let writer_db = db.clone();
+    let writer = std::thread::spawn(move || {
+        let connection = writer_db.connect().unwrap();
+        let mut next = 200_i64;
+        while !writer_stop.load(Ordering::Acquire) {
+            connection
+                .execute(
+                    "UPDATE usage_facts
+                     SET input_tokens=?1,total_tokens=?1
+                     WHERE id='changing-fact'",
+                    [next],
+                )
+                .unwrap();
+            next = if next == 200 { 100 } else { 200 };
+            writer_commits.fetch_add(1, Ordering::Release);
+            std::thread::yield_now();
+        }
+    });
+
+    let mut overlapped_requests = 0;
+    let mut failure = None;
+    for _ in 0..24 {
+        let before = commits.load(Ordering::Acquire);
+        let (status, summary) =
+            get_json(app.clone(), "/api/v1/sessions/snapshot-thread/summary").await;
+        let after = commits.load(Ordering::Acquire);
+        overlapped_requests += usize::from(after > before);
+        if status != StatusCode::OK {
+            failure = Some(format!("summary request returned {status}: {summary}"));
+            break;
+        }
+        if !summary_totals_are_consistent(&summary) {
+            failure = Some(format!(
+                "session metadata, response totals, and model breakdown came from different WAL snapshots: {summary}"
+            ));
+            break;
+        }
+    }
+    stop.store(true, Ordering::Release);
+    writer.join().unwrap();
+    if let Some(failure) = failure {
+        panic!("{failure}");
+    }
+    assert!(
+        overlapped_requests > 0,
+        "the WAL writer did not commit during any summary request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_list_and_project_catalog_use_one_snapshot_during_wal_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Db::open(temp.path().join("usage.sqlite3")).unwrap();
+    let connection = db.connect().unwrap();
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    connection
+        .execute_batch(
+            "INSERT INTO threads(id,title,project,started_at,last_event_at)
+             VALUES('list-snapshot-thread','List snapshot thread','alpha',
+                    '2026-07-25T10:00:00.000000000Z',
+                    '2026-07-25T10:00:00.000000000Z');
+             INSERT INTO rollouts(id,thread_id,started_at,last_event_at,archived)
+             VALUES('list-snapshot-thread','list-snapshot-thread',
+                    '2026-07-25T10:00:00.000000000Z',
+                    '2026-07-25T10:00:00.000000000Z',0);
+             INSERT INTO events(
+                 id,thread_id,rollout_id,timestamp,source_line,kind,native
+             ) VALUES(
+                 'list-snapshot-event','list-snapshot-thread','list-snapshot-thread',
+                 '2026-07-25T10:00:00.000000000Z',1,'state',1
+             );
+             WITH RECURSIVE sequence(value) AS (
+                 VALUES(1) UNION ALL SELECT value+1 FROM sequence WHERE value<20000
+             )
+             INSERT INTO usage_facts(
+                 id,thread_id,rollout_id,timestamp,source_line,model,
+                 input_tokens,cached_input_tokens,output_tokens,
+                 reasoning_tokens,total_tokens,native
+             )
+             SELECT printf('list-stable-%05d',value),
+                    'list-snapshot-thread','list-snapshot-thread',
+                    '2026-07-25T10:00:00.000000000Z',value+1,'snapshot-model',
+                    1,0,0,0,1,1
+             FROM sequence;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let app = runtime_app(
+        db.clone(),
+        temp.path().join("frontend"),
+        StorageExecutor::default(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let commits = Arc::new(AtomicUsize::new(0));
+    let writer_stop = stop.clone();
+    let writer_commits = commits.clone();
+    let writer_db = db.clone();
+    let writer = std::thread::spawn(move || {
+        let connection = writer_db.connect().unwrap();
+        let mut next = "beta";
+        while !writer_stop.load(Ordering::Acquire) {
+            connection
+                .execute(
+                    "UPDATE threads SET project=?1 WHERE id='list-snapshot-thread'",
+                    [next],
+                )
+                .unwrap();
+            next = if next == "beta" { "alpha" } else { "beta" };
+            writer_commits.fetch_add(1, Ordering::Release);
+            std::thread::yield_now();
+        }
+    });
+
+    let mut overlapped_requests = 0;
+    let mut failure = None;
+    for _ in 0..24 {
+        let before = commits.load(Ordering::Acquire);
+        let (status, response) =
+            get_json(app.clone(), "/api/v1/sessions?sort=cost&pageSize=1").await;
+        let after = commits.load(Ordering::Acquire);
+        overlapped_requests += usize::from(after > before);
+        if status != StatusCode::OK {
+            failure = Some(format!("sessions request returned {status}: {response}"));
+            break;
+        }
+        if !session_project_catalog_is_consistent(&response) {
+            failure = Some(format!(
+                "session row and project catalog came from different WAL snapshots: {response}"
+            ));
+            break;
+        }
+    }
+    stop.store(true, Ordering::Release);
+    writer.join().unwrap();
+    if let Some(failure) = failure {
+        panic!("{failure}");
+    }
+    assert!(
+        overlapped_requests > 0,
+        "the WAL writer did not commit during any Sessions list request"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn ingesting_commands_claim_scanner_lease_before_database_hydration() {
@@ -114,6 +496,8 @@ fn ingesting_commands_claim_scanner_lease_before_database_hydration() {
     .unwrap();
     let pricing_url = "http://127.0.0.1:9/prices.json";
     let db = Db::open(&db_path).unwrap();
+    let owner_store = ManualPricingStore::new(primary_pricing.clone()).unwrap();
+    owner_store.hydrate(&db).unwrap();
     db.connect()
         .unwrap()
         .execute_batch(&format!(
@@ -320,6 +704,86 @@ fn occupied_serve_port_fails_before_creating_database_or_worker_state() {
             path.display()
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn multiply_linked_custom_pricing_fails_before_database_initialization() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("must-not-exist.sqlite3");
+    let sessions = temp.path().join("sessions");
+    let pricing_target = temp.path().join("pricing-target.json");
+    let pricing_alias = temp.path().join("pricing-alias.json");
+    std::fs::create_dir(&sessions).unwrap();
+    std::fs::write(&pricing_target, r#"{"version":1,"prices":[],"aliases":[]}"#).unwrap();
+    std::fs::hard_link(&pricing_target, &pricing_alias).unwrap();
+
+    let output = binary()
+        .args(["ingest", "--db"])
+        .arg(&db)
+        .arg("--sessions")
+        .arg(&sessions)
+        .arg("--pricing-config")
+        .arg(&pricing_alias)
+        .env_clear()
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("multiply-linked storage file"), "{stderr}");
+    for path in [
+        db.clone(),
+        appended_path(&db, "-wal"),
+        appended_path(&db, "-shm"),
+    ] {
+        assert!(
+            !path.exists(),
+            "invalid custom pricing initialized {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn malformed_custom_pricing_is_detected_after_database_initialization() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("initialized-before-hydrate.sqlite3");
+    let sessions = temp.path().join("sessions");
+    let pricing = temp.path().join("malformed-pricing.json");
+    std::fs::create_dir(&sessions).unwrap();
+    std::fs::write(&pricing, "{").unwrap();
+
+    let output = binary()
+        .args(["ingest", "--db"])
+        .arg(&db)
+        .arg("--sessions")
+        .arg(&sessions)
+        .arg("--pricing-config")
+        .arg(&pricing)
+        .env_clear()
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to parse"), "{stderr}");
+    let schema_exists: bool = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        schema_exists,
+        "database initialization must precede hydration"
+    );
 }
 
 #[cfg(unix)]

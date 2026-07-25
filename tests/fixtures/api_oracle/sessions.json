@@ -1,0 +1,287 @@
+{
+  "bounded": {
+    "items": [
+      {
+        "costUsd": "0.182507",
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8",
+        "lastEventAt": "2026-07-15T20:13:30.418000000Z",
+        "messageCount": 0,
+        "totalTokens": 42362,
+        "unpricedTokens": 0
+      }
+    ],
+    "page": 1,
+    "pageSize": 50,
+    "total": 1,
+    "totalPages": 1
+  },
+  "costFirst": {
+    "items": [
+      {
+        "costUsd": "1.003",
+        "id": "019f64aa-21e8-7a41-916f-0fe9b845eede",
+        "lastEventAt": "2026-07-15T07:48:30.000000000Z",
+        "messageCount": 4,
+        "totalTokens": 276982,
+        "unpricedTokens": 0
+      },
+      {
+        "costUsd": "0.215899",
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8",
+        "lastEventAt": "2026-07-15T20:41:26.000000000Z",
+        "messageCount": 3,
+        "totalTokens": 85119,
+        "unpricedTokens": 0
+      },
+      {
+        "costUsd": "0.147563",
+        "id": "019df47e-62a3-7ba3-a57f-d7f8565ec08f",
+        "lastEventAt": "2026-05-04T19:37:18.000000000Z",
+        "messageCount": 2,
+        "totalTokens": 28078,
+        "unpricedTokens": 0
+      }
+    ],
+    "page": 1,
+    "pageSize": 3,
+    "total": 6,
+    "totalPages": 2
+  },
+  "date": {
+    "items": [
+      {
+        "costUsd": "0.215899",
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8",
+        "lastEventAt": "2026-07-15T20:41:26.000000000Z",
+        "messageCount": 3,
+        "totalTokens": 85119,
+        "unpricedTokens": 0
+      },
+      {
+        "costUsd": "0.00",
+        "id": "019f6767-979c-7df1-a512-9830528bda62",
+        "lastEventAt": "2026-07-15T20:11:14.654000000Z",
+        "messageCount": 1,
+        "totalTokens": 0,
+        "unpricedTokens": 0
+      },
+      {
+        "costUsd": "1.003",
+        "id": "019f64aa-21e8-7a41-916f-0fe9b845eede",
+        "lastEventAt": "2026-07-15T07:48:30.000000000Z",
+        "messageCount": 4,
+        "totalTokens": 276982,
+        "unpricedTokens": 0
+      },
+      {
+        "costUsd": null,
+        "id": "019ee21b-697b-7090-b865-2a7acf43e3fc",
+        "lastEventAt": "2026-07-15T04:52:31.542000000Z",
+        "messageCount": 0,
+        "totalTokens": 25607,
+        "unpricedTokens": 25607
+      }
+    ],
+    "page": 1,
+    "pageSize": 50,
+    "total": 4,
+    "totalPages": 1
+  },
+  "project": {
+    "items": [
+      {
+        "costUsd": "0.215899",
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8",
+        "lastEventAt": "2026-07-15T20:41:26.000000000Z",
+        "messageCount": 3,
+        "totalTokens": 85119,
+        "unpricedTokens": 0
+      },
+      {
+        "costUsd": "0.00",
+        "id": "019f6767-979c-7df1-a512-9830528bda62",
+        "lastEventAt": "2026-07-15T20:11:14.654000000Z",
+        "messageCount": 1,
+        "totalTokens": 0,
+        "unpricedTokens": 0
+      }
+    ],
+    "page": 1,
+    "pageSize": 50,
+    "total": 2,
+    "totalPages": 1
+  },
+  "projects": {
+    "items": [
+      "automation-review",
+      "codex-dashboard",
+      "peregrine"
+    ]
+  },
+  "recentFirst": {
+    "items": [
+      {
+        "costUsd": "0.215899",
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8",
+        "lastEventAt": "2026-07-15T20:41:26.000000000Z",
+        "messageCount": 3,
+        "totalTokens": 85119,
+        "unpricedTokens": 0
+      },
+      {
+        "costUsd": "0.00",
+        "id": "019f6767-979c-7df1-a512-9830528bda62",
+        "lastEventAt": "2026-07-15T20:11:14.654000000Z",
+        "messageCount": 1,
+        "totalTokens": 0,
+        "unpricedTokens": 0
+      }
+    ],
+    "page": 1,
+    "pageSize": 2,
+    "total": 6,
+    "totalPages": 3
+  },
+  "recentSecond": {
+    "items": [
+      {
+        "costUsd": "1.003",
+        "id": "019f64aa-21e8-7a41-916f-0fe9b845eede",
+        "lastEventAt": "2026-07-15T07:48:30.000000000Z",
+        "messageCount": 4,
+        "totalTokens": 276982,
+        "unpricedTokens": 0
+      },
+      {
+        "costUsd": null,
+        "id": "019ee21b-697b-7090-b865-2a7acf43e3fc",
+        "lastEventAt": "2026-07-15T04:52:31.542000000Z",
+        "messageCount": 0,
+        "totalTokens": 25607,
+        "unpricedTokens": 25607
+      }
+    ],
+    "page": 2,
+    "pageSize": 2,
+    "total": 6,
+    "totalPages": 3
+  },
+  "search": {
+    "items": [
+      {
+        "costUsd": "0.215899",
+        "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8",
+        "lastEventAt": "2026-07-15T20:41:26.000000000Z",
+        "messageCount": 3,
+        "totalTokens": 85119,
+        "unpricedTokens": 0
+      }
+    ],
+    "page": 1,
+    "pageSize": 50,
+    "total": 1,
+    "totalPages": 1
+  },
+  "summary": {
+    "agents": [
+      {
+        "costUsd": "0.00",
+        "id": "019f677d-de1d-7a80-99ad-fdb6076b36d3",
+        "label": "/root/storage_audit",
+        "nickname": null,
+        "path": "/root/storage_audit",
+        "status": "completed",
+        "toolCount": 0,
+        "totalTokens": 0,
+        "turnCount": 0,
+        "unpricedTokens": 0
+      }
+    ],
+    "completedAt": "2026-07-15T20:41:26.000000000Z",
+    "cwd": "/Users/example/src/codex-dashboard",
+    "firstPrompt": "Revisit the usage application from ingestion through the browser UI.",
+    "latestResult": "The model now keeps the rich trace while the main UI stays quiet.",
+    "models": [
+      {
+        "cachedInputTokens": 50688,
+        "costUsd": "0.215899",
+        "effort": "ultra",
+        "inputTokens": 84383,
+        "model": "gpt-5.6-sol",
+        "outputTokens": 736,
+        "reasoningTokens": 469,
+        "totalTokens": 85119,
+        "unpricedTokens": 0
+      }
+    ],
+    "session": {
+      "agentCount": 1,
+      "branch": "master",
+      "costUsd": "0.215899",
+      "id": "019f6768-ef84-74d3-ab05-e4b5fb717fa8",
+      "lastEventAt": "2026-07-15T20:41:26.000000000Z",
+      "lifetimeCostUsd": "0.215899",
+      "lifetimeUnpricedTokens": 0,
+      "messageCount": 3,
+      "project": "codex-dashboard",
+      "rootThreadId": "019f6768-ef84-74d3-ab05-e4b5fb717fa8",
+      "startedAt": "2026-07-15T20:12:38.100000000Z",
+      "status": "completed",
+      "title": "Revisit the usage application from ingestion through the browser UI.",
+      "toolCount": 8,
+      "totalTokens": 85119,
+      "turnCount": 1,
+      "unpricedTokens": 0
+    },
+    "source": "vscode",
+    "toolSummary": [
+      {
+        "count": 2,
+        "failedCount": 0,
+        "tool": "image_generation",
+        "totalDurationMs": 0
+      },
+      {
+        "count": 2,
+        "failedCount": 0,
+        "tool": "web_search",
+        "totalDurationMs": 0
+      },
+      {
+        "count": 1,
+        "failedCount": 0,
+        "tool": "apply_patch",
+        "totalDurationMs": 0
+      },
+      {
+        "count": 1,
+        "failedCount": 0,
+        "tool": "exec",
+        "totalDurationMs": 0
+      },
+      {
+        "count": 1,
+        "failedCount": 0,
+        "tool": "node_repl.js",
+        "totalDurationMs": 313
+      },
+      {
+        "count": 1,
+        "failedCount": 0,
+        "tool": "tool_search",
+        "totalDurationMs": 0
+      }
+    ],
+    "totals": {
+      "blendedTokens": 39499,
+      "cachedInputTokens": 50688,
+      "costUsd": "0.215899",
+      "inputTokens": 84383,
+      "outputTokens": 736,
+      "pricingComplete": true,
+      "reasoningTokens": 469,
+      "totalTokens": 85119,
+      "unpricedTokens": 0
+    }
+  }
+}

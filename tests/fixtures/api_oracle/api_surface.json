@@ -1,0 +1,60 @@
+{
+  "routes": {
+    "invalidQuery": {
+      "allow": null,
+      "body": {
+        "error": "range must be day, week, month, year, or all"
+      },
+      "contentType": "application/json",
+      "status": 400
+    },
+    "missingSession": {
+      "allow": null,
+      "body": {
+        "error": "session not found"
+      },
+      "contentType": "application/json",
+      "status": 404
+    },
+    "unknownApi": {
+      "allow": null,
+      "body": {
+        "error": "API route not found"
+      },
+      "contentType": "application/json",
+      "status": 404
+    },
+    "wrongMethod": {
+      "allow": "GET,HEAD",
+      "body": {
+        "error": "Method Not Allowed"
+      },
+      "contentType": "application/json",
+      "status": 405
+    }
+  },
+  "system": {
+    "settings": {
+      "activeRoot": "$ACTIVE_ROOT",
+      "archiveRoot": "$ARCHIVE_ROOT",
+      "databaseBytesIsPositive": true,
+      "databasePath": "$DATABASE",
+      "lastIngestAtIsTimestamp": true,
+      "pricing": {
+        "complete": false,
+        "knownCostUsd": "1.366462",
+        "unpricedTokens": 25607
+      },
+      "sessionCount": 6,
+      "timezoneIsNonempty": true
+    },
+    "status": {
+      "filesFailed": 0,
+      "filesScanned": 9,
+      "lastEventAt": "2026-07-15T20:41:26.000000000Z",
+      "lastIngestAttemptAtIsTimestamp": true,
+      "lastIngestAtIsTimestamp": true,
+      "state": "idle"
+    }
+  }
+}
