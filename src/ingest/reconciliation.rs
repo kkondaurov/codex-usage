@@ -1,5 +1,5 @@
 use super::{
-    owner_reader::read_available_owners,
+    owner_reader::read_surviving_owners,
     projection::{
         ProjectionConnection, ProjectionTx, ReconciliationCandidate, RemovalImpact,
         apply_thread_metadata_reset, delete_source_checkpoint, delete_thread_if_abandoned,
@@ -45,11 +45,24 @@ fn plan_reconciliation(
 pub(super) fn reset_thread_metadata_from_sources(
     tx: &ProjectionTx<'_>,
     impact: &RemovalImpact,
+    planned_removal_paths: &HashSet<String>,
 ) -> Result<()> {
     let Some(reset) = impact.metadata_reset.as_ref() else {
         return Ok(());
     };
-    let owners = read_available_owners(&reset.ordered_source_paths);
+    // `remove_rollout` computes its evidence from the current transaction
+    // state. When several files from one thread disappear together, a root
+    // rollout can be processed before another planned removal and that doomed
+    // file will still be present in the query result. It is not surviving
+    // evidence, so exclude the complete atomic plan before touching the
+    // filesystem. Every path that remains must still be readable.
+    let surviving_source_paths = reset
+        .ordered_source_paths
+        .iter()
+        .filter(|path| !planned_removal_paths.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let owners = read_surviving_owners(&surviving_source_paths)?;
     apply_thread_metadata_reset(tx, reset, &owners)
 }
 
@@ -73,13 +86,18 @@ pub(super) fn reconcile_missing(
         incomplete_roots,
         candidates,
     );
+    let planned_removal_paths = plan
+        .removals
+        .iter()
+        .map(|candidate| candidate.path.clone())
+        .collect::<HashSet<_>>();
     // Rollout removal reads before deleting. Reserve writer ownership only
     // after the candidate list is owned, so the snapshot cannot become stale
     // while the plan is applied.
     let transaction = projection.begin_reconciliation()?;
     for candidate in plan.removals {
         let impact = remove_rollout(&transaction, &candidate.rollout_id)?;
-        reset_thread_metadata_from_sources(&transaction, &impact)?;
+        reset_thread_metadata_from_sources(&transaction, &impact, &planned_removal_paths)?;
         delete_source_checkpoint(&transaction, &candidate.rollout_id)?;
         if let Some(thread_id) = impact.thread_id.or(candidate.root_thread_id) {
             delete_thread_if_abandoned(&transaction, &thread_id)?;

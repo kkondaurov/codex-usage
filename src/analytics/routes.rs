@@ -7,7 +7,7 @@ use crate::{
     calendar::{canonical_utc_timestamp, local_midnight},
     storage::WorkClass,
     web::{
-        ReadRuntime,
+        ReadRuntime, SingleFlight,
         error::{ApiError, ApiResult},
     },
 };
@@ -19,12 +19,31 @@ use axum::{
 use chrono::{Datelike, Local, NaiveDate};
 use serde::Deserialize;
 
+#[derive(Clone)]
+struct AnalyticsState {
+    reads: ReadRuntime,
+    overview: SingleFlight<NaiveDate, OverviewResponse>,
+    overview_year: SingleFlight<i32, OverviewYearResponse>,
+    stats: SingleFlight<(StatsRange, NaiveDate), StatsResponse>,
+}
+
+impl AnalyticsState {
+    fn new(reads: ReadRuntime) -> Self {
+        Self {
+            reads,
+            overview: SingleFlight::default(),
+            overview_year: SingleFlight::default(),
+            stats: SingleFlight::default(),
+        }
+    }
+}
+
 pub(crate) fn router(reads: ReadRuntime) -> Router {
     Router::new()
         .route("/overview", get(overview))
         .route("/overview/year", get(overview_year))
         .route("/stats", get(stats))
-        .with_state(reads)
+        .with_state(AnalyticsState::new(reads))
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,17 +51,26 @@ struct OverviewYearQuery {
     year: Option<i32>,
 }
 
-async fn overview(State(reads): State<ReadRuntime>) -> ApiResult<Json<OverviewResponse>> {
+async fn overview(State(state): State<AnalyticsState>) -> ApiResult<Json<OverviewResponse>> {
+    let today = Local::now().date_naive();
+    let reads = state.reads.clone();
     Ok(Json(
-        reads
-            .snapshot(WorkClass::Heavy, read_summary_on)
+        state
+            .overview
+            .run(today, move || async move {
+                reads
+                    .snapshot(WorkClass::Heavy, move |connection| {
+                        read_summary_on(connection, today)
+                    })
+                    .await
+            })
             .await
             .map_err(ApiError::internal)?,
     ))
 }
 
 async fn overview_year(
-    State(reads): State<ReadRuntime>,
+    State(state): State<AnalyticsState>,
     Query(query): Query<OverviewYearQuery>,
 ) -> ApiResult<Json<OverviewYearResponse>> {
     let year = query.year.unwrap_or_else(|| Local::now().year());
@@ -54,10 +82,16 @@ async fn overview_year(
         NaiveDate::from_ymd_opt(year + 1, 1, 1)
             .ok_or_else(|| ApiError::bad_request("invalid year"))?,
     ));
+    let reads = state.reads.clone();
     Ok(Json(
-        reads
-            .snapshot(WorkClass::Heavy, move |connection| {
-                read_year_on(connection, year, &start, &end)
+        state
+            .overview_year
+            .run(year, move || async move {
+                reads
+                    .snapshot(WorkClass::Heavy, move |connection| {
+                        read_year_on(connection, year, &start, &end)
+                    })
+                    .await
             })
             .await
             .map_err(ApiError::internal)?,
@@ -71,7 +105,7 @@ struct StatsQuery {
 }
 
 async fn stats(
-    State(reads): State<ReadRuntime>,
+    State(state): State<AnalyticsState>,
     Query(query): Query<StatsQuery>,
 ) -> ApiResult<Json<StatsResponse>> {
     let range = match query.range.as_deref().unwrap_or("day") {
@@ -110,10 +144,16 @@ async fn stats(
         ));
     }
     validate_public_year(display_anchor.year())?;
+    let reads = state.reads.clone();
     Ok(Json(
-        reads
-            .snapshot(WorkClass::Heavy, move |connection| {
-                read_stats_on(connection, range, display_anchor)
+        state
+            .stats
+            .run((range, display_anchor), move || async move {
+                reads
+                    .snapshot(WorkClass::Heavy, move |connection| {
+                        read_stats_on(connection, range, display_anchor)
+                    })
+                    .await
             })
             .await
             .map_err(ApiError::internal)?,

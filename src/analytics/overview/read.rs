@@ -10,7 +10,7 @@ use crate::{
     usage::{TotalsScope, UsageTotals, load_price_book_on, read_all_time_totals_on},
 };
 use anyhow::{Context, Result};
-use chrono::Local;
+use chrono::NaiveDate;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -124,8 +124,11 @@ const OVERVIEW_EVENT_DAY_SEEK_SQL: &str = "SELECT timestamp FROM events
          WHERE thread_id=?1 AND timestamp>=?2 AND timestamp<?3
          ORDER BY timestamp LIMIT 1";
 
-pub(crate) fn read_summary_on(connection: &Connection) -> Result<OverviewResponse> {
-    let period_bounds = overview_summary_bounds(Local::now().date_naive());
+pub(crate) fn read_summary_on(
+    connection: &Connection,
+    today: NaiveDate,
+) -> Result<OverviewResponse> {
+    let period_bounds = overview_summary_bounds(today);
     let bounds = period_bounds
         .iter()
         .enumerate()

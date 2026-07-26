@@ -11,13 +11,13 @@ use unicode_normalization::UnicodeNormalization;
 
 pub(crate) const MAX_SEARCH_CHARS: usize = 256;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum SessionListSort {
     Recent,
     Cost,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SessionListRequest {
     pub(crate) start: Option<String>,
     pub(crate) end: Option<String>,

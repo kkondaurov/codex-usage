@@ -11,7 +11,7 @@ mod read;
 
 pub(crate) use read::read_on;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum StatsRange {
     Day,
     Week,
@@ -46,7 +46,7 @@ pub(crate) struct StatsBucketAggregate {
     pub(crate) known_cost_numerator: i128,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StatsRow {
     pub(crate) period_start: String,
@@ -57,7 +57,7 @@ pub(crate) struct StatsRow {
     pub(crate) totals: UsageTotals,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StatsResponse {
     pub(crate) range: String,

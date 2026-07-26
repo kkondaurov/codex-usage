@@ -13,7 +13,7 @@ use super::{
         is_suspicious_same_path_shrink, matches_unchanged_snapshot, stored_fingerprint_matches,
         trusts_incremental_append,
     },
-    owner_reader::{read_available_owners, read_owner_from_snapshot},
+    owner_reader::{read_owner_from_snapshot, read_surviving_owners},
     projection::{
         PathConflict, ProjectionConnection, ProjectionTx, RemovalImpact, SourceCheckpointWrite,
         UnchangedSourceUpdate, apply_thread_metadata_reset, clear_confirmed_shrink,
@@ -22,7 +22,7 @@ use super::{
         save_source_checkpoint, upsert_owner,
     },
     protocol::{CursorState, OwnerMeta, decode_record},
-    source::{BoundedLine, FileIdentity, MAX_JSONL_LINE_BYTES, SourceSnapshot},
+    source::{BoundedLine, FileIdentity, IngestPacing, MAX_JSONL_LINE_BYTES, SourceSnapshot},
 };
 use crate::storage::Db;
 use anyhow::{Context, Result, anyhow};
@@ -114,6 +114,7 @@ pub(super) struct FileReport {
 pub(super) struct FileIngestor<'db> {
     db: &'db Db,
     audit_budget: FingerprintAuditBudget,
+    pacing: IngestPacing,
 }
 
 impl<'db> FileIngestor<'db> {
@@ -121,7 +122,13 @@ impl<'db> FileIngestor<'db> {
         Self {
             db,
             audit_budget: FingerprintAuditBudget::default(),
+            pacing: IngestPacing::Unpaced,
         }
+    }
+
+    pub(super) fn with_pacing(mut self, pacing: IngestPacing) -> Self {
+        self.pacing = pacing;
+        self
     }
 }
 
@@ -134,13 +141,20 @@ impl FileIngestor<'_> {
         let Ok(mut snapshot) = SourceSnapshot::open(&candidate.path) else {
             return false;
         };
-        Self::source_path_switch_is_ready_from_snapshot(&mut snapshot, candidate.size, previous)
+        snapshot.set_pacing(self.pacing);
+        Self::source_path_switch_is_ready_from_snapshot(
+            &mut snapshot,
+            candidate.size,
+            previous,
+            self.pacing,
+        )
     }
 
     fn source_path_switch_is_ready_from_snapshot(
         snapshot: &mut SourceSnapshot,
         size: u64,
         previous: &SelectedSourceExtent,
+        pacing: IngestPacing,
     ) -> bool {
         if size < previous.committed_size {
             return false;
@@ -167,6 +181,7 @@ impl FileIngestor<'_> {
             let Ok(mut selected_snapshot) = SourceSnapshot::open(&previous.path) else {
                 return false;
             };
+            selected_snapshot.set_pacing(pacing);
             return full_content_fingerprints_from_snapshot(
                 &mut selected_snapshot,
                 previous.committed_size,
@@ -188,7 +203,7 @@ impl FileIngestor<'_> {
         let Some(reset) = impact.metadata_reset.as_ref() else {
             return Ok(());
         };
-        let owners = read_available_owners(&reset.ordered_source_paths);
+        let owners = read_surviving_owners(&reset.ordered_source_paths)?;
         apply_thread_metadata_reset(tx, reset, &owners)
     }
 
@@ -206,6 +221,7 @@ impl FileIngestor<'_> {
         #[cfg(test)]
         run_process_file_before_open_hook(path);
         let mut snapshot = SourceSnapshot::open(path)?;
+        snapshot.set_pacing(self.pacing);
         let extent = snapshot.extent();
         let size = extent.size();
         let modified_ns = extent.modified_ns();
@@ -226,7 +242,12 @@ impl FileIngestor<'_> {
         owner.thread_id = resolved_owner.thread_id.clone();
         if let Some(previous) = previous_extent
             && path != previous.path
-            && !Self::source_path_switch_is_ready_from_snapshot(&mut snapshot, size, previous)
+            && !Self::source_path_switch_is_ready_from_snapshot(
+                &mut snapshot,
+                size,
+                previous,
+                self.pacing,
+            )
         {
             tracing::debug!(
                 owner_id = resolved_owner.owner_id,

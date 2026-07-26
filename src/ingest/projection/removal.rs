@@ -121,9 +121,10 @@ pub(in crate::ingest) fn delete_thread_if_abandoned(
 
 /// Apply root-thread metadata rebuilt from successful source-owner reads.
 ///
-/// `owners` must retain the order of `reset.ordered_source_paths`, with paths
-/// that could not be read omitted. Each field independently takes the first
-/// surviving non-null value, exactly matching the source-reconciliation policy.
+/// `owners` must retain the order of `reset.ordered_source_paths`. Ingestion
+/// requires every surviving source read to succeed before calling this
+/// function, so the metadata reset cannot commit from partial evidence. Each
+/// field independently takes the first surviving non-null value.
 pub(in crate::ingest) fn apply_thread_metadata_reset(
     tx: &super::ProjectionTx<'_>,
     reset: &ThreadMetadataReset,

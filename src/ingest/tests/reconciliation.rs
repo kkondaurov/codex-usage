@@ -291,6 +291,286 @@ fn reconciliation_rolls_back_every_removal_when_a_later_checkpoint_delete_fails(
 }
 
 #[test]
+fn unreadable_surviving_source_rolls_back_reconciliation_and_recovers_cleanly() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Db::open(temp.path().join("usage.db")).unwrap();
+    let sessions = temp.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let root = "019f64aa-0000-7000-8000-000000000118";
+    let child = "019f64aa-0000-7000-8000-000000000119";
+    let root_path = sessions.join("root.jsonl");
+    let child_path = sessions.join("child.jsonl");
+    let root_meta = serde_json::json!({
+        "timestamp": "2026-07-15T09:00:00Z",
+        "type": "session_meta",
+        "payload": {
+            "id": root,
+            "session_id": root,
+            "cwd": "/work/root-project",
+            "git": {
+                "repository_url": "https://example.test/root.git",
+                "branch": "main"
+            },
+            "source": "cli",
+            "thread_source": "desktop"
+        }
+    });
+    let child_meta = serde_json::json!({
+        "timestamp": "2026-07-15T09:00:01Z",
+        "type": "session_meta",
+        "payload": {
+            "id": child,
+            "session_id": root,
+            "cwd": "/work/surviving-child",
+            "git": {
+                "repository_url": "https://example.test/child.git",
+                "branch": "review"
+            },
+            "source": {"subagent": {"thread_spawn": {
+                "parent_thread_id": root,
+                "parent_rollout_id": root,
+                "agent_path": "/root/reviewer"
+            }}},
+            "thread_source": "delegated"
+        }
+    });
+    write_fixture(&root_path, std::slice::from_ref(&root_meta));
+    write_fixture(&child_path, std::slice::from_ref(&child_meta));
+    let roots = IngestRoots {
+        active: Some(sessions),
+        archive: None,
+    };
+    scan_once(&db, &roots).unwrap();
+
+    let connection = db.connect().unwrap();
+    let metadata_before: (String, String, String, String, String, String, i64) = connection
+        .query_row(
+            "SELECT cwd,project,repository_url,branch,source,thread_source,root_metadata_seen
+             FROM threads WHERE id=?1",
+            [root],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        metadata_before,
+        (
+            "/work/root-project".into(),
+            "root-project".into(),
+            "https://example.test/root.git".into(),
+            "main".into(),
+            "cli".into(),
+            "desktop".into(),
+            1,
+        )
+    );
+    let checkpoint_before: (String, i64, String) = connection
+        .query_row(
+            "SELECT path,size_bytes,parse_state_json
+             FROM source_files WHERE rollout_id=?1",
+            [root],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let last_success_before: String = connection
+        .query_row(
+            "SELECT value FROM app_meta WHERE key='last_ingest_at'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+
+    std::fs::remove_file(&root_path).unwrap();
+    write_fixture(
+        &child_path,
+        &[serde_json::json!({"complete": "but no owner"})],
+    );
+
+    let error = scan_once(&db, &roots)
+        .expect_err("reconciliation unexpectedly ignored an unreadable surviving owner");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("failed to read surviving source owner")
+            && error.contains(child_path.to_string_lossy().as_ref()),
+        "unexpected scan error: {error}"
+    );
+
+    let connection = db.connect().unwrap();
+    let metadata_after_failure: (String, String, String, String, String, String, i64) = connection
+        .query_row(
+            "SELECT cwd,project,repository_url,branch,source,thread_source,root_metadata_seen
+             FROM threads WHERE id=?1",
+            [root],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        metadata_after_failure, metadata_before,
+        "a partial surviving-owner read erased authoritative thread metadata"
+    );
+    let checkpoint_after_failure: (String, i64, String) = connection
+        .query_row(
+            "SELECT path,size_bytes,parse_state_json
+             FROM source_files WHERE rollout_id=?1",
+            [root],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        checkpoint_after_failure, checkpoint_before,
+        "failed reconciliation deleted or advanced the missing root checkpoint"
+    );
+    let failed_attempt: (String, String, String) = connection
+        .query_row(
+            "SELECT
+                 (SELECT value FROM app_meta WHERE key='ingest_state'),
+                 (SELECT value FROM app_meta WHERE key='last_ingest_error'),
+                 (SELECT value FROM app_meta WHERE key='last_ingest_at')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(failed_attempt.0, "error");
+    assert!(
+        failed_attempt
+            .1
+            .contains("failed to read surviving source owner")
+    );
+    assert_eq!(failed_attempt.2, last_success_before);
+    drop(connection);
+
+    write_fixture(&child_path, std::slice::from_ref(&child_meta));
+    let recovery = scan_once(&db, &roots).unwrap();
+    assert_eq!(recovery.files_failed, 0);
+
+    let connection = db.connect().unwrap();
+    let recovered: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        String,
+        i64,
+    ) = connection
+        .query_row(
+            "SELECT
+                     cwd,project,repository_url,branch,source,thread_source,root_metadata_seen,
+                     EXISTS(SELECT 1 FROM rollouts WHERE id=?1),
+                     EXISTS(SELECT 1 FROM source_files WHERE rollout_id=?1),
+                     (SELECT value FROM app_meta WHERE key='ingest_state'),
+                     EXISTS(SELECT 1 FROM app_meta WHERE key='last_ingest_error')
+                 FROM threads WHERE id=?1",
+            [root],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        recovered,
+        (
+            "/work/surviving-child".into(),
+            "surviving-child".into(),
+            "https://example.test/child.git".into(),
+            "review".into(),
+            "subagent".into(),
+            "delegated".into(),
+            0,
+            0,
+            0,
+            "idle".into(),
+            0,
+        ),
+        "the clean retry did not reconcile the removed root from complete surviving evidence"
+    );
+}
+
+#[test]
+fn reconciliation_removes_a_missing_root_and_child_in_one_atomic_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Db::open(temp.path().join("usage.db")).unwrap();
+    let sessions = temp.path().join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let root = "019f64aa-0000-7000-8000-000000000120";
+    let child = "019f64aa-0000-7000-8000-000000000121";
+    let root_path = sessions.join("00-root.jsonl");
+    let child_path = sessions.join("01-child.jsonl");
+    write_fixture(
+        &root_path,
+        &[meta("2026-07-15T09:00:00Z", root, root, false)],
+    );
+    write_fixture(
+        &child_path,
+        &[meta("2026-07-15T09:00:01Z", child, root, true)],
+    );
+    let roots = IngestRoots {
+        active: Some(sessions),
+        archive: None,
+    };
+    scan_once(&db, &roots).unwrap();
+
+    std::fs::remove_file(root_path).unwrap();
+    std::fs::remove_file(child_path).unwrap();
+    let report = scan_once(&db, &roots).unwrap();
+    assert_eq!(report.files_failed, 0);
+
+    let connection = db.connect().unwrap();
+    let remaining: (i64, i64, i64, String) = connection
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM source_files WHERE rollout_id IN (?1,?2)),
+                 (SELECT COUNT(*) FROM rollouts WHERE id IN (?1,?2)),
+                 EXISTS(SELECT 1 FROM threads WHERE id=?1),
+                 (SELECT value FROM app_meta WHERE key='ingest_state')",
+            params![root, child],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        remaining,
+        (0, 0, 0, "idle".into()),
+        "one reconciliation pass did not remove the complete missing thread"
+    );
+}
+
+#[test]
 fn reconciliation_uses_checkpoint_thread_fallback_for_orphaned_rollouts() {
     let temp = tempfile::tempdir().unwrap();
     let db = Db::open(temp.path().join("usage.db")).unwrap();

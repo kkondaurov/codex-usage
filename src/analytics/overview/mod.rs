@@ -26,7 +26,7 @@ pub(crate) struct PeriodSummary {
     pub(crate) delta_percent: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OverviewPeriods {
     pub(crate) today: PeriodSummary,
@@ -34,7 +34,7 @@ pub(crate) struct OverviewPeriods {
     pub(crate) month: PeriodSummary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HeatmapDay {
     pub(crate) date: String,
@@ -44,7 +44,7 @@ pub(crate) struct HeatmapDay {
     pub(crate) total_tokens: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProjectDriver {
     project: String,
@@ -52,14 +52,14 @@ pub(crate) struct ProjectDriver {
     share: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OverviewResponse {
     pub(crate) updated_at: Option<String>,
     pub(crate) periods: OverviewPeriods,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OverviewYearResponse {
     pub(crate) year: i32,
@@ -68,7 +68,7 @@ pub(crate) struct OverviewYearResponse {
     pub(crate) top_sessions: Vec<TopSessionResponse>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TopSessionResponse {
     pub(crate) id: String,

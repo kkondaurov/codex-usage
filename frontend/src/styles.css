@@ -509,8 +509,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .missing-price-banner { height: 64px; border: 2px solid var(--text); border-left: 12px solid #ffc83d; background: #fff0b8; display: flex; align-items: center; justify-content: space-between; padding: 0 56px 0 16px; margin: 8px 0 32px; }
 .missing-price-banner span { display: flex; flex-direction: column; gap: 4px; min-width: 0; }.missing-price-banner strong { font-size: 12px; }.missing-price-banner small { max-width: 620px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--secondary); font-size: 13px; }.missing-price-banner b { color: #70530b; font-size: 12px; white-space: nowrap; }
 .expanded-warning { padding-right: 18px; gap: 18px; }
-.expanded-warning > div { display: flex; gap: 8px; margin-left: auto; }
-.expanded-warning > div button { max-width: 180px; border: 0; border-bottom: 1px solid var(--text); background: transparent; padding: 6px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--teal); font-size: 10px; font-weight: 600; cursor: pointer; }
+.expanded-warning > div { min-width: 0; max-width: 100%; display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+.expanded-warning > div button { min-width: 0; max-width: 180px; flex: 0 1 180px; border: 0; border-bottom: 1px solid var(--text); background: transparent; padding: 6px 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--teal); font-size: 10px; font-weight: 600; cursor: pointer; }
 .price-search { margin-bottom: 16px; }
 .price-ledger { border-top: 1px solid var(--text); }
 .price-ledger { min-width: 900px; }
@@ -597,6 +597,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .storage-notice, .pricing-refresh-warning, .missing-price-banner { height: auto; min-height: 64px; align-items: flex-start; flex-wrap: wrap; padding-block: 12px; }
   .storage-notice code { max-width: 100%; }
   .missing-price-banner { padding-right: 16px; }
+  .expanded-warning > div { width: 100%; margin-left: 0; }
+  .expanded-warning > div button { flex: 1 1 120px; }
 }
 
 @media (max-width: 680px) {

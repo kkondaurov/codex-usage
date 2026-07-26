@@ -2,7 +2,7 @@ use super::{
     protocol::{OwnerMeta, decode_owner_record},
     source::{BoundedLine, MAX_JSONL_LINE_BYTES, SourceSnapshot},
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::path::Path;
 
@@ -38,9 +38,12 @@ pub(super) fn read_owner_from_snapshot(
     Err(anyhow!("{} has no session_meta record", path.display()))
 }
 
-pub(super) fn read_available_owners(paths: &[String]) -> Vec<OwnerMeta> {
+pub(super) fn read_surviving_owners(paths: &[String]) -> Result<Vec<OwnerMeta>> {
     paths
         .iter()
-        .filter_map(|path| read_owner(Path::new(path)).ok())
+        .map(|path| {
+            read_owner(Path::new(path))
+                .with_context(|| format!("failed to read surviving source owner {path}"))
+        })
         .collect()
 }

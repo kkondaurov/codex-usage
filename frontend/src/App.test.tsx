@@ -1,5 +1,5 @@
-import { render, screen } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { fireEvent, render, screen } from '@testing-library/react'
+import { MemoryRouter, useNavigate } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 
@@ -22,6 +22,14 @@ vi.mock('./pages/SessionsPage', () => ({ SessionsPage: () => <h1>Sessions</h1> }
 vi.mock('./pages/SessionDetailPage', () => ({ SessionDetailPage: () => <h1>Session detail</h1> }))
 vi.mock('./pages/StatsPage', () => ({ StatsPage: () => <h1>Stats</h1> }))
 vi.mock('./pages/SettingsPage', () => ({ SettingsPage: () => <h1>Settings</h1> }))
+
+function NavigateToStats() {
+  const navigate = useNavigate()
+  return <>
+    <button type="button" onClick={() => navigate('/stats')}>Go to Stats</button>
+    <button type="button" onClick={() => navigate('/?view=compact')}>Change query</button>
+  </>
+}
 
 afterEach(() => {
   headerState.throws = false
@@ -65,5 +73,43 @@ describe('application shell recovery', () => {
   ])('sets a route-specific document title for %s', (entry, title) => {
     render(<MemoryRouter initialEntries={[entry]}><App /></MemoryRouter>)
     expect(document.title).toBe(title)
+  })
+
+  it('moves focus to the new main view after pathname navigation', () => {
+    const scrollTo = vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <NavigateToStats />
+        <App />
+      </MemoryRouter>,
+    )
+    const navigation = screen.getByRole('button', { name: 'Go to Stats' })
+    navigation.focus()
+    fireEvent.click(navigation)
+
+    expect(screen.getByRole('heading', { name: 'Stats' })).toBeVisible()
+    expect(scrollTo).toHaveBeenCalledOnce()
+    expect(scrollTo).toHaveBeenCalledWith({ top: 0, left: 0, behavior: 'auto' })
+    expect(screen.getByRole('main')).toHaveFocus()
+  })
+
+  it('does not steal focus on initial render or query-only navigation', () => {
+    const scrollTo = vi.spyOn(window, 'scrollTo').mockImplementation(() => {})
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <NavigateToStats />
+        <App />
+      </MemoryRouter>,
+    )
+    const main = screen.getByRole('main')
+    const queryNavigation = screen.getByRole('button', { name: 'Change query' })
+    expect(main).not.toHaveFocus()
+
+    queryNavigation.focus()
+    fireEvent.click(queryNavigation)
+
+    expect(queryNavigation).toHaveFocus()
+    expect(main).not.toHaveFocus()
+    expect(scrollTo).not.toHaveBeenCalled()
   })
 })

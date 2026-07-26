@@ -5,7 +5,7 @@ use axum::{
 use codex_usage::{
     app::AppDependencies,
     config::PricingConfig,
-    ingest::IngestRoots,
+    ingest::{IngestRoots, IngestScannerLease},
     pricing::{ManualPricingStore, PricingSync},
     storage::{Db, StorageExecutor, WorkClass},
 };
@@ -469,7 +469,7 @@ async fn session_list_and_project_catalog_use_one_snapshot_during_wal_commits() 
 
 #[cfg(unix)]
 #[test]
-fn ingesting_commands_claim_scanner_lease_before_database_hydration() {
+fn write_capable_commands_claim_projection_lease_before_database_hydration() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("usage.sqlite3");
     let primary_pricing = db_path.with_extension("pricing.json");
@@ -523,13 +523,15 @@ fn ingesting_commands_claim_scanner_lease_before_database_hydration() {
     // SAFETY: `lock` owns a valid descriptor for this test's duration.
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
 
-    for command_name in ["ingest", "serve"] {
-        let alternate_pricing = temp
-            .path()
-            .join(format!("losing-{command_name}.pricing.json"));
+    for (case_name, command_name, no_ingest) in [
+        ("ingest", "ingest", false),
+        ("serve", "serve", false),
+        ("serve-no-ingest", "serve", true),
+    ] {
+        let alternate_pricing = temp.path().join(format!("losing-{case_name}.pricing.json"));
         let alternate_lock = temp
             .path()
-            .join(format!(".losing-{command_name}.pricing.json.lock"));
+            .join(format!(".losing-{case_name}.pricing.json.lock"));
         let mut command = binary();
         command.arg(command_name);
         if command_name == "serve" {
@@ -541,6 +543,9 @@ fn ingesting_commands_claim_scanner_lease_before_database_hydration() {
                 .arg(port)
                 .arg("--frontend")
                 .arg(&frontend);
+            if no_ingest {
+                command.arg("--no-ingest");
+            }
         }
         let output = command
             .arg("--db")
@@ -569,7 +574,7 @@ fn ingesting_commands_claim_scanner_lease_before_database_hydration() {
             .unwrap();
         assert_eq!(
             ingest_state, "scanning",
-            "the losing {command_name} mutated recovery state before checking ownership"
+            "the losing {case_name} mutated recovery state before checking ownership"
         );
         let manual_price: (i64, i64) = connection
             .query_row(
@@ -583,23 +588,166 @@ fn ingesting_commands_claim_scanner_lease_before_database_hydration() {
         assert_eq!(
             manual_price,
             (123_000, 456_000),
-            "the losing {command_name} hydrated its alternate pricing state into SQLite"
+            "the losing {case_name} hydrated its alternate pricing state into SQLite"
         );
         assert_eq!(
             std::fs::read(&primary_pricing).unwrap(),
             primary_pricing_before,
-            "the losing {command_name} changed the owner's pricing sidecar"
+            "the losing {case_name} changed the owner's pricing sidecar"
         );
         assert!(
             !alternate_pricing.exists(),
-            "the losing {command_name} created alternate pricing state"
+            "the losing {case_name} created alternate pricing state"
         );
         assert!(
             !alternate_lock.exists(),
-            "the losing {command_name} created an alternate pricing lock"
+            "the losing {case_name} created an alternate pricing lock"
         );
     }
     drop(lock);
+}
+
+#[cfg(unix)]
+#[test]
+fn no_ingest_server_retains_projection_ownership_until_shutdown() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("usage.sqlite3");
+    let primary_pricing = temp.path().join("primary.pricing.json");
+    let alternate_pricing = temp.path().join("alternate.pricing.json");
+    let sessions = temp.path().join("sessions");
+    let frontend = temp.path().join("frontend");
+    std::fs::create_dir(&sessions).unwrap();
+    std::fs::create_dir(&frontend).unwrap();
+    std::fs::write(frontend.join("index.html"), "<!doctype html>").unwrap();
+    std::fs::write(
+        &primary_pricing,
+        r#"{
+  "version": 1,
+  "prices": [{
+    "modelId": "owner-price",
+    "effectiveFrom": "1970-01-01T00:00:00.000000000Z",
+    "effectiveTo": null,
+    "inputMicrousdPerMillion": 123000,
+    "cachedInputMicrousdPerMillion": null,
+    "outputMicrousdPerMillion": 456000
+  }],
+  "aliases": []
+}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &alternate_pricing,
+        r#"{"version":1,"prices":[],"aliases":[]}"#,
+    )
+    .unwrap();
+
+    let first_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_port = first_reservation.local_addr().unwrap().port();
+    let second_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_port = second_reservation.local_addr().unwrap().port();
+    assert_ne!(first_port, second_port);
+    drop(first_reservation);
+    drop(second_reservation);
+    let pricing_url = "http://127.0.0.1:9/prices.json";
+
+    let first = binary()
+        .args(["serve", "--host", "127.0.0.1", "--port"])
+        .arg(first_port.to_string())
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--sessions")
+        .arg(&sessions)
+        .arg("--pricing-config")
+        .arg(&primary_pricing)
+        .arg("--pricing-url")
+        .arg(pricing_url)
+        .arg("--pricing-timeout-seconds")
+        .arg("1")
+        .arg("--frontend")
+        .arg(&frontend)
+        .arg("--no-ingest")
+        .env_clear()
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut first = ChildGuard(Some(first));
+
+    let ready_by = Instant::now() + Duration::from_secs(10);
+    while !server_responds(first_port) {
+        assert!(
+            first.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "owning --no-ingest server exited before becoming ready"
+        );
+        assert!(
+            Instant::now() < ready_by,
+            "owning --no-ingest server did not become ready"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let output = binary()
+        .args(["serve", "--host", "127.0.0.1", "--port"])
+        .arg(second_port.to_string())
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--sessions")
+        .arg(&sessions)
+        .arg("--pricing-config")
+        .arg(&alternate_pricing)
+        .arg("--pricing-url")
+        .arg(pricing_url)
+        .arg("--pricing-timeout-seconds")
+        .arg("1")
+        .arg("--frontend")
+        .arg(&frontend)
+        .arg("--no-ingest")
+        .env_clear()
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("live ingest scanner"), "{stderr}");
+
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
+    let owner_price: (i64, i64) = connection
+        .query_row(
+            "SELECT input_microusd_per_million, output_microusd_per_million
+             FROM model_prices
+             WHERE source='manual' AND model_id='owner-price'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        owner_price,
+        (123_000, 456_000),
+        "losing --no-ingest server replaced the owner's pricing projection"
+    );
+
+    let first_pid = first.0.as_ref().unwrap().id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(first_pid, libc::SIGTERM) }, 0);
+    let stopped_by = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = first.0.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < stopped_by,
+            "owning --no-ingest server ignored SIGTERM"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    first.0.take();
+    assert!(
+        status.success(),
+        "owning --no-ingest server exited uncleanly: {status}"
+    );
+    let released = IngestScannerLease::acquire_path(&db_path)
+        .expect("--no-ingest server retained projection ownership after shutdown");
+    drop(released);
 }
 
 #[test]

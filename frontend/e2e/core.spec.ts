@@ -122,6 +122,57 @@ test('boots the production application without browser-side network escapes', as
   })
 })
 
+test('SPA navigation moves focus into the newly rendered view', async ({ page, app }) => {
+  await page.setViewportSize({ width: 1440, height: 360 })
+  await page.goto(`${app.baseUrl}/`)
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible()
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight))
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0)
+  const statsLink = page.getByRole('link', { name: 'Stats', exact: true })
+  await statsLink.evaluate(element => (element as HTMLElement).click())
+
+  await expect(page).toHaveURL(/\/stats(?:\?|$)/)
+  await expect(page.getByRole('heading', { name: 'Stats', exact: true })).toBeVisible()
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(0)
+  await expect(page.locator('main#main-content')).toBeFocused()
+})
+
+test('compact Settings contains long missing-price actions without document overflow', async ({ page, app }) => {
+  const unknownModelIds = [
+    'openai/very-long-unpriced-model-identifier-alpha-with-extra-suffix',
+    'openai/very-long-unpriced-model-identifier-beta-with-extra-suffix',
+    'openai/very-long-unpriced-model-identifier-gamma-with-extra-suffix',
+  ]
+  await page.route('**/api/v1/prices/metadata*', async route => {
+    await route.fulfill({
+      json: {
+        observedUnknown: unknownModelIds.map((modelId, index) => ({
+          modelId,
+          usageCount: index + 1,
+          totalTokens: (index + 1) * 1_000,
+          lastSeenAt: '2026-07-18T12:00:00Z',
+        })),
+        observedUnknownTotal: unknownModelIds.length,
+      },
+    })
+  })
+  await page.setViewportSize({ width: 390, height: 900 })
+  await page.goto(`${app.baseUrl}/settings`)
+
+  const warning = page.locator('.missing-price-banner')
+  await expect(warning).toBeVisible()
+  for (const modelId of unknownModelIds) {
+    await expect(page.getByRole('button', { name: `MAP ${modelId}` })).toBeVisible()
+  }
+  await expectNoDocumentHorizontalOverflow(page)
+  const bounds = await warning.evaluate(element => {
+    const box = element.getBoundingClientRect()
+    return { left: box.left, right: box.right, viewportWidth: document.documentElement.clientWidth }
+  })
+  expect(bounds.left).toBeGreaterThanOrEqual(0)
+  expect(bounds.right).toBeLessThanOrEqual(bounds.viewportWidth + 1)
+})
+
 test('responsive routes contain horizontal overflow and preserve keyboard access', async ({ page, app }) => {
   for (const width of [1280, 1024, 680, 390]) {
     await page.setViewportSize({ width, height: 900 })

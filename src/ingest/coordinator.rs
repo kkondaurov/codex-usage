@@ -11,6 +11,7 @@ use super::{
     projection::load_existing_owner_threads,
     reconciliation::reconcile_missing,
     session_titles::sync_session_index_titles,
+    source::IngestPacing,
 };
 use crate::{
     calendar::canonical_utc_timestamp,
@@ -105,15 +106,16 @@ struct ScanOutcome {
 
 pub fn scan_once(db: &Db, roots: &IngestRoots) -> Result<ScanReport> {
     let _scan_guard = DatabaseLock::acquire(db, "ingest")?;
-    Ok(scan_once_locked(db, roots)?.report)
+    Ok(scan_once_locked(db, roots, IngestPacing::Unpaced)?.report)
 }
 
 /// Exclusive ownership for one projection writer configuration.
 ///
 /// A one-shot command retains it across recovery, pricing synchronization, and
-/// projection. A server retains it from recovery through prewarming and then
-/// transfers it into the background scanner. Both paths therefore discover a
-/// competing root owner before mutating shared state.
+/// projection. Every server retains it from recovery through shutdown because
+/// even `--no-ingest` servers hydrate and mutate pricing state. A scanning
+/// server transfers it into the background scanner. These paths therefore
+/// discover a competing projection owner before mutating shared state.
 #[derive(Debug)]
 pub struct IngestScannerLease {
     database_path: PathBuf,
@@ -128,9 +130,9 @@ impl IngestScannerLease {
     /// Claim projection ownership before opening SQLite.
     ///
     /// Database initialization mutates the projection, and startup composition
-    /// hydrates manual pricing immediately afterward. Command entrypoints that
-    /// intend to ingest must establish their exclusive writer identity from
-    /// the canonical storage path before either step.
+    /// hydrates manual pricing immediately afterward. Every write-capable
+    /// command must establish its exclusive identity from the canonical
+    /// storage path before either step.
     pub fn acquire_path(database_path: impl AsRef<Path>) -> Result<Self> {
         let database_path = canonicalize_storage_path(database_path.as_ref())?;
         let cancelled = AtomicBool::new(false);
@@ -183,7 +185,20 @@ pub fn scan_one_shot_with_lease(
     roots: &IngestRoots,
     lease: &IngestScannerLease,
 ) -> Result<ScanReport> {
-    scan_one_shot_with_lease_and_between_pass(db, roots, lease, || {})
+    scan_one_shot_with_lease_and_between_pass(db, roots, lease, || {}, IngestPacing::Unpaced)
+}
+
+/// Run the complete scan sequence with cooperative pacing for a live server.
+///
+/// The CLI and synchronous startup replay intentionally use the unpaced public
+/// entrypoint above. Only the background scanner selects this mode while HTTP
+/// requests are concurrently using the same machine and WAL projection.
+pub(super) fn scan_background_with_lease(
+    db: &Db,
+    roots: &IngestRoots,
+    lease: &IngestScannerLease,
+) -> Result<ScanReport> {
+    scan_one_shot_with_lease_and_between_pass(db, roots, lease, || {}, IngestPacing::Background)
 }
 
 #[cfg(test)]
@@ -196,7 +211,13 @@ where
     F: FnOnce(),
 {
     let lease = IngestScannerLease::acquire(db)?;
-    scan_one_shot_with_lease_and_between_pass(db, roots, &lease, between_passes)
+    scan_one_shot_with_lease_and_between_pass(
+        db,
+        roots,
+        &lease,
+        between_passes,
+        IngestPacing::Unpaced,
+    )
 }
 
 fn scan_one_shot_with_lease_and_between_pass<F>(
@@ -204,6 +225,7 @@ fn scan_one_shot_with_lease_and_between_pass<F>(
     roots: &IngestRoots,
     lease: &IngestScannerLease,
     between_passes: F,
+    pacing: IngestPacing,
 ) -> Result<ScanReport>
 where
     F: FnOnce(),
@@ -214,11 +236,11 @@ where
     // different root set replace the signature and leave both projections
     // present after this command reports success.
     let _scan_guard = DatabaseLock::acquire(db, "ingest")?;
-    let first = scan_once_locked(db, roots)?;
+    let first = scan_once_locked(db, roots, pacing)?;
     let mut report = first.report;
     if first.root_signature_adopted {
         between_passes();
-        match scan_once_locked(db, roots) {
+        match scan_once_locked(db, roots, pacing) {
             Ok(confirmation) => report.merge_scan(confirmation.report),
             Err(error) => {
                 finalize_scan_sequence_error(db, &report, &error);
@@ -233,18 +255,18 @@ where
     Ok(report)
 }
 
-fn scan_once_locked(db: &Db, roots: &IngestRoots) -> Result<ScanOutcome> {
+fn scan_once_locked(db: &Db, roots: &IngestRoots, pacing: IngestPacing) -> Result<ScanOutcome> {
     // The caller owns the process lock across this complete application-level
     // reconciliation decision even though source files commit independently.
     AttemptRecorder::new(db).begin()?;
-    let attempt = scan_once_started(db, roots);
+    let attempt = scan_once_started(db, roots, pacing);
     if let Err(error) = &attempt {
         finalize_unexpected_scan_error(db, error);
     }
     attempt
 }
 
-fn scan_once_started(db: &Db, roots: &IngestRoots) -> Result<ScanOutcome> {
+fn scan_once_started(db: &Db, roots: &IngestRoots, pacing: IngestPacing) -> Result<ScanOutcome> {
     #[cfg(test)]
     run_scan_after_start_hook(db)?;
 
@@ -285,7 +307,7 @@ fn scan_once_started(db: &Db, roots: &IngestRoots) -> Result<ScanOutcome> {
     report.files_seen = files.len() as u64;
     let selected_source_extents = load_selected_source_extents(db)?;
     let source_handoffs = SourceHandoffIndex::new(&selected_source_extents);
-    let mut file_ingestor = FileIngestor::new(db);
+    let mut file_ingestor = FileIngestor::new(db).with_pacing(pacing);
     let mut protected_handoff_owners = HashSet::new();
     let mut candidates_by_owner: HashMap<String, Vec<SourceCandidate>> = HashMap::new();
     let mut owners = HashMap::new();

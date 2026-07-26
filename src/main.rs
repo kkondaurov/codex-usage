@@ -68,13 +68,13 @@ async fn run() -> Result<()> {
                 .await
                 .with_context(|| format!("failed to bind {address}"))?;
             let common = args.common.resolved();
-            // Retain one ownership lease from startup recovery through any
-            // synchronous replay and prewarming, then transfer it directly to
-            // the live scanner. Claim it before opening SQLite so a losing
-            // process cannot hydrate a different pricing sidecar first.
-            let scanner_lease = (!args.no_ingest)
-                .then(|| ingest::IngestScannerLease::acquire_path(&common.db))
-                .transpose()?;
+            // Every server is write-capable: even `--no-ingest` performs
+            // recovery, hydrates manual pricing, exposes pricing mutations,
+            // and runs the pricing refresher. Retain one projection ownership
+            // lease for the server's lifetime so another port cannot attach a
+            // conflicting configuration to the same database. When scanning
+            // is enabled, transfer that lease directly to the live scanner.
+            let projection_lease = ingest::IngestScannerLease::acquire_path(&common.db)?;
             let (db, manual_pricing) = open_configured_db(&common)?;
             ingest::recover_interrupted_scan(&db)?;
             let pricing_config = common.pricing();
@@ -92,29 +92,26 @@ async fn run() -> Result<()> {
                     database = %db.path().display(),
                     "rebuilding stale SQLite projection before serving requests"
                 );
-                ingest::scan_one_shot_with_lease(
-                    &db,
-                    &roots,
-                    scanner_lease
-                        .as_ref()
-                        .expect("stale projection replay requires ingest ownership"),
-                )
-                .context("failed to rebuild stale SQLite projection")?;
+                ingest::scan_one_shot_with_lease(&db, &roots, &projection_lease)
+                    .context("failed to rebuild stale SQLite projection")?;
             }
             analytics::prewarm_current_year_analytics(&db)?;
             let frontend = args.frontend.clone();
             let executor = StorageExecutor::default();
             let pricing_sync = PricingSync::new(executor.clone());
-            let scanner = scanner_lease
-                .map(|lease| {
+            let scanner = if args.no_ingest {
+                None
+            } else {
+                Some(
                     ingest::spawn_scanner_with_lease(
                         db.clone(),
                         roots.clone(),
                         Duration::from_secs(args.poll_seconds.max(1)),
-                        lease,
+                        projection_lease,
                     )
-                })
-                .transpose()?;
+                    .context("failed to start live ingest scanner")?,
+                )
+            };
             let pricing_refresher =
                 pricing_sync.spawn_refresher(db.clone(), pricing_config.clone());
             let app = AppDependencies::new(

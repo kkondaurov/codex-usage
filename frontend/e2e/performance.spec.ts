@@ -14,6 +14,8 @@ import {
 
 const STATS_RANGES = ['day', 'week', 'month', 'year', 'all'] as const
 const COLD_SAMPLE_COUNT = 5
+const CONCURRENT_OVERVIEW_CONTEXT_COUNT = 3
+const CONCURRENT_SESSIONS_CONTEXT_COUNT = 4
 const PRODUCT_TARGET_MS = 1_000
 const HEADROOM_MEDIAN_BUDGET_MS = 900
 const API_BUDGET_MS = 900
@@ -221,6 +223,92 @@ function summarize(samples: number[]) {
 
 test.describe('cold analytical performance', () => {
   test.describe.configure({ retries: 0, timeout: 180_000 })
+
+  test(`sequential concurrent cold Overview and Sessions bursts stay below the ${PRODUCT_TARGET_MS}ms product target`, async ({ browser, app }, testInfo) => {
+    const overview = await Promise.all(Array.from(
+      { length: CONCURRENT_OVERVIEW_CONTEXT_COUNT },
+      async (_, index) => ({
+        context: index + 1,
+        timing: await withColdBrowserContext(browser, page => measureColdOverview(page, app.baseUrl)),
+      }),
+    ))
+    const sessions = await Promise.all(Array.from(
+      { length: CONCURRENT_SESSIONS_CONTEXT_COUNT },
+      async (_, index) => ({
+        context: index + 1,
+        timing: await withColdBrowserContext(browser, page => measureColdCostSortedSessions(page, app.baseUrl)),
+      }),
+    ))
+
+    const renderTimings = [
+      ...overview.flatMap(sample => (
+        Object.entries(sample.timing.render).map(([surface, elapsedMs]) => ({
+          burst: 'Overview',
+          context: sample.context,
+          surface: `Overview ${surface}`,
+          elapsedMs,
+        }))
+      )),
+      ...sessions.map(sample => ({
+        burst: 'Sessions',
+        context: sample.context,
+        surface: 'Sessions sorted by cost',
+        elapsedMs: sample.timing.renderMs,
+      })),
+    ]
+    const apiTimings = [
+      ...overview.flatMap(sample => [
+        { burst: 'Overview', context: sample.context, surface: 'Overview summary API', elapsedMs: sample.timing.api.summaryMs },
+        { burst: 'Overview', context: sample.context, surface: 'Overview annual API', elapsedMs: sample.timing.api.annualMs },
+      ]),
+      ...sessions.map(sample => ({
+        burst: 'Sessions',
+        context: sample.context,
+        surface: 'Sessions sorted by cost API',
+        elapsedMs: sample.timing.apiMs,
+      })),
+    ]
+    const report = {
+      productTargetMs: PRODUCT_TARGET_MS,
+      apiBudgetMs: API_BUDGET_MS,
+      coldDefinition: 'each page load runs in a new isolated Chromium context with an empty SPA cache; the Overview burst completes before the Sessions burst starts, while the long-running server and database remain warm as they do in normal use',
+      workload: {
+        order: ['Overview', 'Sessions sorted by cost'],
+        overviewContexts: CONCURRENT_OVERVIEW_CONTEXT_COUNT,
+        sessionsContexts: CONCURRENT_SESSIONS_CONTEXT_COUNT,
+      },
+      scale: {
+        year: overviewScaleYear,
+        threads: 12 * overviewScaleThreadsPerMonth,
+        messages: overviewScaleMessageCount,
+        usageFacts: overviewScaleUsageFactCount,
+        events: overviewScaleEventCount,
+        usageGroups: 12 * (overviewScaleThreadsPerMonth + overviewScaleAdditionalGroupsPerMonth),
+      },
+      raw: { overview, sessions },
+      observed: { render: renderTimings, api: apiTimings },
+    }
+    await testInfo.attach('concurrent-cold-performance.json', {
+      body: Buffer.from(JSON.stringify(report, null, 2)),
+      contentType: 'application/json',
+    })
+    console.log(`Concurrent cold timings:\n${JSON.stringify(report.observed, null, 2)}`)
+
+    const slowRenders = renderTimings
+      .filter(timing => timing.elapsedMs >= PRODUCT_TARGET_MS)
+      .map(timing => `${timing.surface} context ${timing.context}: ${timing.elapsedMs}ms`)
+    const slowApis = apiTimings
+      .filter(timing => timing.elapsedMs >= API_BUDGET_MS)
+      .map(timing => `${timing.surface} context ${timing.context}: ${timing.elapsedMs}ms`)
+    expect(
+      slowRenders,
+      `Every concurrently loaded cold SPA surface must stay below the ${PRODUCT_TARGET_MS}ms product target.`,
+    ).toEqual([])
+    expect(
+      slowApis,
+      `Every API in the concurrent cold burst must stay below the ${API_BUDGET_MS}ms budget.`,
+    ).toEqual([])
+  })
 
   test(`cold analytical and Activity surfaces stay below ${PRODUCT_TARGET_MS}ms with median headroom`, async ({ browser, app }, testInfo) => {
     const overview: OverviewTiming[] = []

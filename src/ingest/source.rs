@@ -4,11 +4,84 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Take};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::time::Duration;
 
 // Bound individual JSONL records so a missing newline cannot grow memory
 // without limit. Large payloads are parsed for metadata but are never retained
 // in the SQLite projection.
 pub(super) const MAX_JSONL_LINE_BYTES: usize = 32 * 1024 * 1024;
+
+// A live scan shares the machine with latency-sensitive HTTP reads. Briefly
+// sleeping after each bounded slice gives those foreground workers regular
+// CPU and storage scheduling opportunities without changing which source
+// bytes are fingerprinted or where a file transaction commits.
+pub(super) const BACKGROUND_INGEST_SLICE_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(not(test))]
+pub(super) const BACKGROUND_INGEST_PAUSE: Duration = Duration::from_millis(1);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum IngestPacing {
+    #[default]
+    Unpaced,
+    Background,
+}
+
+#[derive(Debug)]
+struct IngestPacer {
+    mode: IngestPacing,
+    slice_bytes: u64,
+    bytes_in_slice: u64,
+    #[cfg(test)]
+    pauses: u64,
+}
+
+impl Default for IngestPacer {
+    fn default() -> Self {
+        Self::new(IngestPacing::Unpaced)
+    }
+}
+
+impl IngestPacer {
+    fn new(mode: IngestPacing) -> Self {
+        Self {
+            mode,
+            slice_bytes: BACKGROUND_INGEST_SLICE_BYTES,
+            bytes_in_slice: 0,
+            #[cfg(test)]
+            pauses: 0,
+        }
+    }
+
+    fn account(&mut self, bytes: u64) {
+        if self.mode == IngestPacing::Unpaced || bytes == 0 {
+            return;
+        }
+        let total = self.bytes_in_slice.saturating_add(bytes);
+        let pauses = total / self.slice_bytes;
+        self.bytes_in_slice = total % self.slice_bytes;
+        for _ in 0..pauses {
+            self.pause();
+        }
+    }
+
+    fn pause(&mut self) {
+        #[cfg(test)]
+        {
+            self.pauses = self.pauses.saturating_add(1);
+        }
+        #[cfg(not(test))]
+        std::thread::sleep(BACKGROUND_INGEST_PAUSE);
+    }
+
+    #[cfg(test)]
+    fn with_slice(mode: IngestPacing, slice_bytes: u64) -> Self {
+        assert!(slice_bytes > 0);
+        let mut pacer = Self::new(mode);
+        pacer.slice_bytes = slice_bytes;
+        pacer
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct FileIdentity {
@@ -73,6 +146,7 @@ pub(super) struct SourceSnapshot {
     path: PathBuf,
     file: File,
     extent: CapturedExtent,
+    pacer: IngestPacer,
 }
 
 impl SourceSnapshot {
@@ -96,7 +170,12 @@ impl SourceSnapshot {
                 identity: file_identity(&metadata),
             },
             file,
+            pacer: IngestPacer::default(),
         })
+    }
+
+    pub(super) fn set_pacing(&mut self, pacing: IngestPacing) {
+        self.pacer = IngestPacer::new(pacing);
     }
 
     pub(super) fn extent(&self) -> CapturedExtent {
@@ -120,7 +199,9 @@ impl SourceSnapshot {
             ));
         }
         self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(buffer)
+        self.file.read_exact(buffer)?;
+        self.pacer.account(buffer.len() as u64);
+        Ok(())
     }
 
     pub(super) fn jsonl_from(&mut self, offset: u64) -> io::Result<CapturedJsonlReader<'_>> {
@@ -136,12 +217,14 @@ impl SourceSnapshot {
         self.file.seek(SeekFrom::Start(offset))?;
         Ok(CapturedJsonlReader {
             reader: BufReader::new((&mut self.file).take(remaining)),
+            pacer: &mut self.pacer,
         })
     }
 }
 
 pub(super) struct CapturedJsonlReader<'a> {
     reader: BufReader<Take<&'a mut File>>,
+    pacer: &'a mut IngestPacer,
 }
 
 impl CapturedJsonlReader<'_> {
@@ -150,7 +233,12 @@ impl CapturedJsonlReader<'_> {
         buffer: &mut Vec<u8>,
         limit: usize,
     ) -> io::Result<BoundedLine> {
-        read_bounded_line(&mut self.reader, buffer, limit)
+        if self.pacer.mode == IngestPacing::Unpaced {
+            return read_bounded_line(&mut self.reader, buffer, limit);
+        }
+        let reader = &mut self.reader;
+        let pacer = &mut self.pacer;
+        read_bounded_line_with_accounting(reader, buffer, limit, |bytes| pacer.account(bytes))
     }
 }
 
@@ -165,6 +253,15 @@ pub(super) fn read_bounded_line<R: BufRead>(
     reader: &mut R,
     buffer: &mut Vec<u8>,
     limit: usize,
+) -> io::Result<BoundedLine> {
+    read_bounded_line_with_accounting(reader, buffer, limit, |_| {})
+}
+
+fn read_bounded_line_with_accounting<R: BufRead>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+    limit: usize,
+    mut account: impl FnMut(u64),
 ) -> io::Result<BoundedLine> {
     buffer.clear();
     let mut len = 0_u64;
@@ -189,6 +286,7 @@ pub(super) fn read_bounded_line<R: BufRead>(
             }
         }
         reader.consume(take);
+        account(take as u64);
         len = len.saturating_add(take as u64);
         if newline.is_some() {
             return Ok(BoundedLine::Complete { len, oversized });
@@ -225,6 +323,87 @@ mod tests {
             reader.next_bounded_line(&mut buffer, 16).unwrap(),
             BoundedLine::Eof
         );
+    }
+
+    #[test]
+    fn background_pacer_preserves_exact_thresholds_and_remainder() {
+        let mut pacer = IngestPacer::with_slice(IngestPacing::Background, 8);
+        pacer.account(7);
+        assert_eq!(pacer.pauses, 0);
+        assert_eq!(pacer.bytes_in_slice, 7);
+
+        pacer.account(1);
+        assert_eq!(pacer.pauses, 1);
+        assert_eq!(pacer.bytes_in_slice, 0);
+
+        pacer.account(19);
+        assert_eq!(pacer.pauses, 3);
+        assert_eq!(pacer.bytes_in_slice, 3);
+
+        let mut unpaced = IngestPacer::with_slice(IngestPacing::Unpaced, 8);
+        unpaced.account(u64::MAX);
+        assert_eq!(unpaced.pauses, 0);
+        assert_eq!(unpaced.bytes_in_slice, 0);
+    }
+
+    #[test]
+    fn captured_reads_share_one_background_pacing_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.jsonl");
+        std::fs::write(&path, b"abcd\nef\n").unwrap();
+        let mut snapshot = SourceSnapshot::open(&path).unwrap();
+        snapshot.pacer = IngestPacer::with_slice(IngestPacing::Background, 4);
+
+        let mut buffer = Vec::new();
+        {
+            let mut reader = snapshot.jsonl_from(0).unwrap();
+            assert_eq!(
+                reader.next_bounded_line(&mut buffer, 16).unwrap(),
+                BoundedLine::Complete {
+                    len: 5,
+                    oversized: false
+                }
+            );
+            assert_eq!(
+                reader.next_bounded_line(&mut buffer, 16).unwrap(),
+                BoundedLine::Complete {
+                    len: 3,
+                    oversized: false
+                }
+            );
+        }
+        assert_eq!(snapshot.pacer.pauses, 2);
+        assert_eq!(snapshot.pacer.bytes_in_slice, 0);
+
+        let mut exact = [0_u8; 4];
+        snapshot.read_exact_at(0, &mut exact).unwrap();
+        assert_eq!(&exact, b"abcd");
+        assert_eq!(snapshot.pacer.pauses, 3);
+        assert_eq!(snapshot.pacer.bytes_in_slice, 0);
+    }
+
+    #[test]
+    fn oversized_line_accounts_each_buffered_chunk_while_it_is_drained() {
+        let mut source = vec![b'x'; 20];
+        source.push(b'\n');
+        let mut reader = BufReader::with_capacity(4, source.as_slice());
+        let mut buffer = Vec::new();
+        let mut charges = Vec::new();
+
+        let line = read_bounded_line_with_accounting(&mut reader, &mut buffer, 3, |bytes| {
+            charges.push(bytes)
+        })
+        .unwrap();
+
+        assert_eq!(
+            line,
+            BoundedLine::Complete {
+                len: 21,
+                oversized: true
+            }
+        );
+        assert!(buffer.is_empty());
+        assert_eq!(charges, [4, 4, 4, 4, 4, 1]);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../api'
@@ -121,32 +122,59 @@ describe('annual heatmap geometry', () => {
   })
 })
 
-describe('OverviewPage staged loading', () => {
-  it('renders permanent section geometry and hydrates the summary independently', async () => {
+describe('OverviewPage independent loading', () => {
+  it('starts summary and annual loading together without duplicate requests', async () => {
     const summary = deferred<OverviewResponse>()
     const yearly = deferred<OverviewYearResponse>()
     const summarySpy = vi.spyOn(api, 'overview').mockReturnValue(summary.promise)
     const yearSpy = vi.spyOn(api, 'overviewYear').mockReturnValue(yearly.promise)
 
-    renderOverview()
+    render(<StrictMode><MemoryRouter><OverviewPage /></MemoryRouter></StrictMode>)
     expect(screen.getByRole('heading', { name: 'Overview' })).toBeInTheDocument()
     expect(screen.getByLabelText('Loading overview summary')).toBeInTheDocument()
     expect(screen.getByLabelText('Loading 2026 yearly usage')).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'TOP PROJECTS · 2026' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'TOP SESSIONS · 2026' })).toBeInTheDocument()
     expect(summarySpy).toHaveBeenCalledTimes(1)
-    expect(yearSpy).not.toHaveBeenCalled()
+    expect(yearSpy).toHaveBeenCalledTimes(1)
+    expect(yearSpy).toHaveBeenCalledWith(2026, expect.any(AbortSignal))
     expect(within(screen.getByLabelText('Loading 2026 yearly usage')).queryAllByRole('button')).toEqual([])
+
+    await act(async () => { yearly.resolve(yearResponse()); await Promise.resolve() })
+    expect(screen.getByText('2026 winner')).toBeInTheDocument()
+    expect(screen.getByLabelText('Loading overview summary')).toBeInTheDocument()
+    expect(summarySpy).toHaveBeenCalledTimes(1)
+    expect(yearSpy).toHaveBeenCalledTimes(1)
 
     await act(async () => { summary.resolve(summaryResponse); await Promise.resolve() })
     expect(screen.getByText('$12.34')).toBeInTheDocument()
     expect(screen.queryByText(/Updated/i)).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Loading overview summary')).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Loading 2026 yearly usage')).toBeInTheDocument()
-    expect(yearSpy).toHaveBeenCalledWith(2026, expect.any(AbortSignal))
+    expect(summarySpy).toHaveBeenCalledTimes(1)
+    expect(yearSpy).toHaveBeenCalledTimes(1)
+  })
 
-    await act(async () => { yearly.resolve(yearResponse()); await Promise.resolve() })
+  it('reuses both Overview responses until the 30-second freshness boundary', async () => {
+    const summarySpy = vi.spyOn(api, 'overview').mockResolvedValue(summaryResponse)
+    const yearSpy = vi.spyOn(api, 'overviewYear').mockResolvedValue(yearResponse())
+
+    const first = renderOverview()
+    await flush()
+    expect(summarySpy).toHaveBeenCalledTimes(1)
+    expect(yearSpy).toHaveBeenCalledTimes(1)
+    first.unmount()
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(29_999) })
+    const second = renderOverview()
+    expect(screen.getByText('$12.34')).toBeInTheDocument()
     expect(screen.getByText('2026 winner')).toBeInTheDocument()
+    expect(summarySpy).toHaveBeenCalledTimes(1)
+    expect(yearSpy).toHaveBeenCalledTimes(1)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(summarySpy).toHaveBeenCalledTimes(2)
+    expect(yearSpy).toHaveBeenCalledTimes(2)
+    second.unmount()
   })
 
   it('uses the browser calendar date for today navigation', async () => {

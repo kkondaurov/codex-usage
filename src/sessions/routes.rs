@@ -16,7 +16,7 @@ use crate::{
     storage::WorkClass,
     usage::UsageTotals,
     web::{
-        ReadRuntime,
+        ReadRuntime, SingleFlight,
         error::{ApiError, ApiResult},
         pagination::{clamped_page_size, validated_page},
     },
@@ -29,12 +29,27 @@ use axum::{
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone)]
+struct SessionsState {
+    reads: ReadRuntime,
+    lists: SingleFlight<SessionListRequest, SessionsResponse>,
+}
+
+impl SessionsState {
+    fn new(reads: ReadRuntime) -> Self {
+        Self {
+            reads,
+            lists: SingleFlight::default(),
+        }
+    }
+}
+
 pub(crate) fn router(reads: ReadRuntime) -> Router {
     Router::new()
         .route("/projects", get(projects))
         .route("/sessions", get(sessions))
         .route("/sessions/{id}/summary", get(session_summary))
-        .with_state(reads)
+        .with_state(SessionsState::new(reads))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -119,7 +134,7 @@ struct SessionsQuery {
     page_size: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionsResponse {
     items: Vec<SessionRow>,
@@ -131,7 +146,7 @@ struct SessionsResponse {
 }
 
 async fn sessions(
-    State(reads): State<ReadRuntime>,
+    State(state): State<SessionsState>,
     Query(query): Query<SessionsQuery>,
 ) -> ApiResult<Json<SessionsResponse>> {
     let (start, end) = query_bounds(
@@ -160,34 +175,38 @@ async fn sessions(
     } else {
         SessionListSort::Recent
     };
-    let response = reads
-        .snapshot(WorkClass::Heavy, move |connection| {
-            let SessionListPage {
-                items,
-                page,
-                page_size,
-                total,
-                total_pages,
-            } = read_session_page_on(
-                connection,
-                &SessionListRequest {
-                    start,
-                    end,
-                    project,
-                    search,
-                    sort,
-                    page,
-                    page_size,
-                },
-            )?;
-            Ok(SessionsResponse {
-                items: items.into_iter().map(SessionRow::from).collect(),
-                projects: read_projects_on(connection)?,
-                page,
-                page_size,
-                total,
-                total_pages,
-            })
+    let request = SessionListRequest {
+        start,
+        end,
+        project,
+        search,
+        sort,
+        page,
+        page_size,
+    };
+    let reads = state.reads.clone();
+    let response = state
+        .lists
+        .run(request.clone(), move || async move {
+            reads
+                .snapshot(WorkClass::Heavy, move |connection| {
+                    let SessionListPage {
+                        items,
+                        page,
+                        page_size,
+                        total,
+                        total_pages,
+                    } = read_session_page_on(connection, &request)?;
+                    Ok(SessionsResponse {
+                        items: items.into_iter().map(SessionRow::from).collect(),
+                        projects: read_projects_on(connection)?,
+                        page,
+                        page_size,
+                        total,
+                        total_pages,
+                    })
+                })
+                .await
         })
         .await
         .map_err(ApiError::internal)?;
@@ -199,9 +218,10 @@ struct ProjectsResponse {
     items: Vec<String>,
 }
 
-async fn projects(State(reads): State<ReadRuntime>) -> ApiResult<Json<ProjectsResponse>> {
+async fn projects(State(state): State<SessionsState>) -> ApiResult<Json<ProjectsResponse>> {
     Ok(Json(ProjectsResponse {
-        items: reads
+        items: state
+            .reads
             .snapshot(WorkClass::Heavy, read_projects_on)
             .await
             .map_err(ApiError::internal)?,
@@ -340,10 +360,11 @@ impl From<SessionSummaryRecord> for SessionSummaryResponse {
 }
 
 async fn session_summary(
-    State(reads): State<ReadRuntime>,
+    State(state): State<SessionsState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<SessionSummaryResponse>> {
-    reads
+    state
+        .reads
         .snapshot(WorkClass::Heavy, move |connection| {
             read_summary_on(connection, &id)
                 .map(|summary| summary.map(SessionSummaryResponse::from))

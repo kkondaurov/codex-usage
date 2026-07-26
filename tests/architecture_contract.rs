@@ -5739,7 +5739,7 @@ fn ingest_owner_reader_single_owns_descriptor_bounded_owner_decoding() {
     for (declaration, name) in [
         ("fn read_owner(", "read_owner"),
         ("fn read_owner_from_snapshot(", "read_owner_from_snapshot"),
-        ("fn read_available_owners(", "read_available_owners"),
+        ("fn read_surviving_owners(", "read_surviving_owners"),
     ] {
         assert!(
             owner_reader.contains(declaration),
@@ -5772,7 +5772,7 @@ fn ingest_owner_reader_single_owns_descriptor_bounded_owner_decoding() {
     for removed in [
         "fn read_owner(",
         "fn read_owner_from_snapshot(",
-        "fn read_available_owners(",
+        "fn read_surviving_owners(",
         "type OwnerReader",
     ] {
         assert!(
@@ -6177,7 +6177,7 @@ fn ingest_coordinator_single_owns_scan_cycles_without_becoming_a_worker_or_adapt
         .find("AttemptRecorder::new(db).begin()")
         .expect("scan cycle must begin its durable attempt first");
     let started = locked
-        .find("scan_once_started(db, roots)")
+        .find("scan_once_started(db, roots, pacing)")
         .expect("scan cycle must enter enumeration after attempt start");
     assert!(
         begin < started,
@@ -6245,10 +6245,10 @@ fn ingest_coordinator_single_owns_scan_cycles_without_becoming_a_worker_or_adapt
         .find("DatabaseLock::acquire(db,")
         .expect("one-shot must acquire one process lock");
     let first = one_shot
-        .find("scan_once_locked(db, roots)")
+        .find("scan_once_locked(db, roots, pacing)")
         .expect("one-shot must perform its first scan");
     let confirmation = one_shot[first + 1..]
-        .find("scan_once_locked(db, roots)")
+        .find("scan_once_locked(db, roots, pacing)")
         .map(|offset| first + 1 + offset)
         .expect("one-shot must retain its optional confirmation scan");
     let publication = one_shot
@@ -6353,7 +6353,7 @@ fn ingest_scanner_single_owns_the_background_worker_without_absorbing_coordinati
             && scanner.contains("coordinator::{")
             && scanner.contains("IngestRoots")
             && scanner.contains("IngestScannerLease")
-            && scanner.contains("scan_one_shot_with_lease"),
+            && scanner.contains("scan_background_with_lease"),
         "Scanner must consume Attempt failure marking and Coordinator lifecycle operations directly"
     );
     for forbidden in [
@@ -6381,7 +6381,7 @@ fn ingest_scanner_single_owns_the_background_worker_without_absorbing_coordinati
         "IngestScannerLease::acquire(&db)",
         "lease.require_database(&db)",
         "std::thread::spawn(move ||",
-        "scan_one_shot_with_lease(&db, &roots, &lease)",
+        "scan_background_with_lease(&db, &roots, &lease)",
         "AttemptRecorder::new(&db).mark_cycle_failed()",
         "Duration::from_millis(250)",
     ] {
@@ -6520,7 +6520,7 @@ fn ingest_reconciliation_single_owns_the_ordered_removal_plan() {
         "reconciliation_candidates()",
         "begin_reconciliation()",
         "remove_rollout(",
-        "read_available_owners(",
+        "read_surviving_owners(",
         "apply_thread_metadata_reset(",
         "delete_source_checkpoint(",
         "delete_thread_if_abandoned(",
@@ -6632,7 +6632,7 @@ fn ingest_reconciliation_single_owns_the_ordered_removal_plan() {
         "fn reset_thread_metadata_from_sources(",
         "fn read_owner(",
         "fn read_owner_from_snapshot(",
-        "fn read_available_owners(",
+        "fn read_surviving_owners(",
     ] {
         assert!(
             !composition.contains(removed),

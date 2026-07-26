@@ -530,8 +530,6 @@ export function OverviewPage() {
   const [year, setYear] = useState(new Date().getFullYear())
   const summary = useCachedAsync('overview', signal => api.overview(signal), [], 30_000, 30_000)
 
-  const summarySettled = Boolean(summary.data) || (!summary.loading && Boolean(summary.error))
-
   return (
     <div className="overview-page">
       {summary.data && summary.error && <DegradedDataNotice error={summary.error} lastSuccessfulAt={summary.lastSuccessfulAt} onRetry={() => void summary.refresh()} />}
@@ -548,22 +546,11 @@ export function OverviewPage() {
         : summary.error && !summary.loading
           ? <SummaryError error={summary.error} onRetry={() => void summary.refresh()} />
           : <SummarySkeleton />}
-      {summarySettled
-        ? <YearOverviewSections year={year} onPrevious={() => setYear(value => Math.max(MIN_PUBLIC_YEAR, value - 1))} onNext={() => setYear(value => value + 1)} />
-        : (
-          <>
-            <AnnualHeatmap
-              year={year}
-              days={null}
-              loading
-              error={null}
-              onRetry={() => undefined}
-              onPrevious={() => setYear(value => Math.max(MIN_PUBLIC_YEAR, value - 1))}
-              onNext={() => setYear(value => value + 1)}
-            />
-            <BottomSkeleton year={year} />
-          </>
-        )}
+      <YearOverviewSections
+        year={year}
+        onPrevious={() => setYear(value => Math.max(MIN_PUBLIC_YEAR, value - 1))}
+        onNext={() => setYear(value => value + 1)}
+      />
     </div>
   )
 }

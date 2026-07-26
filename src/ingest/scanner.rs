@@ -1,6 +1,6 @@
 use super::{
     attempt::AttemptRecorder,
-    coordinator::{IngestRoots, IngestScannerLease, scan_one_shot_with_lease},
+    coordinator::{IngestRoots, IngestScannerLease, scan_background_with_lease},
 };
 use crate::storage::Db;
 use anyhow::{Context, Result};
@@ -81,7 +81,7 @@ pub fn spawn_scanner_with_lease(
     let stop = cancelled.clone();
     let worker = std::thread::spawn(move || {
         while !stop.load(Ordering::Acquire) {
-            if let Err(error) = scan_one_shot_with_lease(&db, &roots, &lease) {
+            if let Err(error) = scan_background_with_lease(&db, &roots, &lease) {
                 tracing::warn!(%error, "ingest scan failed");
                 let _ = AttemptRecorder::new(&db).mark_cycle_failed();
             }
