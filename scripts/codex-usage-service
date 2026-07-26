@@ -1,0 +1,272 @@
+#!/bin/sh
+
+set -eu
+
+service_label=${CODEX_USAGE_SERVICE_LABEL:-com.kkondaurov.codex-usage}
+launchctl_command=${CODEX_USAGE_LAUNCHCTL:-/bin/launchctl}
+plutil_command=${CODEX_USAGE_PLUTIL:-/usr/bin/plutil}
+curl_command=${CODEX_USAGE_CURL:-/usr/bin/curl}
+skip_build=${CODEX_USAGE_SERVICE_SKIP_BUILD:-0}
+service_url=${CODEX_USAGE_SERVICE_URL:-http://127.0.0.1:5610}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+repository_dir=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+working_dir=${CODEX_USAGE_SERVICE_WORKING_DIRECTORY:-$repository_dir}
+program=${CODEX_USAGE_SERVICE_PROGRAM:-$repository_dir/target/release/codex-usage}
+
+home_dir=${HOME:?HOME must be set}
+launch_agents_dir=${CODEX_USAGE_LAUNCH_AGENTS_DIR:-$home_dir/Library/LaunchAgents}
+log_dir=${CODEX_USAGE_SERVICE_LOG_DIR:-$home_dir/Library/Logs}
+plist_path=$launch_agents_dir/$service_label.plist
+stdout_path=$log_dir/codex-usage.log
+stderr_path=$log_dir/codex-usage.error.log
+user_id=$(/usr/bin/id -u)
+domain=gui/$user_id
+service_target=$domain/$service_label
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/codex-usage-service COMMAND
+
+Commands:
+  install    Build Codex Usage, install its LaunchAgent, and start it
+  start      Start the installed LaunchAgent
+  stop       Stop the LaunchAgent without uninstalling it
+  status     Show whether the LaunchAgent is running
+  uninstall  Stop the LaunchAgent and remove it
+EOF
+}
+
+fail() {
+    printf 'codex-usage-service: %s\n' "$*" >&2
+    exit 1
+}
+
+require_macos() {
+    [ "$(/usr/bin/uname -s)" = Darwin ] || fail "the background service is supported only on macOS"
+}
+
+require_executable() {
+    [ -x "$1" ] || fail "required executable not found: $1"
+}
+
+validate_configuration() {
+    [ "$user_id" -ne 0 ] || fail "run this command as your logged-in user, not with sudo"
+    case "$service_label" in
+        ''|*[!A-Za-z0-9._-]*)
+            fail "invalid LaunchAgent label: $service_label"
+            ;;
+    esac
+    case "$skip_build" in
+        0|1) ;;
+        *) fail "CODEX_USAGE_SERVICE_SKIP_BUILD must be 0 or 1" ;;
+    esac
+    require_executable "$launchctl_command"
+    require_executable "$plutil_command"
+    require_executable "$curl_command"
+}
+
+is_loaded() {
+    "$launchctl_command" print "$service_target" >/dev/null 2>&1
+}
+
+wait_until_running() {
+    attempts=0
+    while [ "$attempts" -lt 10 ]; do
+        service_description=$(
+            "$launchctl_command" print "$service_target" 2>/dev/null || true
+        )
+        if printf '%s\n' "$service_description" | /usr/bin/grep -q 'state = running'; then
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        /bin/sleep 1
+    done
+    return 1
+}
+
+wait_for_ui() {
+    attempts=0
+    while [ "$attempts" -lt 5 ]; do
+        if "$curl_command" --fail --silent --show-error --max-time 5 \
+            "$service_url/api/v1/status" >/dev/null 2>&1; then
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        /bin/sleep 1
+    done
+    return 1
+}
+
+report_started() {
+    if wait_for_ui; then
+        printf 'Codex Usage is running at %s\n' "$service_url"
+    else
+        printf 'The LaunchAgent is running; the UI is still starting at %s\n' "$service_url"
+        printf 'Check %s if it does not become available.\n' "$stderr_path"
+    fi
+}
+
+build_application() {
+    if [ "$skip_build" = 1 ]; then
+        return
+    fi
+    command -v npm >/dev/null 2>&1 || fail "npm is required to install Codex Usage"
+    command -v cargo >/dev/null 2>&1 || fail "Cargo is required to install Codex Usage"
+
+    printf 'Installing frontend dependencies...\n'
+    npm --prefix "$repository_dir/frontend" ci
+    printf 'Building frontend...\n'
+    npm --prefix "$repository_dir/frontend" run build
+    printf 'Building release binary...\n'
+    cargo build --release --manifest-path "$repository_dir/Cargo.toml"
+}
+
+write_plist() {
+    destination=$1
+    "$plutil_command" -create xml1 "$destination"
+    "$plutil_command" -insert Label -string "$service_label" "$destination"
+    "$plutil_command" -insert ProgramArguments -array "$destination"
+    "$plutil_command" -insert ProgramArguments.0 -string "$program" "$destination"
+    "$plutil_command" -insert ProgramArguments.1 -string serve "$destination"
+    "$plutil_command" -insert WorkingDirectory -string "$working_dir" "$destination"
+    "$plutil_command" -insert RunAtLoad -bool true "$destination"
+    "$plutil_command" -insert KeepAlive -bool true "$destination"
+    "$plutil_command" -insert ProcessType -string Background "$destination"
+    "$plutil_command" -insert ThrottleInterval -integer 10 "$destination"
+    "$plutil_command" -insert StandardOutPath -string "$stdout_path" "$destination"
+    "$plutil_command" -insert StandardErrorPath -string "$stderr_path" "$destination"
+    "$plutil_command" -insert EnvironmentVariables -dictionary "$destination"
+    "$plutil_command" -insert EnvironmentVariables.HOME -string "$home_dir" "$destination"
+    "$plutil_command" -insert EnvironmentVariables.PATH -string \
+        /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin "$destination"
+    "$plutil_command" -insert EnvironmentVariables.RUST_LOG -string info "$destination"
+    "$plutil_command" -lint "$destination" >/dev/null
+    /bin/chmod 644 "$destination"
+}
+
+cleanup_install_files() {
+    if [ -n "${new_plist:-}" ]; then
+        /bin/rm -f "$new_plist"
+    fi
+    if [ -n "${old_plist:-}" ]; then
+        /bin/rm -f "$old_plist"
+    fi
+}
+
+start_service() {
+    [ -f "$plist_path" ] || fail "Codex Usage is not installed; run '$0 install' first"
+    if ! is_loaded; then
+        "$launchctl_command" enable "$service_target"
+        "$launchctl_command" bootstrap "$domain" "$plist_path"
+    fi
+    wait_until_running || fail "LaunchAgent did not reach the running state; check $stderr_path"
+    report_started
+}
+
+stop_service() {
+    if is_loaded; then
+        "$launchctl_command" bootout "$service_target"
+        printf 'Codex Usage is stopped.\n'
+    else
+        printf 'Codex Usage is already stopped.\n'
+    fi
+}
+
+install_service() {
+    build_application
+    require_executable "$program"
+    [ -d "$working_dir" ] || fail "working directory not found: $working_dir"
+    /bin/mkdir -p "$launch_agents_dir" "$log_dir"
+
+    new_plist=$(/usr/bin/mktemp "$launch_agents_dir/.codex-usage.XXXXXX")
+    old_plist=
+    was_loaded=0
+    trap cleanup_install_files EXIT
+    trap 'exit 1' HUP INT TERM
+    write_plist "$new_plist"
+
+    if [ -f "$plist_path" ]; then
+        old_plist=$(/usr/bin/mktemp "$launch_agents_dir/.codex-usage.previous.XXXXXX")
+        /bin/cp -p "$plist_path" "$old_plist"
+    fi
+    if is_loaded; then
+        was_loaded=1
+        "$launchctl_command" bootout "$service_target"
+    fi
+
+    /bin/mv -f "$new_plist" "$plist_path"
+    new_plist=
+    "$launchctl_command" enable "$service_target"
+    if ! "$launchctl_command" bootstrap "$domain" "$plist_path"; then
+        if [ -n "$old_plist" ]; then
+            /bin/mv -f "$old_plist" "$plist_path"
+            old_plist=
+            if [ "$was_loaded" = 1 ]; then
+                "$launchctl_command" bootstrap "$domain" "$plist_path" >/dev/null 2>&1 || true
+            fi
+        else
+            /bin/rm -f "$plist_path"
+        fi
+        fail "failed to load the LaunchAgent"
+    fi
+    if [ -n "$old_plist" ]; then
+        /bin/rm -f "$old_plist"
+        old_plist=
+    fi
+    trap - EXIT HUP INT TERM
+
+    wait_until_running || fail "LaunchAgent did not reach the running state; check $stderr_path"
+    report_started
+    printf 'It will start automatically when you log in.\n'
+}
+
+show_status() {
+    if is_loaded; then
+        service_description=$("$launchctl_command" print "$service_target")
+        state=$(
+            printf '%s\n' "$service_description" |
+                /usr/bin/awk '/state = / { print $3; exit }'
+        )
+        [ -n "$state" ] || state=loaded
+        printf 'Codex Usage is %s.\n' "$state"
+        if "$curl_command" --fail --silent --show-error --max-time 5 \
+            "$service_url/api/v1/status" >/dev/null 2>&1; then
+            printf 'UI: %s (ready)\n' "$service_url"
+        else
+            printf 'UI: %s (not responding)\n' "$service_url"
+        fi
+        printf 'Logs: %s and %s\n' "$stdout_path" "$stderr_path"
+        return 0
+    fi
+    if [ -f "$plist_path" ]; then
+        printf 'Codex Usage is installed but stopped.\n'
+    else
+        printf 'Codex Usage is not installed.\n'
+    fi
+    return 1
+}
+
+uninstall_service() {
+    if is_loaded; then
+        "$launchctl_command" bootout "$service_target"
+    fi
+    /bin/rm -f "$plist_path"
+    printf 'Codex Usage is uninstalled. Local data and logs were preserved.\n'
+}
+
+require_macos
+validate_configuration
+
+case ${1:-} in
+    install) install_service ;;
+    start) start_service ;;
+    stop) stop_service ;;
+    status) show_status ;;
+    uninstall) uninstall_service ;;
+    -h|--help|help) usage ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

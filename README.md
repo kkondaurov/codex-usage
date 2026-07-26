@@ -23,26 +23,61 @@ bulky tool inputs and outputs, attachments, and generated images. Every session
 page includes a link that opens the original thread in Codex when you want the
 complete record.
 
-## Run it
+## Install on macOS
 
-You need Git, Rust, Node.js, and npm. The supported Rust and Node.js versions are
-pinned in the repository.
+You need Git, Rust, Node.js, and npm. The repository pins the supported Rust,
+Node.js, and npm versions.
 
 From a fresh clone:
 
 ```sh
 git clone https://github.com/kkondaurov/codex-usage.git
 cd codex-usage
+./scripts/codex-usage-service install
+```
+
+The command builds Codex Usage, installs it as a user LaunchAgent, and starts
+it. It will start automatically when you log in. Then open
+<http://127.0.0.1:5610>.
+
+The first launch may take a little longer while your existing Codex history is
+indexed.
+
+## Manage the service
+
+Run these commands from the cloned repository:
+
+```sh
+./scripts/codex-usage-service start
+./scripts/codex-usage-service stop
+./scripts/codex-usage-service status
+./scripts/codex-usage-service uninstall
+```
+
+`stop` leaves the service installed so you can start it again later. `uninstall`
+stops it and removes the LaunchAgent, but preserves the local database, pricing
+settings, logs, and build files.
+
+Rerun `install` after updating or moving the repository. The LaunchAgent stores
+the checkout's absolute path.
+
+Logs are written to:
+
+- `~/Library/Logs/codex-usage.log`
+- `~/Library/Logs/codex-usage.error.log`
+
+## Run it in a terminal
+
+To run Codex Usage without installing the background service:
+
+```sh
 npm --prefix frontend ci
 npm --prefix frontend run build
 cargo run
 ```
 
-Then open <http://127.0.0.1:5610>.
-
-Run the application from the repository root and leave the terminal open while
-using it. Press `Ctrl-C` to stop it. The first launch may take a little longer
-while your existing Codex history is indexed.
+Run it from the repository root and leave the terminal open. Press `Ctrl-C` to
+stop it. The UI is available at <http://127.0.0.1:5610>.
 
 By default, Codex Usage reads `~/.codex/sessions` and
 `~/.codex/archived_sessions`. It stores its local database and pricing settings
