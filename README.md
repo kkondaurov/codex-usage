@@ -82,7 +82,9 @@ stop it. The UI is available at <http://127.0.0.1:5610>.
 By default, Codex Usage reads `~/.codex/sessions` and
 `~/.codex/archived_sessions`. It stores its local database and pricing settings
 in the repository directory; those files are ignored by Git. New session
-activity is picked up automatically while the application is running.
+activity is picked up automatically while the application is running. Both
+plain `.jsonl` rollouts and Codex's lossless `.jsonl.zst` archives are supported;
+when both representations exist briefly, the plain file takes precedence.
 
 For a one-time refresh without starting the web interface:
 

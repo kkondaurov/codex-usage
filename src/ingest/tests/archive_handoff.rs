@@ -1154,3 +1154,86 @@ fn empty_rollout_placeholder_waits_then_ingests_when_populated() {
         .unwrap();
     assert_eq!(projected, (1, 1));
 }
+
+#[test]
+fn compressed_handoff_preserves_projection_and_stays_visible() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Db::open(temp.path().join("usage.db")).unwrap();
+    let archive = temp.path().join("archived_sessions");
+    std::fs::create_dir(&archive).unwrap();
+    let owner = "019f64aa-0000-7000-8000-000000000301";
+    let turn = "019f64ab-0000-7000-8000-000000000301";
+    let lines = [
+        meta("2026-07-15T09:00:00Z", owner, owner, false),
+        task("2026-07-15T09:00:01Z", turn),
+        context("2026-07-15T09:00:01Z", turn, "gpt-5.5"),
+        usage("2026-07-15T09:00:02Z", 100),
+    ];
+    let plain = archive.join(format!("rollout-2026-07-15T09-00-00-{owner}.jsonl"));
+    let compressed = plain.with_file_name(format!(
+        "{}.zst",
+        plain.file_name().unwrap().to_string_lossy()
+    ));
+    write_fixture(&plain, &lines);
+    let logical_size = plain.metadata().unwrap().len();
+    let roots = IngestRoots {
+        active: None,
+        archive: Some(archive),
+    };
+
+    scan_once(&db, &roots).unwrap();
+    write_compressed_fixture(&compressed, &lines);
+    std::fs::remove_file(&plain).unwrap();
+
+    let handoff = scan_once(&db, &roots).unwrap();
+    assert_eq!(handoff.files_ingested, 1);
+    assert_eq!(handoff.records_read, 4);
+    let connection = db.connect().unwrap();
+    let projected: (String, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                 path,size_bytes,byte_offset,
+                 (SELECT COUNT(*) FROM usage_facts WHERE rollout_id=?1),
+                 (SELECT SUM(input_tokens) FROM usage_facts WHERE rollout_id=?1)
+             FROM source_files WHERE rollout_id=?1",
+            [owner],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        projected,
+        (
+            compressed.to_string_lossy().into_owned(),
+            logical_size as i64,
+            logical_size as i64,
+            1,
+            100,
+        )
+    );
+    drop(connection);
+
+    let unchanged = scan_once(&db, &roots).unwrap();
+    assert_eq!(unchanged.files_unchanged, 1);
+    assert_eq!(unchanged.files_ingested, 0);
+    let rows: (i64, i64, i64) = db
+        .connect()
+        .unwrap()
+        .query_row(
+            "SELECT
+                 EXISTS(SELECT 1 FROM source_files WHERE rollout_id=?1),
+                 EXISTS(SELECT 1 FROM rollouts WHERE id=?1),
+                 EXISTS(SELECT 1 FROM threads WHERE id=?1)",
+            [owner],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(rows, (1, 1, 1));
+}

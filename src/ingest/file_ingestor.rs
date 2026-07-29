@@ -22,7 +22,10 @@ use super::{
         save_source_checkpoint, upsert_owner,
     },
     protocol::{CursorState, OwnerMeta, decode_record},
-    source::{BoundedLine, FileIdentity, IngestPacing, MAX_JSONL_LINE_BYTES, SourceSnapshot},
+    source::{
+        BoundedLine, FileIdentity, IngestPacing, MAX_JSONL_LINE_BYTES, SourceSnapshot,
+        is_compressed_rollout_path,
+    },
 };
 use crate::storage::Db;
 use anyhow::{Context, Result, anyhow};
@@ -138,6 +141,12 @@ impl FileIngestor<'_> {
         candidate: &SourceCandidate,
         previous: &SelectedSourceExtent,
     ) -> bool {
+        // A compressed rollout is immutable and expensive to materialize. Let
+        // `process` open it once and perform the same committed-prefix proof on
+        // that captured snapshot; a mismatch is still deferred transactionally.
+        if is_compressed_rollout_path(&candidate.path) {
+            return true;
+        }
         let Ok(mut snapshot) = SourceSnapshot::open(&candidate.path) else {
             return false;
         };
@@ -156,6 +165,14 @@ impl FileIngestor<'_> {
         previous: &SelectedSourceExtent,
         pacing: IngestPacing,
     ) -> bool {
+        let size = if snapshot.is_compressed() {
+            if snapshot.ensure_materialized().is_err() {
+                return false;
+            }
+            snapshot.extent().size()
+        } else {
+            size
+        };
         if size < previous.committed_size {
             return false;
         }
@@ -222,10 +239,6 @@ impl FileIngestor<'_> {
         run_process_file_before_open_hook(path);
         let mut snapshot = SourceSnapshot::open(path)?;
         snapshot.set_pacing(self.pacing);
-        let extent = snapshot.extent();
-        let size = extent.size();
-        let modified_ns = extent.modified_ns();
-        let identity = extent.identity();
         let mut owner = read_owner_from_snapshot(&mut snapshot, path)?;
         if owner.owner_id != resolved_owner.owner_id
             || owner.parent_rollout_id != resolved_owner.parent_rollout_id
@@ -240,11 +253,12 @@ impl FileIngestor<'_> {
         // Topology resolution can follow parents discovered in other files, so it
         // is the sole field intentionally carried over from the scan-wide graph.
         owner.thread_id = resolved_owner.thread_id.clone();
+        let size_hint = snapshot.extent().size();
         if let Some(previous) = previous_extent
             && path != previous.path
             && !Self::source_path_switch_is_ready_from_snapshot(
                 &mut snapshot,
-                size,
+                size_hint,
                 previous,
                 self.pacing,
             )
@@ -252,7 +266,7 @@ impl FileIngestor<'_> {
             tracing::debug!(
                 owner_id = resolved_owner.owner_id,
                 path = %path.display(),
-                candidate_size = size,
+                candidate_size = size_hint,
                 previous_committed_size = previous.committed_size,
                 "deferring source handoff because the opened snapshot no longer contains the committed prefix"
             );
@@ -263,9 +277,38 @@ impl FileIngestor<'_> {
         }
         #[cfg(test)]
         run_process_file_after_snapshot_hook(path);
-        let mut connection = self.db.connect()?;
         let path_text = path.to_string_lossy();
+        let mut connection = self.db.connect()?;
         let checkpoint_by_path = load_checkpoint_by_path(&connection, &path_text)?;
+        if snapshot.is_compressed()
+            && let Some(checkpoint) = checkpoint_by_path.as_ref()
+        {
+            let storage_extent = snapshot.extent();
+            if matches_unchanged_snapshot(
+                checkpoint,
+                PROJECTOR_GENERATION,
+                &resolved_owner.owner_id,
+                &resolved_owner.thread_id,
+                checkpoint.size,
+                storage_extent.modified_ns(),
+                storage_extent.identity(),
+            ) {
+                return Self::mark_file_unchanged(
+                    &mut connection,
+                    checkpoint,
+                    archived,
+                    checkpoint.size,
+                    storage_extent.modified_ns(),
+                    storage_extent.identity(),
+                    None,
+                );
+            }
+        }
+        snapshot.ensure_materialized()?;
+        let extent = snapshot.extent();
+        let size = extent.size();
+        let modified_ns = extent.modified_ns();
+        let identity = extent.identity();
         let suspicious_same_path_shrink =
             is_suspicious_same_path_shrink(checkpoint_by_path.as_ref(), &owner.owner_id, size);
         if !suspicious_same_path_shrink {

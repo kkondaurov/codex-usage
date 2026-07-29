@@ -3,11 +3,30 @@ use anyhow::{Context, Result, anyhow};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
+    ffi::OsStr,
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
+
+const COMPRESSED_ROLLOUT_SUFFIX: &str = ".zst";
+
+fn is_compressed_rollout_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.ends_with(".jsonl.zst"))
+}
+
+fn plain_rollout_path(path: &Path) -> PathBuf {
+    let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
+        return path.to_path_buf();
+    };
+    let Some(plain_file_name) = file_name.strip_suffix(COMPRESSED_ROLLOUT_SUFFIX) else {
+        return path.to_path_buf();
+    };
+    path.with_file_name(plain_file_name)
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct SourceCandidate {
@@ -85,7 +104,8 @@ impl SourceHandoffIndex {
 }
 
 fn source_file_name_key(path: &Path) -> Option<String> {
-    path.file_name()
+    plain_rollout_path(path)
+        .file_name()
         .and_then(|value| value.to_str())
         .map(str::to_ascii_lowercase)
 }
@@ -93,6 +113,12 @@ fn source_file_name_key(path: &Path) -> Option<String> {
 pub(super) fn source_is_complete(path: &Path, size: u64) -> bool {
     if size == 0 {
         return false;
+    }
+    // Codex publishes compressed rollouts through a verified atomic rename.
+    // Projection validates the complete frame; discovery only needs to avoid
+    // treating an immutable archive like a live JSONL with a partial tail.
+    if is_compressed_rollout_path(path) {
+        return true;
     }
     let Ok(mut file) = File::open(path) else {
         return false;
@@ -126,11 +152,12 @@ pub(super) fn collect_jsonl(
         let entry = entry.with_context(|| {
             format!("configured ingest root {} traversal failed", root.display())
         })?;
+        let path = entry.path();
+        let is_plain = path.extension().is_some_and(|value| value == "jsonl");
+        let is_compressed = is_compressed_rollout_path(path);
         if entry.file_type().is_file()
-            && entry
-                .path()
-                .extension()
-                .is_some_and(|value| value == "jsonl")
+            && (is_plain || is_compressed)
+            && !(is_compressed && plain_rollout_path(path).is_file())
         {
             let metadata = entry.metadata().with_context(|| {
                 format!("source metadata unavailable for {}", entry.path().display())
@@ -177,10 +204,11 @@ pub(super) fn owners_with_pending_empty_sources(
     owners
 }
 
-fn rollout_id_from_source_path(path: &str) -> Option<&str> {
-    let stem = Path::new(path).file_stem()?.to_str()?;
+fn rollout_id_from_source_path(path: &str) -> Option<String> {
+    let plain_path = plain_rollout_path(Path::new(path));
+    let stem = plain_path.file_stem()?.to_str()?;
     let candidate = stem.get(stem.len().checked_sub(36)?..)?;
-    looks_like_uuid(candidate).then_some(candidate)
+    looks_like_uuid(candidate).then(|| candidate.to_owned())
 }
 
 pub(super) fn plan_catalog_selection(
@@ -343,10 +371,16 @@ mod tests {
         let top_level = root.join("top-level.jsonl");
         let nested_source = nested.join("nested.jsonl");
         let empty = root.join("empty.jsonl");
+        let compressed_only = root.join("compressed-only.jsonl.zst");
+        let plain_preferred = root.join("plain-preferred.jsonl");
+        let compressed_shadow = root.join("plain-preferred.jsonl.zst");
         let ignored = root.join("notes.txt");
         std::fs::write(&top_level, b"{}\n").unwrap();
         std::fs::write(&nested_source, b"{}\n").unwrap();
         File::create(&empty).unwrap();
+        std::fs::write(&compressed_only, b"zstd-frame").unwrap();
+        std::fs::write(&plain_preferred, b"{}\n").unwrap();
+        std::fs::write(&compressed_shadow, b"zstd-frame").unwrap();
         std::fs::write(&ignored, b"not a rollout").unwrap();
 
         #[cfg(unix)]
@@ -368,7 +402,12 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(
             discovered,
-            HashSet::from([top_level.clone(), nested_source.clone()])
+            HashSet::from([
+                top_level.clone(),
+                nested_source.clone(),
+                compressed_only.clone(),
+                plain_preferred.clone(),
+            ])
         );
         assert_eq!(
             observed,
@@ -376,6 +415,8 @@ mod tests {
                 top_level.to_string_lossy().into_owned(),
                 nested_source.to_string_lossy().into_owned(),
                 empty.to_string_lossy().into_owned(),
+                compressed_only.to_string_lossy().into_owned(),
+                plain_preferred.to_string_lossy().into_owned(),
             ])
         );
         assert_eq!(
@@ -568,6 +609,13 @@ mod tests {
             )),
             Some(UUID_OWNER),
             "an embedded rollout id is authoritative even when its filename fallback is ambiguous"
+        );
+        assert_eq!(
+            index.matching_owner(Path::new(
+                "/new/rollout-2026-07-25T00-00-00-019f64aa-0000-7000-8000-000000000201.jsonl.zst"
+            )),
+            Some(UUID_OWNER),
+            "compressed names must correlate with their canonical JSONL owner"
         );
         assert_eq!(
             index.matching_owner(Path::new("/new/friendly-session.jsonl")),

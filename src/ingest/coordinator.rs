@@ -11,7 +11,7 @@ use super::{
     projection::load_existing_owner_threads,
     reconciliation::reconcile_missing,
     session_titles::sync_session_index_titles,
-    source::IngestPacing,
+    source::{IngestPacing, is_compressed_rollout_path},
 };
 use crate::{
     calendar::canonical_utc_timestamp,
@@ -312,10 +312,21 @@ fn scan_once_started(db: &Db, roots: &IngestRoots, pacing: IngestPacing) -> Resu
     let mut candidates_by_owner: HashMap<String, Vec<SourceCandidate>> = HashMap::new();
     let mut owners = HashMap::new();
     for (path, archived) in files {
-        let size = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let storage_size = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         match read_owner(&path) {
             Ok(owner) => {
-                let complete = source_is_complete(&path, size);
+                // A zstd path's physical size is not its JSONL byte extent.
+                // Reuse the last logical extent only as a catalog preference
+                // hint; projection derives and verifies the exact size from
+                // the captured decompressed snapshot.
+                let size = if is_compressed_rollout_path(&path) {
+                    selected_source_extents
+                        .get(&owner.owner_id)
+                        .map_or(storage_size, |extent| extent.raw_size)
+                } else {
+                    storage_size
+                };
+                let complete = source_is_complete(&path, storage_size);
                 candidates_by_owner
                     .entry(owner.owner_id.clone())
                     .or_default()
@@ -340,10 +351,10 @@ fn scan_once_started(db: &Db, roots: &IngestRoots, pacing: IngestPacing) -> Resu
                 {
                     protected_handoff_owners.insert(owner_id.to_owned());
                 }
-                if !source_is_complete(&path, size) {
+                if !source_is_complete(&path, storage_size) {
                     tracing::debug!(
                         path = %path.display(),
-                        candidate_size = size,
+                        candidate_size = storage_size,
                         "deferring incomplete source until its owner record is complete"
                     );
                     continue;

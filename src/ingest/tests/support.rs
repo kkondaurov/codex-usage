@@ -14,6 +14,15 @@ pub(super) fn write_fixture(path: &Path, lines: &[Value]) {
     }
 }
 
+pub(super) fn write_compressed_fixture(path: &Path, lines: &[Value]) {
+    let output = File::create(path).unwrap();
+    let mut encoder = zstd::stream::write::Encoder::new(output, 3).unwrap();
+    for line in lines {
+        writeln!(encoder, "{}", serde_json::to_string(line).unwrap()).unwrap();
+    }
+    encoder.finish().unwrap();
+}
+
 pub(super) fn meta(timestamp: &str, owner: &str, thread: &str, fork: bool) -> Value {
     let source = if fork {
         serde_json::json!({"subagent":{"thread_spawn":{
