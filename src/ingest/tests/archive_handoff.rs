@@ -1186,8 +1186,9 @@ fn compressed_handoff_preserves_projection_and_stays_visible() {
     std::fs::remove_file(&plain).unwrap();
 
     let handoff = scan_once(&db, &roots).unwrap();
-    assert_eq!(handoff.files_ingested, 1);
-    assert_eq!(handoff.records_read, 4);
+    assert_eq!(handoff.files_ingested, 0);
+    assert_eq!(handoff.files_unchanged, 1);
+    assert_eq!(handoff.records_read, 0);
     let connection = db.connect().unwrap();
     let projected: (String, i64, i64, i64, i64) = connection
         .query_row(

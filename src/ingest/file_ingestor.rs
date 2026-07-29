@@ -16,9 +16,10 @@ use super::{
     owner_reader::{read_owner_from_snapshot, read_surviving_owners},
     projection::{
         PathConflict, ProjectionConnection, ProjectionTx, RemovalImpact, SourceCheckpointWrite,
-        UnchangedSourceUpdate, apply_thread_metadata_reset, clear_confirmed_shrink,
-        clear_projected_thread_title, delete_source_checkpoint, delete_thread_if_abandoned,
-        find_path_conflict, mark_source_unchanged, rematerialize_after_checkpoint, remove_rollout,
+        SourceHandoffUpdate, UnchangedSourceUpdate, apply_thread_metadata_reset,
+        clear_confirmed_shrink, clear_projected_thread_title, delete_source_checkpoint,
+        delete_thread_if_abandoned, find_path_conflict, mark_source_handoff_unchanged,
+        mark_source_unchanged, rematerialize_after_checkpoint, remove_rollout,
         save_source_checkpoint, upsert_owner,
     },
     protocol::{CursorState, OwnerMeta, decode_record},
@@ -224,6 +225,39 @@ impl FileIngestor<'_> {
         apply_thread_metadata_reset(tx, reset, &owners)
     }
 
+    fn finish_verified_source_handoff(
+        connection: &mut Connection,
+        checkpoint: &SourceCheckpoint,
+        path: &Path,
+        archived: bool,
+        size: u64,
+        modified_ns: u64,
+        identity: FileIdentity,
+    ) -> Result<FileReport> {
+        let transaction = ProjectionConnection::new(connection).begin_metadata_refresh()?;
+        mark_source_handoff_unchanged(
+            &transaction,
+            &SourceHandoffUpdate {
+                rollout_id: checkpoint.state.owner_id.clone(),
+                path: path.to_string_lossy().into_owned(),
+                archived,
+                size_bytes: size,
+                modified_ns,
+                ctime_ns: identity.ctime_ns,
+                device_id: identity.device_id,
+                inode: identity.inode,
+                rollout_archive_changed: checkpoint.archived != archived,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(FileReport {
+            unchanged: true,
+            failed: checkpoint.last_error.is_some(),
+            error: checkpoint.last_error.clone(),
+            ..FileReport::default()
+        })
+    }
+
     pub(super) fn process(
         &mut self,
         path: &Path,
@@ -254,27 +288,31 @@ impl FileIngestor<'_> {
         // is the sole field intentionally carried over from the scan-wide graph.
         owner.thread_id = resolved_owner.thread_id.clone();
         let size_hint = snapshot.extent().size();
-        if let Some(previous) = previous_extent
+        let verified_handoff = if let Some(previous) = previous_extent
             && path != previous.path
-            && !Self::source_path_switch_is_ready_from_snapshot(
+        {
+            if !Self::source_path_switch_is_ready_from_snapshot(
                 &mut snapshot,
                 size_hint,
                 previous,
                 self.pacing,
-            )
-        {
-            tracing::debug!(
-                owner_id = resolved_owner.owner_id,
-                path = %path.display(),
-                candidate_size = size_hint,
-                previous_committed_size = previous.committed_size,
-                "deferring source handoff because the opened snapshot no longer contains the committed prefix"
-            );
-            return Ok(FileReport {
-                deferred: true,
-                ..FileReport::default()
-            });
-        }
+            ) {
+                tracing::debug!(
+                    owner_id = resolved_owner.owner_id,
+                    path = %path.display(),
+                    candidate_size = size_hint,
+                    previous_committed_size = previous.committed_size,
+                    "deferring source handoff because the opened snapshot no longer contains the committed prefix"
+                );
+                return Ok(FileReport {
+                    deferred: true,
+                    ..FileReport::default()
+                });
+            }
+            true
+        } else {
+            false
+        };
         #[cfg(test)]
         run_process_file_after_snapshot_hook(path);
         let path_text = path.to_string_lossy();
@@ -309,6 +347,30 @@ impl FileIngestor<'_> {
         let size = extent.size();
         let modified_ns = extent.modified_ns();
         let identity = extent.identity();
+        if snapshot.is_compressed()
+            && verified_handoff
+            && checkpoint_by_path.is_none()
+            && let Some(previous) = previous_extent
+            && previous.raw_size == previous.committed_size
+            && size == previous.committed_size
+            && let Some(checkpoint) = load_checkpoint(&connection, &owner.owner_id)?
+            && checkpoint.state.projector_generation == PROJECTOR_GENERATION
+            && checkpoint.state.owner_id == owner.owner_id
+            && checkpoint.state.thread_id == owner.thread_id
+            && checkpoint.size == previous.raw_size
+            && checkpoint.offset == previous.committed_size
+            && checkpoint.fingerprint == previous.fingerprint
+        {
+            return Self::finish_verified_source_handoff(
+                &mut connection,
+                &checkpoint,
+                path,
+                archived,
+                size,
+                modified_ns,
+                identity,
+            );
+        }
         let suspicious_same_path_shrink =
             is_suspicious_same_path_shrink(checkpoint_by_path.as_ref(), &owner.owner_id, size);
         if !suspicious_same_path_shrink {

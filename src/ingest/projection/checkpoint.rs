@@ -129,6 +129,52 @@ pub(in crate::ingest) fn mark_source_unchanged(
     Ok(())
 }
 
+/// Move an unchanged rollout checkpoint to a verified representation sibling.
+///
+/// The caller has already proven that the new path contains the complete
+/// committed logical extent. Preserve the normalized projection and its
+/// ingestion timestamp while replacing only source-location metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::ingest) struct SourceHandoffUpdate {
+    pub rollout_id: String,
+    pub path: String,
+    pub archived: bool,
+    pub size_bytes: u64,
+    pub modified_ns: u64,
+    pub ctime_ns: Option<i64>,
+    pub device_id: Option<i64>,
+    pub inode: Option<i64>,
+    pub rollout_archive_changed: bool,
+}
+
+pub(in crate::ingest) fn mark_source_handoff_unchanged(
+    tx: &super::ProjectionTx<'_>,
+    update: &SourceHandoffUpdate,
+) -> Result<()> {
+    tx.sqlite.execute(
+        "UPDATE source_files SET
+            path=?1,archived=?2,size_bytes=?3,modified_ns=?4,ctime_ns=?5,device_id=?6,inode=?7
+         WHERE rollout_id=?8",
+        params![
+            update.path,
+            update.archived as i64,
+            update.size_bytes as i64,
+            update.modified_ns as i64,
+            update.ctime_ns,
+            update.device_id,
+            update.inode,
+            update.rollout_id,
+        ],
+    )?;
+    if update.rollout_archive_changed {
+        tx.sqlite.execute(
+            "UPDATE rollouts SET archived=?1 WHERE id=?2",
+            params![update.archived as i64, update.rollout_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// One conflicting durable source already claiming a candidate path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::ingest) struct PathConflict {

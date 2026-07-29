@@ -19,9 +19,10 @@ pub(in crate::ingest) use agents::{
     apply_observation as apply_agent_observation, rematerialize_surviving_observation,
 };
 pub(in crate::ingest) use checkpoint::{
-    PathConflict, SourceCheckpointWrite, UnchangedSourceUpdate, clear_confirmed_shrink,
-    delete_source_checkpoint, find_path_conflict, mark_source_unchanged,
-    rematerialize_after_checkpoint, save_source_checkpoint,
+    PathConflict, SourceCheckpointWrite, SourceHandoffUpdate, UnchangedSourceUpdate,
+    clear_confirmed_shrink, delete_source_checkpoint, find_path_conflict,
+    mark_source_handoff_unchanged, mark_source_unchanged, rematerialize_after_checkpoint,
+    save_source_checkpoint,
 };
 pub(in crate::ingest) use connection::{
     ProjectionConnection, ProjectionTx, ReconciliationCandidate,
