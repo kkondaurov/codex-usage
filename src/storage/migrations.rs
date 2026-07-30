@@ -3,7 +3,9 @@ use chrono::Utc;
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 const MIGRATION_1: &str = include_str!("../../migrations/0001_initial.sql");
-const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_1)];
+const MIGRATION_2: &str =
+    include_str!("../../migrations/0002_preserve_layered_price_intervals.sql");
+const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATION_1), (2, MIGRATION_2)];
 const REQUIRED_RUNTIME_INDEXES: &str = "
     CREATE INDEX IF NOT EXISTS idx_agent_runs_rollout ON agent_runs(rollout_id);
     CREATE INDEX IF NOT EXISTS idx_agent_runs_parent_rollout
@@ -148,7 +150,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(migrations, (1, 1));
+        assert_eq!(migrations, (2, 2));
 
         let price_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM model_prices", [], |row| row.get(0))
@@ -205,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_version_one_database_restores_rollout_replay_indexes() {
+    fn reopening_database_restores_rollout_replay_indexes() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("usage.db");
         let db = Db::open(&path).unwrap();
@@ -231,7 +233,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(migration, 1);
+        assert_eq!(migration, 2);
         drop(connection);
         drop(db);
 
@@ -321,6 +323,65 @@ mod tests {
                 "{query} did not use {index}; query plan:\n{plan}"
             );
         }
+    }
+
+    #[test]
+    fn version_one_price_view_upgrade_reveals_fallback_after_legacy_remote_closes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usage.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(1,?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO model_prices(
+                    model_id,effective_from,effective_to,
+                    input_microusd_per_million,cached_input_microusd_per_million,
+                    output_microusd_per_million,currency,source
+                 ) VALUES
+                    ('gpt-5.5','1970-01-01T00:00:00.000000000Z',NULL,
+                     5000000,500000,30000000,'USD','bundled-baseline'),
+                    ('gpt-5.5','1970-01-01T00:00:00.000000000Z',
+                     '2026-07-30T13:00:00.000000000Z',
+                     9000000,900000,40000000,'USD','remote:legacy');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Db::open(&path).unwrap();
+        let connection = db.connect().unwrap();
+        let migration: (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*),MAX(version) FROM schema_migrations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let source: String = connection
+            .query_row(
+                "SELECT source FROM resolved_model_prices
+                 WHERE model_id='gpt-5.5'
+                   AND effective_from<='2026-07-30T13:00:00.000000000Z'
+                   AND (effective_to IS NULL
+                        OR effective_to>'2026-07-30T13:00:00.000000000Z')
+                 ORDER BY source_priority DESC,effective_from DESC,source DESC
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let price_book = crate::usage::load_price_book_on(&connection).unwrap();
+        let (_, fallback) = price_book
+            .price_at("gpt-5.5", "2026-07-30T13:00:00.000000000Z")
+            .unwrap();
+        assert_eq!(migration, (2, 2));
+        assert_eq!(source, "bundled-baseline");
+        assert_eq!(fallback.cost_numerator(1, 0, 0), 5_000_000);
     }
 
     #[test]
@@ -656,7 +717,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("schema version 999 is newer than supported version 1")
+                .contains("schema version 999 is newer than supported version 2")
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!sqlite_sidecar_path(&path, "-wal").exists());
@@ -717,7 +778,7 @@ mod tests {
         let journal_mode: String = connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
-        assert_eq!(migration, (1, 1));
+        assert_eq!(migration, (2, 2));
         assert_eq!(journal_mode, "wal");
     }
 

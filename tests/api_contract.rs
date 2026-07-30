@@ -5008,7 +5008,10 @@ async fn price_and_alias_crud_reprice_history_immediately_without_reingestion() 
         raw_request(&harness.app, Method::POST, "/api/v1/prices/refresh", None).await;
     assert_eq!(status, StatusCode::OK);
     let refreshed: Value = serde_json::from_slice(&body).unwrap();
-    assert!(refreshed["updated"].as_u64().unwrap() > 0);
+    assert_eq!(
+        refreshed["updated"], 0,
+        "the fixture rates already match, so refresh adds no price interval"
+    );
     let refreshed_prices = get_json(&harness.app, "/api/v1/prices?page=1&pageSize=25").await;
     assert_eq!(refreshed_prices["source"], pricing_url);
 }
@@ -5071,11 +5074,10 @@ async fn failed_price_refresh_is_visible_without_exposing_transport_details() {
     let (status, _, body) =
         raw_request(&harness.app, Method::POST, "/api/v1/prices/refresh", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        serde_json::from_slice::<Value>(&body).unwrap()["updated"]
-            .as_u64()
-            .unwrap()
-            > 0
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["updated"],
+        0,
+        "a successful recovery with unchanged fixture rates adds no interval"
     );
     let recovered = get_json(&harness.app, "/api/v1/prices?page=1&pageSize=25").await;
     assert!(recovered["lastRefreshAt"].is_string());
@@ -5147,7 +5149,10 @@ async fn manual_price_canonicalizes_the_key_reprices_usage_and_survives_refresh(
             .query_row(
                 "SELECT effective_from,input_microusd_per_million,
                     cached_input_microusd_per_million,output_microusd_per_million,source
-             FROM resolved_model_prices WHERE model_id='gpt-5.5'",
+             FROM resolved_model_prices
+             WHERE model_id='gpt-5.5' AND effective_to IS NULL
+             ORDER BY source_priority DESC,effective_from DESC,source DESC
+             LIMIT 1",
                 [],
                 |row| {
                     Ok((
@@ -5194,15 +5199,17 @@ async fn manual_price_canonicalizes_the_key_reprices_usage_and_survives_refresh(
         .unwrap()
         .query_row(
             "SELECT input_microusd_per_million,source FROM resolved_model_prices
-             WHERE model_id='gpt-5.5'",
+             WHERE model_id='gpt-5.5' AND effective_to IS NULL
+             ORDER BY source_priority DESC,effective_from DESC,source DESC
+             LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
     assert_eq!(
         restored,
-        (5_000_000, format!("remote:{pricing_url}")),
-        "DELETE must normalize equivalent offsets and reveal the remote layer"
+        (5_000_000, "fixture".into()),
+        "DELETE must normalize equivalent offsets and reveal the unchanged non-manual layer"
     );
 }
 

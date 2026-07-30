@@ -108,7 +108,10 @@ pub(super) fn prices(
              SELECT 1 FROM price_search_matches search
              WHERE search.model_id=resolved_model_prices.model_id
          )
-         ORDER BY model_id,effective_from DESC LIMIT ?2 OFFSET ?3",
+         ORDER BY model_id,effective_from DESC,
+                  effective_to IS NULL DESC,effective_to DESC,
+                  source_priority DESC,source DESC
+         LIMIT ?2 OFFSET ?3",
     )?;
     let raw_items = statement
         .query_map(
@@ -414,6 +417,39 @@ mod tests {
         ] {
             assert!(error.to_string().starts_with("invalid "));
         }
+    }
+
+    #[test]
+    fn price_history_pagination_is_stable_for_layers_with_the_same_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("usage.db")).unwrap();
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO model_prices(
+                    model_id,effective_from,effective_to,
+                    input_microusd_per_million,cached_input_microusd_per_million,
+                    output_microusd_per_million,currency,source
+                 ) VALUES(
+                    'gpt-5.5','1970-01-01T00:00:00.000000000Z',
+                    '2026-07-30T13:00:00.000000000Z',
+                    9000000,900000,40000000,'USD','remote:legacy'
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let current = prices(&connection, Some("gpt-5.5"), 1, 1).unwrap();
+        let historical = prices(&connection, Some("gpt-5.5"), 2, 1).unwrap();
+        assert_eq!(current.total, 2);
+        assert_eq!(current.total_pages, 2);
+        assert_eq!(current.items[0].source, "bundled-baseline");
+        assert_eq!(current.items[0].effective_to, None);
+        assert_eq!(historical.items[0].source, "remote:legacy");
+        assert_eq!(
+            historical.items[0].effective_to.as_deref(),
+            Some("2026-07-30T13:00:00.000000000Z")
+        );
     }
 
     #[test]

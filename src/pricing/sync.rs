@@ -1,5 +1,6 @@
 use super::{MAX_MODEL_ID_CHARS, manual_store::resolved_alias_layer_validation_message};
 use crate::{
+    calendar::canonical_utc_timestamp,
     config::{MAX_PRICING_REFRESH_HOURS, MIN_PRICING_REFRESH_HOURS, PricingConfig},
     costing::PriceMicros,
     storage::{DatabaseLock, Db, StorageExecutor, WorkClass, seed_fallback_prices},
@@ -20,7 +21,6 @@ use std::{
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-const EFFECTIVE_FROM: &str = "1970-01-01T00:00:00.000000000Z";
 const MIN_RETRY_SECONDS: u64 = 30;
 const MAX_RETRY_SECONDS: u64 = 30 * 60;
 const MAX_DUE_CHECK_SECONDS: u64 = 60 * 60;
@@ -64,7 +64,7 @@ impl RefreshErrorKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RemotePrice {
     model_id: String,
     input_microusd_per_million: i64,
@@ -301,7 +301,9 @@ impl PricingSync {
         refresh_guard: OwnedMutexGuard<()>,
         database_guard: DatabaseLock,
     ) -> Result<usize> {
-        let fetched = fetch_prices(config).await;
+        let fetched = fetch_prices(config)
+            .await
+            .map(|prices| (prices, Utc::now()));
         let db = db.clone();
         let source_url = config.url.clone();
         self.executor
@@ -309,7 +311,9 @@ impl PricingSync {
                 let _refresh_guard = refresh_guard;
                 let _database_guard = database_guard;
                 let result = match fetched {
-                    Ok(prices) => replace_remote_prices(&db, &prices, &source_url, Utc::now()),
+                    Ok((prices, observed_at)) => {
+                        replace_remote_prices(&db, &prices, &source_url, observed_at)
+                    }
                     Err(error) => Err(error),
                 };
                 match result {
@@ -509,45 +513,77 @@ fn replace_remote_prices(
     fetched_at: DateTime<Utc>,
 ) -> Result<usize> {
     let remote_source = format!("remote:{source_url}");
+    let observed_at = canonical_utc_timestamp(fetched_at);
     let mut connection = db.connect()?;
     let transaction = connection.transaction()?;
-    // The remote feed owns only the remote layer. Bundled fallbacks and manual
-    // overrides remain present so removing or omitting a remote row reveals the
-    // next layer immediately.
-    transaction.execute(
-        "DELETE FROM model_prices
-         WHERE source NOT IN ('manual','bundled-baseline')",
-        [],
-    )?;
     seed_fallback_prices(&transaction)?;
+    let mut updated = 0;
+
+    let mut active_remote = HashMap::<String, Vec<RemotePrice>>::new();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT model_id,input_microusd_per_million,
+                    cached_input_microusd_per_million,output_microusd_per_million
+             FROM model_prices
+             WHERE source NOT IN ('manual','bundled-baseline')
+               AND effective_to IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(RemotePrice {
+                model_id: row.get(0)?,
+                input_microusd_per_million: row.get(1)?,
+                cached_input_microusd_per_million: row.get(2)?,
+                output_microusd_per_million: row.get(3)?,
+            })
+        })?;
+        for row in rows {
+            let price = row?;
+            active_remote
+                .entry(price.model_id.clone())
+                .or_default()
+                .push(price);
+        }
+    }
+
+    // Absence from one snapshot is not evidence that a model or its price
+    // stopped existing. Reconcile only prices that the feed actually reports.
     for price in prices {
+        if active_remote
+            .get(&price.model_id)
+            .is_some_and(|active| active.as_slice() == std::slice::from_ref(price))
+        {
+            continue;
+        }
+        close_active_remote_prices(&transaction, &price.model_id, &observed_at)?;
         transaction.execute(
             "INSERT INTO model_prices(
-                model_id,effective_from,input_microusd_per_million,
+                model_id,effective_from,effective_to,input_microusd_per_million,
                 cached_input_microusd_per_million,output_microusd_per_million,
                 currency,source
-             ) VALUES(?1,?2,?3,?4,?5,'USD',?6)
+             ) VALUES(?1,?2,NULL,?3,?4,?5,'USD',?6)
              ON CONFLICT(model_id,effective_from,source) DO UPDATE SET
+                effective_to=NULL,
                 input_microusd_per_million=excluded.input_microusd_per_million,
                 cached_input_microusd_per_million=excluded.cached_input_microusd_per_million,
                 output_microusd_per_million=excluded.output_microusd_per_million,
                 currency=excluded.currency",
             params![
                 price.model_id,
-                EFFECTIVE_FROM,
+                observed_at,
                 price.input_microusd_per_million,
                 price.cached_input_microusd_per_million,
                 price.output_microusd_per_million,
                 remote_source,
             ],
         )?;
+        updated += 1;
     }
     if let Some(message) = resolved_alias_layer_validation_message(&transaction)? {
         bail!("pricing refresh would leave {message}");
     }
     transaction.execute(
         "INSERT OR REPLACE INTO app_meta(key,value) VALUES('pricing_last_refresh_at',?1)",
-        [fetched_at.to_rfc3339()],
+        [&observed_at],
     )?;
     transaction.execute(
         "INSERT OR REPLACE INTO app_meta(key,value) VALUES('pricing_source_url',?1)",
@@ -560,7 +596,22 @@ fn replace_remote_prices(
         [],
     )?;
     transaction.commit()?;
-    Ok(prices.len())
+    Ok(updated)
+}
+
+fn close_active_remote_prices(
+    connection: &rusqlite::Connection,
+    model_id: &str,
+    observed_at: &str,
+) -> Result<()> {
+    connection.execute(
+        "UPDATE model_prices SET effective_to=?1
+         WHERE model_id=?2
+           AND source NOT IN ('manual','bundled-baseline')
+           AND effective_to IS NULL",
+        params![observed_at, model_id],
+    )?;
+    Ok(())
 }
 
 fn classify_refresh_error(error: &anyhow::Error) -> RefreshErrorKind {
@@ -626,6 +677,58 @@ mod tests {
     };
     use axum::{Json, Router, routing::get};
     use serde_json::json;
+
+    const BASELINE_EFFECTIVE_FROM: &str = "1970-01-01T00:00:00.000000000Z";
+    const OBSERVED_ONE: &str = "2026-07-30T12:00:00.000000000Z";
+    const OBSERVED_TWO: &str = "2026-07-30T13:00:00.000000000Z";
+    const OBSERVED_THREE: &str = "2026-07-30T14:00:00.000000000Z";
+    const OBSERVED_FOUR: &str = "2026-07-30T15:00:00.000000000Z";
+    type StoredPriceInterval = (String, Option<String>, i64, Option<i64>, i64);
+
+    fn observed_at(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn remote_price(model_id: &str, input: i64, cached: Option<i64>, output: i64) -> RemotePrice {
+        RemotePrice {
+            model_id: model_id.into(),
+            input_microusd_per_million: input,
+            cached_input_microusd_per_million: cached,
+            output_microusd_per_million: output,
+        }
+    }
+
+    fn insert_usage_facts(db: &Db, model_id: &str, rows: &[(&str, &str)]) {
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads(id,started_at,last_event_at) VALUES('pricing-history',?1,?1)",
+                [rows[0].1],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO rollouts(id,thread_id,started_at,last_event_at)
+                 VALUES('pricing-history','pricing-history',?1,?1)",
+                [rows[0].1],
+            )
+            .unwrap();
+        for (source_line, (id, timestamp)) in rows.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO usage_facts(
+                        id,thread_id,rollout_id,timestamp,source_line,model,
+                        input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,
+                        total_tokens,native
+                     ) VALUES(?1,'pricing-history','pricing-history',?2,?3,?4,
+                              1,0,0,0,1,1)",
+                    params![id, timestamp, source_line as i64, model_id],
+                )
+                .unwrap();
+        }
+    }
 
     fn open_with_store(
         db_path: impl AsRef<std::path::Path>,
@@ -788,16 +891,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_snapshot_coexists_with_and_reveals_bundled_fallback() {
+    fn remote_snapshot_omission_preserves_existing_remote_and_bundled_layers() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
-        let remote = RemotePrice {
-            model_id: "gpt-5.5".into(),
-            input_microusd_per_million: 9_000_000,
-            cached_input_microusd_per_million: Some(900_000),
-            output_microusd_per_million: 40_000_000,
-        };
-        replace_remote_prices(&db, &[remote], "manual", Utc::now()).unwrap();
+        let remote = remote_price("gpt-5.5", 9_000_000, Some(900_000), 40_000_000);
+        replace_remote_prices(&db, &[remote], "manual", observed_at(OBSERVED_ONE)).unwrap();
         let connection = db.connect().unwrap();
         let layers: Vec<String> = connection
             .prepare(
@@ -815,28 +913,38 @@ mod tests {
         );
         let remote_source: String = connection
             .query_row(
-                "SELECT source FROM resolved_model_prices WHERE model_id='gpt-5.5'",
-                [],
+                "SELECT source FROM resolved_model_prices
+                 WHERE model_id='gpt-5.5'
+                   AND effective_from<=?1
+                   AND (effective_to IS NULL OR effective_to>?1)
+                 ORDER BY source_priority DESC,effective_from DESC
+                 LIMIT 1",
+                [OBSERVED_ONE],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(remote_source, "remote:manual");
         drop(connection);
 
-        let later_snapshot = RemotePrice {
-            model_id: "gpt-5.6-sol".into(),
-            input_microusd_per_million: 8_000_000,
-            cached_input_microusd_per_million: Some(800_000),
-            output_microusd_per_million: 35_000_000,
-        };
-        replace_remote_prices(&db, &[later_snapshot], "bundled-baseline", Utc::now()).unwrap();
-        let restored: (i64, String) = db
+        let later_snapshot = remote_price("gpt-5.6-sol", 8_000_000, Some(800_000), 35_000_000);
+        replace_remote_prices(
+            &db,
+            &[later_snapshot],
+            "bundled-baseline",
+            observed_at(OBSERVED_TWO),
+        )
+        .unwrap();
+        let preserved: (i64, String) = db
             .connect()
             .unwrap()
             .query_row(
                 "SELECT input_microusd_per_million,source FROM resolved_model_prices
-                 WHERE model_id='gpt-5.5'",
-                [],
+                 WHERE model_id='gpt-5.5'
+                   AND effective_from<=?1
+                   AND (effective_to IS NULL OR effective_to>?1)
+                 ORDER BY source_priority DESC,effective_from DESC
+                 LIMIT 1",
+                [OBSERVED_TWO],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -849,8 +957,336 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(restored, (5_000_000, "bundled-baseline".into()));
-        assert_eq!(raw_layers, 1);
+        assert_eq!(preserved, (9_000_000, "remote:manual".into()));
+        assert_eq!(
+            raw_layers, 2,
+            "omission must leave both the remote and bundled layers untouched"
+        );
+        let effective_to: Option<String> = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT effective_to FROM model_prices
+                 WHERE model_id='gpt-5.5' AND source='remote:manual'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(effective_to, None);
+    }
+
+    #[test]
+    fn omitting_a_legacy_epoch_remote_price_leaves_it_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO model_prices(
+                    model_id,effective_from,input_microusd_per_million,
+                    cached_input_microusd_per_million,output_microusd_per_million,
+                    currency,source
+                 ) VALUES('gpt-5.5',?1,9000000,900000,40000000,'USD','remote:legacy')",
+                [BASELINE_EFFECTIVE_FROM],
+            )
+            .unwrap();
+        let unrelated = remote_price("gpt-5.6-sol", 8_000_000, Some(800_000), 35_000_000);
+
+        replace_remote_prices(
+            &db,
+            &[unrelated],
+            "https://example.test/prices.json",
+            observed_at(OBSERVED_TWO),
+        )
+        .unwrap();
+
+        let connection = db.connect().unwrap();
+        let source_at = |timestamp: &str| {
+            connection
+                .query_row(
+                    "SELECT source FROM resolved_model_prices
+                     WHERE model_id='gpt-5.5'
+                       AND effective_from<=?1
+                       AND (effective_to IS NULL OR effective_to>?1)
+                     ORDER BY source_priority DESC,effective_from DESC,source DESC
+                     LIMIT 1",
+                    [timestamp],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(source_at(OBSERVED_ONE), "remote:legacy");
+        assert_eq!(source_at(OBSERVED_TWO), "remote:legacy");
+        let effective_to: Option<String> = connection
+            .query_row(
+                "SELECT effective_to FROM model_prices
+                 WHERE model_id='gpt-5.5' AND source='remote:legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(effective_to, None);
+    }
+
+    #[test]
+    fn unchanged_remote_price_keeps_its_first_observation_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
+        let remote = remote_price("gpt-9-observed", 1_000_000, Some(100_000), 2_000_000);
+
+        replace_remote_prices(
+            &db,
+            std::slice::from_ref(&remote),
+            "https://example.test/prices.json",
+            observed_at(OBSERVED_ONE),
+        )
+        .unwrap();
+        replace_remote_prices(
+            &db,
+            std::slice::from_ref(&remote),
+            "https://example.test/relocated-prices.json",
+            observed_at(OBSERVED_TWO),
+        )
+        .unwrap();
+
+        let connection = db.connect().unwrap();
+        let rows: Vec<(String, Option<String>, String)> = connection
+            .prepare(
+                "SELECT effective_from,effective_to,source FROM model_prices
+                 WHERE model_id='gpt-9-observed'
+                   AND source NOT IN ('manual','bundled-baseline')",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let refreshed_at: String = connection
+            .query_row(
+                "SELECT value FROM app_meta WHERE key='pricing_last_refresh_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            [(
+                OBSERVED_ONE.into(),
+                None,
+                "remote:https://example.test/prices.json".into()
+            )],
+            "an unchanged price must not fabricate a historical boundary"
+        );
+        assert_eq!(refreshed_at, OBSERVED_TWO);
+    }
+
+    #[test]
+    fn first_remote_observation_does_not_reprice_earlier_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
+        let remote = remote_price("gpt-9-first-seen", 600_000, None, 2_000_000);
+
+        assert_eq!(
+            replace_remote_prices(
+                &db,
+                &[remote],
+                "https://example.test/prices.json",
+                observed_at(OBSERVED_TWO),
+            )
+            .unwrap(),
+            1
+        );
+        insert_usage_facts(
+            &db,
+            "gpt-9-first-seen",
+            &[("before-first", OBSERVED_ONE), ("at-first", OBSERVED_TWO)],
+        );
+
+        let connection = db.connect().unwrap();
+        let costs: Vec<(String, i64, i64)> = connection
+            .prepare(
+                "SELECT id,price_known,cost_numerator FROM priced_usage
+                 WHERE thread_id='pricing-history' ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            costs,
+            [
+                ("before-first".into(), 0, 0),
+                ("at-first".into(), 1, 600_000),
+            ]
+        );
+
+        let price_book = crate::usage::load_price_book_on(&connection).unwrap();
+        assert!(
+            price_book
+                .price_at("gpt-9-first-seen", OBSERVED_ONE)
+                .is_none()
+        );
+        let (_, at_first) = price_book
+            .price_at("gpt-9-first-seen", OBSERVED_TWO)
+            .unwrap();
+        assert_eq!(at_first.cost_numerator(1, 0, 0), 600_000);
+    }
+
+    #[test]
+    fn changed_remote_price_preserves_costs_across_the_exact_observation_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
+        let old = remote_price("gpt-9-temporal", 1_000_000, Some(100_000), 2_000_000);
+        let new = remote_price("gpt-9-temporal", 200_000, Some(20_000), 1_200_000);
+
+        replace_remote_prices(
+            &db,
+            &[old],
+            "https://example.test/prices.json",
+            observed_at(OBSERVED_ONE),
+        )
+        .unwrap();
+        replace_remote_prices(
+            &db,
+            &[new],
+            "https://example.test/prices.json",
+            observed_at(OBSERVED_TWO),
+        )
+        .unwrap();
+        insert_usage_facts(
+            &db,
+            "gpt-9-temporal",
+            &[
+                ("before", "2026-07-30T12:59:59.999999999Z"),
+                ("at", OBSERVED_TWO),
+            ],
+        );
+
+        let connection = db.connect().unwrap();
+        let intervals: Vec<(String, Option<String>, i64)> = connection
+            .prepare(
+                "SELECT effective_from,effective_to,input_microusd_per_million
+                 FROM model_prices
+                 WHERE model_id='gpt-9-temporal'
+                 ORDER BY effective_from",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let costs: Vec<(String, i64, i64)> = connection
+            .prepare(
+                "SELECT id,price_known,cost_numerator FROM priced_usage
+                 WHERE thread_id='pricing-history' ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            intervals,
+            [
+                (OBSERVED_ONE.into(), Some(OBSERVED_TWO.into()), 1_000_000),
+                (OBSERVED_TWO.into(), None, 200_000),
+            ]
+        );
+        assert_eq!(
+            costs,
+            [("before".into(), 1, 1_000_000), ("at".into(), 1, 200_000)]
+        );
+    }
+
+    #[test]
+    fn omission_keeps_the_price_active_until_a_later_observed_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
+        let remote = remote_price("gpt-9-returning", 700_000, None, 3_000_000);
+        let unrelated = remote_price("gpt-8-unrelated", 1_000_000, None, 2_000_000);
+
+        replace_remote_prices(
+            &db,
+            std::slice::from_ref(&remote),
+            "https://example.test/prices.json",
+            observed_at(OBSERVED_ONE),
+        )
+        .unwrap();
+        replace_remote_prices(
+            &db,
+            std::slice::from_ref(&unrelated),
+            "https://example.test/prices.json",
+            observed_at(OBSERVED_TWO),
+        )
+        .unwrap();
+        let changed = remote_price("gpt-9-returning", 300_000, None, 1_200_000);
+        assert_eq!(
+            replace_remote_prices(
+                &db,
+                &[remote.clone(), unrelated.clone()],
+                "https://example.test/prices.json",
+                observed_at(OBSERVED_THREE),
+            )
+            .unwrap(),
+            0,
+            "an unchanged price returning after omission adds no interval"
+        );
+        replace_remote_prices(
+            &db,
+            &[changed, unrelated],
+            "https://example.test/prices.json",
+            observed_at(OBSERVED_FOUR),
+        )
+        .unwrap();
+        insert_usage_facts(
+            &db,
+            "gpt-9-returning",
+            &[
+                ("present", OBSERVED_ONE),
+                ("omitted", "2026-07-30T13:30:00.000000000Z"),
+                ("returned", OBSERVED_THREE),
+                ("changed", OBSERVED_FOUR),
+            ],
+        );
+
+        let connection = db.connect().unwrap();
+        let intervals: Vec<(String, Option<String>)> = connection
+            .prepare(
+                "SELECT effective_from,effective_to FROM model_prices
+                 WHERE model_id='gpt-9-returning' ORDER BY effective_from",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let costs: Vec<(String, i64, i64)> = connection
+            .prepare(
+                "SELECT id,price_known,cost_numerator FROM priced_usage
+                 WHERE thread_id='pricing-history' ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            intervals,
+            [
+                (OBSERVED_ONE.into(), Some(OBSERVED_FOUR.into())),
+                (OBSERVED_FOUR.into(), None),
+            ]
+        );
+        assert_eq!(
+            costs,
+            [
+                ("present".into(), 1, 700_000),
+                ("omitted".into(), 1, 700_000),
+                ("returned".into(), 1, 700_000),
+                ("changed".into(), 1, 300_000),
+            ]
+        );
     }
 
     #[test]
@@ -949,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_rollback_preserves_remote_alias_target_when_next_snapshot_omits_it() {
+    fn refresh_omission_preserves_remote_alias_target_and_imports_other_models() {
         let temp = tempfile::tempdir().unwrap();
         let (db, store) = open_with_default_store(temp.path().join("codex-usage.db"));
         let source_url = "https://example.invalid/prices.json";
@@ -959,7 +1395,7 @@ mod tests {
             cached_input_microusd_per_million: Some(100_000),
             output_microusd_per_million: 2_000_000,
         };
-        replace_remote_prices(&db, &[remote_only], source_url, Utc::now()).unwrap();
+        replace_remote_prices(&db, &[remote_only], source_url, observed_at(OBSERVED_ONE)).unwrap();
         store
             .save_alias(
                 &db,
@@ -976,24 +1412,18 @@ mod tests {
             cached_input_microusd_per_million: None,
             output_microusd_per_million: 4_000_000,
         };
-        let error = replace_remote_prices(&db, &[unrelated], source_url, Utc::now()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("observed-remote-only pointing to unpriced model gpt-9-remote-only"),
-            "{error:#}"
-        );
+        replace_remote_prices(&db, &[unrelated], source_url, observed_at(OBSERVED_TWO)).unwrap();
 
         let connection = db.connect().unwrap();
-        let resolved: (String, String) = connection
+        let resolved: (String, String, Option<String>) = connection
             .query_row(
-                "SELECT alias.canonical_model_id,price.source
+                "SELECT alias.canonical_model_id,price.source,price.effective_to
                  FROM resolved_model_aliases alias
                  JOIN resolved_model_prices price
                    ON price.model_id=alias.canonical_model_id
                  WHERE alias.observed_model_id='observed-remote-only'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         let unrelated_count: i64 = connection
@@ -1005,9 +1435,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             resolved,
-            ("gpt-9-remote-only".into(), format!("remote:{source_url}"))
+            (
+                "gpt-9-remote-only".into(),
+                format!("remote:{source_url}"),
+                None
+            ),
+            "omission must leave the target interval open"
         );
-        assert_eq!(unrelated_count, 0, "the rejected snapshot must roll back");
+        assert_eq!(unrelated_count, 1, "present models must still be imported");
     }
 
     #[test]
@@ -1170,7 +1605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_refresh_replaces_cache_and_preserves_manual_override() {
+    async fn remote_refresh_preserves_manual_override_and_stores_observation_time() {
         let temp = tempfile::tempdir().unwrap();
         let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
         let connection = db.connect().unwrap();
@@ -1181,7 +1616,7 @@ mod tests {
                     cached_input_microusd_per_million,output_microusd_per_million,
                     currency,source
                  ) VALUES('gpt-5.5',?1,10000000,1000000,60000000,'USD','manual')",
-                [EFFECTIVE_FROM],
+                [BASELINE_EFFECTIVE_FROM],
             )
             .unwrap();
         drop(connection);
@@ -1200,7 +1635,7 @@ mod tests {
             .query_row(
                 "SELECT input_microusd_per_million,source FROM resolved_model_prices
                  WHERE model_id='gpt-5.5' AND effective_from=?1",
-                [EFFECTIVE_FROM],
+                [BASELINE_EFFECTIVE_FROM],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -1218,12 +1653,187 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let (remote_effective_from, remote_input): (String, i64) = connection
+            .query_row(
+                "SELECT effective_from,input_microusd_per_million FROM model_prices
+                 WHERE model_id='gpt-5.5' AND source=?1",
+                [format!("remote:{url}")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
         assert_eq!(input, 10_000_000);
         assert_eq!(source, "manual");
         assert_eq!(stored_url, url);
         assert_eq!(fallback_source, "bundled-baseline");
+        assert_eq!(remote_input, 5_000_000);
+        assert_ne!(remote_effective_from, BASELINE_EFFECTIVE_FROM);
+        assert!(remote_effective_from.ends_with('Z'));
         server.abort();
         assert!(!sync.sync_if_needed(&db, &config).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn successive_http_refreshes_append_only_when_the_observed_price_changes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/prices.json",
+            get({
+                let calls = calls.clone();
+                move || {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let price = if call == 0 {
+                            json!({
+                                "input_cost_per_token": 0.000001,
+                                "cache_read_input_token_cost": 0.0000001,
+                                "output_cost_per_token": 0.000006
+                            })
+                        } else {
+                            json!({
+                                "input_cost_per_token": 0.0000002,
+                                "cache_read_input_token_cost": 0.00000002,
+                                "output_cost_per_token": 0.0000012
+                            })
+                        };
+                        if call == 0 {
+                            Json(json!({
+                                "openai/gpt-5.6-luna": price,
+                                "openai/gpt-9-omitted": {
+                                    "input_cost_per_token": 0.0000007,
+                                    "output_cost_per_token": 0.000003
+                                }
+                            }))
+                        } else {
+                            Json(json!({"openai/gpt-5.6-luna": price}))
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(temp.path().join("codex-usage.db")).unwrap();
+        let config = PricingConfig {
+            url: format!("http://{address}/prices.json"),
+            refresh_interval_hours: 24,
+            timeout_seconds: 2,
+        };
+        let sync = PricingSync::new(StorageExecutor::default());
+
+        assert_eq!(sync.force_sync(&db, &config).await.unwrap(), 2);
+        tokio::time::sleep(StdDuration::from_millis(2)).await;
+        assert_eq!(sync.force_sync(&db, &config).await.unwrap(), 1);
+        tokio::time::sleep(StdDuration::from_millis(2)).await;
+        assert_eq!(sync.force_sync(&db, &config).await.unwrap(), 0);
+
+        let connection = db.connect().unwrap();
+        let intervals: Vec<StoredPriceInterval> = connection
+            .prepare(
+                "SELECT effective_from,effective_to,input_microusd_per_million,
+                        cached_input_microusd_per_million,output_microusd_per_million
+                 FROM model_prices
+                 WHERE model_id='gpt-5.6-luna' AND source=?1
+                 ORDER BY effective_from",
+            )
+            .unwrap()
+            .query_map([format!("remote:{}", config.url)], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            intervals.len(),
+            2,
+            "the unchanged third refresh adds no row"
+        );
+        assert_eq!(
+            (
+                intervals[0].1.as_deref(),
+                intervals[0].2,
+                intervals[0].3,
+                intervals[0].4,
+            ),
+            (
+                Some(intervals[1].0.as_str()),
+                1_000_000,
+                Some(100_000),
+                6_000_000
+            )
+        );
+        assert_eq!(
+            (
+                intervals[1].1.as_deref(),
+                intervals[1].2,
+                intervals[1].3,
+                intervals[1].4
+            ),
+            (None, 200_000, Some(20_000), 1_200_000)
+        );
+        assert!(
+            intervals
+                .iter()
+                .all(|(effective_from, _, _, _, _)| effective_from.ends_with('Z'))
+        );
+        let omitted: (String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT effective_from,effective_to,input_microusd_per_million
+                 FROM model_prices
+                 WHERE model_id='gpt-9-omitted' AND source=?1",
+                [format!("remote:{}", config.url)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            omitted,
+            (intervals[0].0.clone(), None, 700_000),
+            "two later omissions must leave the first observed price active"
+        );
+        let old_observation = intervals[0].0.clone();
+        let new_observation = intervals[1].0.clone();
+        drop(connection);
+
+        insert_usage_facts(
+            &db,
+            "gpt-5.6-luna",
+            &[
+                ("old-http", &old_observation),
+                ("new-http", &new_observation),
+            ],
+        );
+        let costs: Vec<(String, i64)> = db
+            .connect()
+            .unwrap()
+            .prepare(
+                "SELECT id,cost_numerator FROM priced_usage
+                 WHERE thread_id='pricing-history' ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            costs,
+            [("old-http".into(), 1_000_000), ("new-http".into(), 200_000)]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        server.abort();
     }
 
     #[cfg(unix)]
